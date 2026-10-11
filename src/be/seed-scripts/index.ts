@@ -30,6 +30,15 @@ import completeTaskSrc from "./catalog/complete-task.ts" with { type: "text" };
 import compoundInsightsSrc from "./catalog/compound-insights.inline.ts" with { type: "text" };
 import dateResolveSrc from "./catalog/date-resolve.ts" with { type: "text" };
 import delegateSrc from "./catalog/delegate.ts" with { type: "text" };
+import dreamApplySrc from "./catalog/dream-apply.ts" with { type: "text" };
+import dreamGatherSrc from "./catalog/dream-gather.ts" with { type: "text" };
+import dreamHeartbeatSrc from "./catalog/dream-heartbeat.ts" with { type: "text" };
+import dreamLearnSrc from "./catalog/dream-learn.ts" with { type: "text" };
+import dreamOwnersSrc from "./catalog/dream-owners.ts" with { type: "text" };
+import dreamReportsCheckSrc from "./catalog/dream-reports-check.ts" with { type: "text" };
+import dreamRollbackSrc from "./catalog/dream-rollback.ts" with { type: "text" };
+import dreamTrimSrc from "./catalog/dream-trim.ts" with { type: "text" };
+import dreamVerifySrc from "./catalog/dream-verify.ts" with { type: "text" };
 import fetchReadableSrc from "./catalog/fetch-readable.ts" with { type: "text" };
 import getChildOutputsSrc from "./catalog/get-child-outputs.ts" with { type: "text" };
 import ghPrSnapshotSrc from "./catalog/gh-pr-snapshot.ts" with { type: "text" };
@@ -291,6 +300,74 @@ export const SEED_SCRIPTS: SeedScript[] = [
     intent:
       "See who is in the swarm and what tasks are running — swarm stats / agent list / task counts in a single call.",
     source: asText(swarmOverviewSrc),
+  },
+  {
+    name: "dream-gather",
+    description:
+      "Dreaming gather: the last N days of per-agent task, cost, skill, memory and profile evidence, plus the normalized nightly config (mode, lanes, caps, cfg, lead and worker ids).",
+    intent:
+      "First node of the nightly dreaming workflow; decides off, dry-run or live and feeds every later node.",
+    source: asText(dreamGatherSrc),
+  },
+  {
+    name: "dream-reports-check",
+    description:
+      "Dreaming reports guard: validate each per-agent reflection report against its slot and schema, list slots to retry once, then merge the retry pass.",
+    intent:
+      "Reject malformed or mismatched reflection reports before synthesis in the dreaming workflow.",
+    source: asText(dreamReportsCheckSrc),
+  },
+  {
+    name: "dream-apply",
+    description:
+      "Dreaming apply: write approved identity and memory actions with pre-images, scrubber guards and re-read verification.",
+    intent:
+      "Nightly dreaming run applies auto-tier identity and memory actions, honouring lanes and caps.",
+    source: asText(dreamApplySrc),
+  },
+  {
+    name: "dream-trim",
+    description:
+      "Dreaming trim: plan profile-field trims with KV pre-images, then apply net-smaller drafts with re-read verification.",
+    intent: "Keep agent profile fields short; plan, apply or revert one night's trims.",
+    source: asText(dreamTrimSrc),
+  },
+  {
+    name: "dream-heartbeat",
+    description:
+      "Dreaming heartbeat lane: plan, validate and apply a prune of the Lead's HEARTBEAT checklist, with the draft and pre-image held in KV.",
+    intent:
+      "Run from the dreaming workflow to shrink the Lead heartbeat safely: validator parity, kept pins, a quiet window, sha-checked apply and rollback.",
+    source: asText(dreamHeartbeatSrc),
+  },
+  {
+    name: "dream-verify",
+    description:
+      "Dreaming verify: re-check every lane's claims against the database, flag unclaimed writes and dry-run violations, track survival, and mark a clean dry run green.",
+    intent:
+      "Run after the dreaming lanes to prove what changed, keep the ledger, and unlock the first live run.",
+    source: asText(dreamVerifySrc),
+  },
+  {
+    name: "dream-learn",
+    description:
+      "Dreaming learning loop: score past profile, heartbeat and memory cuts (reverted, reintroduced, referenced), pin reintroduced ones, store nightly metrics with trends.",
+    intent: "Measure whether dreaming cuts stuck and feed that back into the next night's gather.",
+    source: asText(dreamLearnSrc),
+  },
+  {
+    name: "dream-owners",
+    description:
+      "Dreaming owners: turn every action no lane closed tonight into one task per owner, idempotent per run, and flag degraded sends with the unowned action ids.",
+    intent: "Make sure nothing the nightly dreaming run found stays parked without an owner.",
+    source: asText(dreamOwnersSrc),
+  },
+  {
+    name: "dream-rollback",
+    description:
+      "Dreaming rollback: restore profile fields, identity edits and memories a dreaming run wrote, from its KV pre-images.",
+    intent: "Undo one dreaming run by hand.",
+    source: asText(dreamRollbackSrc),
   },
 ];
 
