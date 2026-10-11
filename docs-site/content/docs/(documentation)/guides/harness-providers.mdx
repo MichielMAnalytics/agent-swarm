@@ -867,6 +867,8 @@ Skills are the swarm's portable procedural knowledge — reusable markdown files
 
 Follow-up and resumed task prompts keep the skill invocation on the first line, with the bounded prior-context block after it. Persisted profile-sync warnings also follow the invocation and stay ahead of prior context. Claude and the OpenCode ACP target expand the leading command natively; Codex and OpenCode use the adapter resolver. Prepending context before the command leaves it as plain text.
 
+Skill telemetry records successful shell `cat` reads of installed `SKILL.md` files as `skill.invoke` with `via: "read"`, including Codex's `bash -lc` commands. Listing or searching a skills directory does not count. Each skill counts once per session across prompt, tool, and read delivery; failed Codex shell commands do not count.
+
 ### Where skill files come from
 
 The swarm still seeds skills into each provider's skill dir at container boot in [`docker-entrypoint.sh`](https://github.com/desplega-ai/agent-swarm/blob/main/docker-entrypoint.sh) L764–803, but bundled complex-skill files are now also synced from the database during normal skill refreshes. At minimum, every skill installs its `SKILL.md` into:
