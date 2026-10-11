@@ -201,17 +201,41 @@ export function loadSeedSchedules(
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
-function scheduleSeedHash(schedule: SeedSchedule): string {
+/**
+ * The part of a seeded schedule that the seed hash covers. `enabled` is left
+ * out on purpose: it is an operator switch, not content. Toggling it must not
+ * mark the row as user-edited, and flipping SEED_AUTOMATIONS_ENABLED must not
+ * change any source hash.
+ */
+type HashedSeedSchedule = Omit<SeedSchedule, "enabled">;
+
+function hashedSchedule(schedule: SeedSchedule): HashedSeedSchedule {
+  const { enabled: _enabled, ...hashed } = schedule;
+  return hashed;
+}
+
+function scheduleSeedHash(schedule: HashedSeedSchedule): string {
   return computeContentHash(canonicalJson(schedule));
 }
 
-function scheduleFromRow(schedule: ScheduledTask): SeedSchedule {
+/**
+ * Seed hashes recorded before `enabled` left the hash covered it. Return the
+ * old-formula hash of the live row under both `enabled` values, so a row whose
+ * only change is an `enabled` toggle still counts as pristine and is
+ * rebaselined to the new formula.
+ */
+function legacyScheduleSeedHashes(schedule: HashedSeedSchedule): string[] {
+  return [true, false].map((enabled) =>
+    computeContentHash(canonicalJson({ ...schedule, enabled })),
+  );
+}
+
+function scheduleFromRow(schedule: ScheduledTask): HashedSeedSchedule {
   return {
     name: schedule.name,
     description: schedule.description ?? "",
     cronExpression: schedule.cronExpression ?? "",
     timezone: schedule.timezone,
-    enabled: schedule.enabled,
     taskTemplate: schedule.taskTemplate ?? "",
     taskType: schedule.taskType ?? "",
     tags: schedule.tags,
@@ -221,18 +245,18 @@ function scheduleFromRow(schedule: ScheduledTask): SeedSchedule {
   };
 }
 
-function nextRunAt(schedule: SeedSchedule): string | null {
+function nextRunAt(schedule: SeedSchedule, enabled: boolean): string | null {
   try {
     // Disabled templates can await a required timezone parameter. Validate the
     // cron in UTC until setup supplies it, retaining the placeholder in the row.
     const timezonePending =
-      !schedule.enabled &&
+      !enabled &&
       schedule.requiredParams.some((param) => schedule.timezone.includes(`{{${param}}}`));
     const interval = CronExpressionParser.parse(schedule.cronExpression, {
       currentDate: new Date(),
       tz: timezonePending ? "UTC" : schedule.timezone,
     });
-    return schedule.enabled ? interval.next().toISOString() : null;
+    return enabled ? interval.next().toISOString() : null;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Invalid cron expression";
     throw new Error(`Invalid cron expression: ${message}`);
@@ -249,7 +273,7 @@ export function createSchedulesSeeder(
     items(): ScheduleSeedItem[] {
       return schedules.map((schedule) => ({
         key: schedule.name,
-        contentHash: scheduleSeedHash(schedule),
+        contentHash: scheduleSeedHash(hashedSchedule(schedule)),
         schedule,
       }));
     },
@@ -259,14 +283,17 @@ export function createSchedulesSeeder(
       return existing ? scheduleSeedHash(scheduleFromRow(existing)) : null;
     },
 
+    async legacyUpstreamHashes(item): Promise<string[]> {
+      const existing = await getScheduledTaskByName(item.key);
+      return existing ? legacyScheduleSeedHashes(scheduleFromRow(existing)) : [];
+    },
+
     async apply(item): Promise<void> {
       const { schedule } = item;
-      const resolvedNextRunAt = nextRunAt(schedule);
       const data = {
         description: schedule.description,
         cronExpression: schedule.cronExpression,
         timezone: schedule.timezone,
-        enabled: schedule.enabled,
         targetType: "agent-task" as const,
         taskTemplate: schedule.taskTemplate,
         taskType: schedule.taskType,
@@ -277,11 +304,20 @@ export function createSchedulesSeeder(
       };
       const existing = await getScheduledTaskByName(schedule.name);
       if (existing) {
-        await updateScheduledTask(existing.id, { ...data, nextRunAt: resolvedNextRunAt });
+        // `enabled` is the operator's switch: an update ships new content and
+        // keeps whatever the row is set to. The cron is validated either way,
+        // but only an enabled row gets a fresh nextRunAt.
+        const resolvedNextRunAt = nextRunAt(schedule, existing.enabled);
+        await updateScheduledTask(existing.id, {
+          ...data,
+          ...(existing.enabled ? { nextRunAt: resolvedNextRunAt } : {}),
+        });
       } else {
+        const resolvedNextRunAt = nextRunAt(schedule, schedule.enabled);
         await createScheduledTask({
           name: schedule.name,
           ...data,
+          enabled: schedule.enabled,
           nextRunAt: resolvedNextRunAt ?? undefined,
         });
       }

@@ -2,17 +2,20 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import {
   closeDb,
+  computeContentHash,
   getScheduledTaskByName,
   getScheduledTasks,
   initDb,
   updateScheduledTask,
 } from "../be/db";
-import { runSeeder } from "../be/seed";
+import { getSeedState, recordSeedState, runSeeder } from "../be/seed";
 import {
   createSchedulesSeeder,
   loadSeedSchedules,
   type ScheduleTemplateSource,
 } from "../be/seed/schedules-seeder";
+import { canonicalJson } from "../be/seed/workflows-seeder";
+import type { ScheduledTask } from "../types";
 
 const TEST_DB_PATH = "./test-seed-schedules.sqlite";
 
@@ -70,6 +73,43 @@ function zeroConfigScheduleSource(opts?: {
       enabled: templateEnabled,
     })}\n\`\`\`\n\n## Scheduled Task\n\nRun work.`,
   } satisfies ScheduleTemplateSource;
+}
+
+/**
+ * Local copy of the seed hash shape from before `enabled` left the hash: the
+ * hashed fields of the row plus `enabled`. Deliberately not imported from the
+ * seeder, so these fixtures keep the old formula even if the seeder changes.
+ */
+function legacyScheduleHash(row: ScheduledTask, enabled: boolean): string {
+  const hashed = {
+    name: row.name,
+    description: row.description ?? "",
+    cronExpression: row.cronExpression ?? "",
+    timezone: row.timezone,
+    taskTemplate: row.taskTemplate ?? "",
+    taskType: row.taskType ?? "",
+    tags: row.tags,
+    params: row.params ?? {},
+    requiredParams: row.requiredParams ?? [],
+    requires: row.requires ?? [],
+  };
+  return computeContentHash(canonicalJson({ ...hashed, enabled }));
+}
+
+function legacyScheduleHashes(row: ScheduledTask): string[] {
+  return [legacyScheduleHash(row, true), legacyScheduleHash(row, false)];
+}
+
+/**
+ * Seed `source` and then rewrite its seed_state the way the pre-fix seeder
+ * recorded it: the legacy-formula hash, including the row's create-time
+ * `enabled`. Returns the row as seeded.
+ */
+async function seedLegacySchedule(source = scheduleSource()): Promise<ScheduledTask> {
+  await runSeeder(createSchedulesSeeder([source]), { quiet: true });
+  const row = (await getScheduledTaskByName(JSON.parse(source.config).name))!;
+  await recordSeedState("schedule", row.name, legacyScheduleHash(row, row.enabled));
+  return row;
 }
 
 const ORIGINAL_SEED_AUTOMATIONS_ENABLED = process.env.SEED_AUTOMATIONS_ENABLED;
@@ -215,7 +255,7 @@ describe("schedules seeder", () => {
     expect(second).toMatchObject({ skippedUnchanged: 1, updated: 0, failed: [] });
   });
 
-  test("preserves a schedule enabled by the operator", async () => {
+  test("keeps updating a schedule the operator enabled, and keeps it enabled", async () => {
     await runSeeder(createSchedulesSeeder([scheduleSource()]), { quiet: true });
     const seeded = await getScheduledTaskByName("test-seeded-schedule");
     await updateScheduledTask(seeded!.id, { enabled: true });
@@ -223,11 +263,182 @@ describe("schedules seeder", () => {
     const result = await runSeeder(createSchedulesSeeder([scheduleSource("30 9 * * *")]), {
       quiet: true,
     });
-    expect(result.skippedUserModified).toBe(1);
+    expect(result).toMatchObject({ updated: 1, skippedUserModified: 0, failed: [] });
+    const updated = await getScheduledTaskByName("test-seeded-schedule");
+    expect(updated).toMatchObject({ enabled: true, cronExpression: "30 9 * * *" });
+    // An enabled row gets a nextRunAt computed from the new cron.
+    expect(updated?.nextRunAt).toBeDefined();
+    expect(new Date(updated!.nextRunAt!).getUTCMinutes()).toBe(30);
+  });
+
+  test("an update keeps a disabled schedule disabled and does not schedule a run", async () => {
+    await runSeeder(createSchedulesSeeder([scheduleSource()]), { quiet: true });
+
+    const result = await runSeeder(createSchedulesSeeder([scheduleSource("30 9 * * *")]), {
+      quiet: true,
+    });
+    expect(result).toMatchObject({ updated: 1, skippedUserModified: 0 });
     expect(await getScheduledTaskByName("test-seeded-schedule")).toMatchObject({
+      enabled: false,
+      cronExpression: "30 9 * * *",
+      nextRunAt: undefined,
+    });
+  });
+
+  test("an update keeps an auto-enabled schedule the operator disabled disabled", async () => {
+    await runSeeder(createSchedulesSeeder([zeroConfigScheduleSource()]), { quiet: true });
+    const seeded = await getScheduledTaskByName("test-zero-config-schedule");
+    expect(seeded?.enabled).toBe(true);
+    await updateScheduledTask(seeded!.id, { enabled: false });
+
+    const changed = zeroConfigScheduleSource();
+    changed.content = changed.content.replace("Run work.", "Run updated work.");
+    const result = await runSeeder(createSchedulesSeeder([changed]), { quiet: true });
+    expect(result).toMatchObject({ updated: 1, skippedUserModified: 0 });
+    expect(await getScheduledTaskByName("test-zero-config-schedule")).toMatchObject({
+      enabled: false,
+      taskTemplate: "Run updated work.",
+    });
+  });
+
+  describe("rows seeded under the legacy hash (enabled was hashed)", () => {
+    test("(a) an unedited legacy row is rebaselined, and a later template change updates it", async () => {
+      const row = await seedLegacySchedule();
+      const seeder = createSchedulesSeeder([scheduleSource()]);
+      const item = seeder.items()[0]!;
+
+      const first = await runSeeder(seeder, { quiet: true });
+      expect(first).toMatchObject({ skippedUnchanged: 1, rebaselined: 1, skippedUserModified: 0 });
+      const recorded = (await getSeedState("schedule", item.key))?.seededHash;
+      expect(recorded).toBe(item.contentHash);
+      // Legacy -> new: the recorded hash is now a new-formula hash, which no
+      // legacy-formula hash of the same row can equal.
+      expect(legacyScheduleHashes(row)).not.toContain(recorded);
+
+      const second = await runSeeder(createSchedulesSeeder([scheduleSource("30 9 * * *")]), {
+        quiet: true,
+      });
+      expect(second).toMatchObject({ updated: 1, rebaselined: 0, skippedUserModified: 0 });
+      expect((await getScheduledTaskByName("test-seeded-schedule"))?.cronExpression).toBe(
+        "30 9 * * *",
+      );
+    });
+
+    test("(b) a legacy row with only enabled toggled is pristine: it updates and stays enabled", async () => {
+      const row = await seedLegacySchedule();
+      await updateScheduledTask(row.id, { enabled: true });
+
+      const result = await runSeeder(createSchedulesSeeder([scheduleSource("30 9 * * *")]), {
+        quiet: true,
+      });
+      expect(result).toMatchObject({
+        updated: 1,
+        rebaselined: 1,
+        skippedUserModified: 0,
+        failed: [],
+      });
+      expect(await getScheduledTaskByName("test-seeded-schedule")).toMatchObject({
+        enabled: true,
+        cronExpression: "30 9 * * *",
+      });
+    });
+
+    test("(c) a legacy row with a description edit is preserved", async () => {
+      const row = await seedLegacySchedule();
+      await updateScheduledTask(row.id, { description: "Operator description." });
+
+      const result = await runSeeder(createSchedulesSeeder([scheduleSource("30 9 * * *")]), {
+        quiet: true,
+      });
+      expect(result).toMatchObject({ skippedUserModified: 1, updated: 0, rebaselined: 0 });
+      expect(await getScheduledTaskByName("test-seeded-schedule")).toMatchObject({
+        description: "Operator description.",
+        cronExpression: "0 9 * * *",
+      });
+    });
+
+    test("(c) a legacy row with a task-template edit is preserved", async () => {
+      const row = await seedLegacySchedule();
+      await updateScheduledTask(row.id, { taskTemplate: "Operator prompt." });
+
+      const result = await runSeeder(createSchedulesSeeder([scheduleSource("30 9 * * *")]), {
+        quiet: true,
+      });
+      expect(result).toMatchObject({ skippedUserModified: 1, updated: 0, rebaselined: 0 });
+      expect(await getScheduledTaskByName("test-seeded-schedule")).toMatchObject({
+        taskTemplate: "Operator prompt.",
+        cronExpression: "0 9 * * *",
+      });
+    });
+
+    test("(d) a legacy row with a content edit plus an enabled toggle is preserved", async () => {
+      const row = await seedLegacySchedule();
+      await updateScheduledTask(row.id, { taskTemplate: "Operator prompt.", enabled: true });
+
+      const result = await runSeeder(createSchedulesSeeder([scheduleSource("30 9 * * *")]), {
+        quiet: true,
+      });
+      expect(result).toMatchObject({ skippedUserModified: 1, updated: 0, rebaselined: 0 });
+      expect(await getScheduledTaskByName("test-seeded-schedule")).toMatchObject({
+        enabled: true,
+        taskTemplate: "Operator prompt.",
+        cronExpression: "0 9 * * *",
+      });
+    });
+
+    test("new -> legacy: a rebaselined row edited later is preserved, never matched as legacy", async () => {
+      await seedLegacySchedule();
+      await runSeeder(createSchedulesSeeder([scheduleSource()]), { quiet: true }); // rebaseline
+      const rebaselined = await getScheduledTaskByName("test-seeded-schedule");
+      await updateScheduledTask(rebaselined!.id, { description: "Edited after rebaseline." });
+
+      const result = await runSeeder(createSchedulesSeeder([scheduleSource("30 9 * * *")]), {
+        quiet: true,
+      });
+      expect(result).toMatchObject({ skippedUserModified: 1, updated: 0, rebaselined: 0 });
+      expect((await getScheduledTaskByName("test-seeded-schedule"))?.description).toBe(
+        "Edited after rebaseline.",
+      );
+    });
+  });
+
+  test("(e) a schedule with filled params is still preserved", async () => {
+    await runSeeder(createSchedulesSeeder([scheduleSource()]), { quiet: true });
+    const seeded = await getScheduledTaskByName("test-seeded-schedule");
+    await updateScheduledTask(seeded!.id, {
+      params: { REPO_URL: "https://example.com/repo.git" },
       enabled: true,
+    });
+
+    const result = await runSeeder(createSchedulesSeeder([scheduleSource("30 9 * * *")]), {
+      quiet: true,
+    });
+    expect(result).toMatchObject({ skippedUserModified: 1, updated: 0 });
+    expect(await getScheduledTaskByName("test-seeded-schedule")).toMatchObject({
+      params: { REPO_URL: "https://example.com/repo.git" },
       cronExpression: "0 9 * * *",
     });
+  });
+
+  test("(f) flipping SEED_AUTOMATIONS_ENABLED changes no hash", async () => {
+    delete process.env.SEED_AUTOMATIONS_ENABLED;
+    const on = createSchedulesSeeder([zeroConfigScheduleSource()]).items()[0]!;
+    process.env.SEED_AUTOMATIONS_ENABLED = "false";
+    const off = createSchedulesSeeder([zeroConfigScheduleSource()]).items()[0]!;
+    // Control: the switch does change the create-time enabled value.
+    expect(on.schedule.enabled).toBe(true);
+    expect(off.schedule.enabled).toBe(false);
+    expect(off.contentHash).toBe(on.contentHash);
+
+    // A row seeded with the switch on stays in sync after the switch flips.
+    delete process.env.SEED_AUTOMATIONS_ENABLED;
+    await runSeeder(createSchedulesSeeder([zeroConfigScheduleSource()]), { quiet: true });
+    process.env.SEED_AUTOMATIONS_ENABLED = "false";
+    const result = await runSeeder(createSchedulesSeeder([zeroConfigScheduleSource()]), {
+      quiet: true,
+    });
+    expect(result).toMatchObject({ skippedUnchanged: 1, skippedUserModified: 0 });
+    expect((await getScheduledTaskByName("test-zero-config-schedule"))?.enabled).toBe(true);
   });
 
   test("updates a pristine schedule when its template changes", async () => {

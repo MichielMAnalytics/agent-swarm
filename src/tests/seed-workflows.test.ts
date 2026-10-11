@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
-import { closeDb, initDb, listWorkflows, updateWorkflow } from "../be/db";
-import { getSeedState, runSeeder } from "../be/seed";
+import { closeDb, computeContentHash, initDb, listWorkflows, updateWorkflow } from "../be/db";
+import { getSeedState, recordSeedState, runSeeder } from "../be/seed";
 import {
+  canonicalJson,
   createWorkflowsSeeder,
   loadSeedWorkflows,
   type WorkflowTemplateSource,
 } from "../be/seed/workflows-seeder";
+import type { Workflow } from "../types";
 
 const TEST_DB_PATH = "./test-seed-workflows.sqlite";
 
@@ -61,6 +63,48 @@ function zeroConfigWorkflowSource(opts?: {
 
 async function getWorkflow(name = "test-seeded-workflow") {
   return (await listWorkflows()).find((workflow) => workflow.name === name) ?? null;
+}
+
+const EDITED_DEFINITION = {
+  nodes: [{ id: "ui-edit", type: "agent-task", config: { template: "Edited." } }],
+  onNodeFailure: "fail" as const,
+};
+
+/**
+ * Local copy of the seed hash shape from before `enabled` left the hash: the
+ * hashed fields of the row plus `enabled`. Deliberately not imported from the
+ * seeder, so these fixtures keep the old formula even if the seeder changes.
+ */
+function legacyWorkflowHash(row: Workflow, enabled: boolean): string {
+  const hashed = {
+    name: row.name,
+    description: row.description ?? "",
+    definition: row.definition,
+    triggers: row.triggers,
+    cooldown: row.cooldown,
+    input: row.input,
+    triggerSchema: row.triggerSchema,
+    params: row.params ?? {},
+    requiredParams: row.requiredParams ?? [],
+    requires: row.requires ?? [],
+  };
+  return computeContentHash(canonicalJson({ ...hashed, enabled }));
+}
+
+function legacyWorkflowHashes(row: Workflow): string[] {
+  return [legacyWorkflowHash(row, true), legacyWorkflowHash(row, false)];
+}
+
+/**
+ * Seed `source` and then rewrite its seed_state the way the pre-fix seeder
+ * recorded it: the legacy-formula hash, including the row's create-time
+ * `enabled`. Returns the row as seeded.
+ */
+async function seedLegacyWorkflow(source = workflowSource()): Promise<Workflow> {
+  await runSeeder(createWorkflowsSeeder([source]), { quiet: true });
+  const row = (await getWorkflow(JSON.parse(source.config).name))!;
+  await recordSeedState("workflow", row.name, legacyWorkflowHash(row, row.enabled));
+  return row;
 }
 
 const ORIGINAL_SEED_AUTOMATIONS_ENABLED = process.env.SEED_AUTOMATIONS_ENABLED;
@@ -167,7 +211,7 @@ describe("workflows seeder", () => {
     expect(second).toMatchObject({ skippedUnchanged: 1, updated: 0, failed: [] });
   });
 
-  test("preserves a workflow enabled by the operator", async () => {
+  test("keeps updating a workflow the operator enabled, and keeps it enabled", async () => {
     await runSeeder(createWorkflowsSeeder([workflowSource()]), { quiet: true });
     const seeded = await getWorkflow();
     await updateWorkflow(seeded!.id, { enabled: true });
@@ -175,14 +219,157 @@ describe("workflows seeder", () => {
     const result = await runSeeder(createWorkflowsSeeder([workflowSource("Source update.")]), {
       quiet: true,
     });
-    expect(result.skippedUserModified).toBe(1);
+    expect(result).toMatchObject({ updated: 1, skippedUserModified: 0, failed: [] });
     expect(await getWorkflow()).toMatchObject({
       enabled: true,
       definition: {
-        nodes: [{ id: "work", type: "agent-task", config: { template: "Do the work." } }],
+        nodes: [{ id: "work", type: "agent-task", config: { template: "Source update." } }],
         onNodeFailure: "fail",
       },
     });
+  });
+
+  test("an update keeps a disabled workflow disabled", async () => {
+    await runSeeder(createWorkflowsSeeder([zeroConfigWorkflowSource()]), { quiet: true });
+    const seeded = await getWorkflow("test-zero-config-workflow");
+    expect(seeded?.enabled).toBe(true);
+    await updateWorkflow(seeded!.id, { enabled: false });
+
+    const changed = zeroConfigWorkflowSource();
+    changed.content = changed.content.replace("Do the work.", "Source update.");
+    const result = await runSeeder(createWorkflowsSeeder([changed]), { quiet: true });
+    expect(result).toMatchObject({ updated: 1, skippedUserModified: 0 });
+    const updated = await getWorkflow("test-zero-config-workflow");
+    expect(updated?.enabled).toBe(false);
+    expect(updated?.definition.nodes[0]?.config.template).toBe("Source update.");
+  });
+
+  describe("rows seeded under the legacy hash (enabled was hashed)", () => {
+    test("(a) an unedited legacy row is rebaselined, and a later template change updates it", async () => {
+      const row = await seedLegacyWorkflow();
+      const seeder = createWorkflowsSeeder([workflowSource()]);
+      const item = seeder.items()[0]!;
+
+      const first = await runSeeder(seeder, { quiet: true });
+      expect(first).toMatchObject({ skippedUnchanged: 1, rebaselined: 1, skippedUserModified: 0 });
+      const recorded = (await getSeedState("workflow", item.key))?.seededHash;
+      expect(recorded).toBe(item.contentHash);
+      // Legacy -> new: the recorded hash is now a new-formula hash, which no
+      // legacy-formula hash of the same row can equal.
+      expect(legacyWorkflowHashes(row)).not.toContain(recorded);
+
+      const second = await runSeeder(createWorkflowsSeeder([workflowSource("Source update.")]), {
+        quiet: true,
+      });
+      expect(second).toMatchObject({ updated: 1, rebaselined: 0, skippedUserModified: 0 });
+      expect((await getWorkflow())?.definition.nodes[0]?.config.template).toBe("Source update.");
+    });
+
+    test("(b) a legacy row with only enabled toggled is pristine: it updates and stays enabled", async () => {
+      const row = await seedLegacyWorkflow();
+      await updateWorkflow(row.id, { enabled: true });
+
+      const result = await runSeeder(createWorkflowsSeeder([workflowSource("Source update.")]), {
+        quiet: true,
+      });
+      expect(result).toMatchObject({
+        updated: 1,
+        rebaselined: 1,
+        skippedUserModified: 0,
+        failed: [],
+      });
+      const updated = await getWorkflow();
+      expect(updated?.enabled).toBe(true);
+      expect(updated?.definition.nodes[0]?.config.template).toBe("Source update.");
+    });
+
+    test("(c) a legacy row with a description edit is preserved", async () => {
+      const row = await seedLegacyWorkflow();
+      await updateWorkflow(row.id, { description: "Operator description." });
+
+      const result = await runSeeder(createWorkflowsSeeder([workflowSource("Source update.")]), {
+        quiet: true,
+      });
+      expect(result).toMatchObject({ skippedUserModified: 1, updated: 0, rebaselined: 0 });
+      const kept = await getWorkflow();
+      expect(kept?.description).toBe("Operator description.");
+      expect(kept?.definition.nodes[0]?.config.template).toBe("Do the work.");
+    });
+
+    test("(c) a legacy row with a definition edit is preserved", async () => {
+      const row = await seedLegacyWorkflow();
+      await updateWorkflow(row.id, { definition: EDITED_DEFINITION });
+
+      const result = await runSeeder(createWorkflowsSeeder([workflowSource("Source update.")]), {
+        quiet: true,
+      });
+      expect(result).toMatchObject({ skippedUserModified: 1, updated: 0, rebaselined: 0 });
+      expect((await getWorkflow())?.definition.nodes[0]?.id).toBe("ui-edit");
+    });
+
+    test("(d) a legacy row with a content edit plus an enabled toggle is preserved", async () => {
+      const row = await seedLegacyWorkflow();
+      await updateWorkflow(row.id, { definition: EDITED_DEFINITION, enabled: true });
+
+      const result = await runSeeder(createWorkflowsSeeder([workflowSource("Source update.")]), {
+        quiet: true,
+      });
+      expect(result).toMatchObject({ skippedUserModified: 1, updated: 0, rebaselined: 0 });
+      const kept = await getWorkflow();
+      expect(kept?.enabled).toBe(true);
+      expect(kept?.definition.nodes[0]?.id).toBe("ui-edit");
+    });
+
+    test("new -> legacy: a rebaselined row edited later is preserved, never matched as legacy", async () => {
+      await seedLegacyWorkflow();
+      await runSeeder(createWorkflowsSeeder([workflowSource()]), { quiet: true }); // rebaseline
+      const rebaselined = await getWorkflow();
+      await updateWorkflow(rebaselined!.id, { description: "Edited after rebaseline." });
+
+      const result = await runSeeder(createWorkflowsSeeder([workflowSource("Source update.")]), {
+        quiet: true,
+      });
+      expect(result).toMatchObject({ skippedUserModified: 1, updated: 0, rebaselined: 0 });
+      expect((await getWorkflow())?.description).toBe("Edited after rebaseline.");
+    });
+  });
+
+  test("(e) a workflow with filled params is still preserved", async () => {
+    await runSeeder(createWorkflowsSeeder([workflowSource()]), { quiet: true });
+    const seeded = await getWorkflow();
+    await updateWorkflow(seeded!.id, {
+      params: { REPO_URL: "https://example.com/repo.git" },
+      enabled: true,
+    });
+
+    const result = await runSeeder(createWorkflowsSeeder([workflowSource("Source update.")]), {
+      quiet: true,
+    });
+    expect(result).toMatchObject({ skippedUserModified: 1, updated: 0 });
+    const kept = await getWorkflow();
+    expect(kept?.params).toEqual({ REPO_URL: "https://example.com/repo.git" });
+    expect(kept?.definition.nodes[0]?.config.template).toBe("Do the work.");
+  });
+
+  test("(f) flipping SEED_AUTOMATIONS_ENABLED changes no hash", async () => {
+    delete process.env.SEED_AUTOMATIONS_ENABLED;
+    const on = createWorkflowsSeeder([zeroConfigWorkflowSource()]).items()[0]!;
+    process.env.SEED_AUTOMATIONS_ENABLED = "false";
+    const off = createWorkflowsSeeder([zeroConfigWorkflowSource()]).items()[0]!;
+    // Control: the switch does change the create-time enabled value.
+    expect(on.workflow.enabled).toBe(true);
+    expect(off.workflow.enabled).toBe(false);
+    expect(off.contentHash).toBe(on.contentHash);
+
+    // A row seeded with the switch on stays in sync after the switch flips.
+    delete process.env.SEED_AUTOMATIONS_ENABLED;
+    await runSeeder(createWorkflowsSeeder([zeroConfigWorkflowSource()]), { quiet: true });
+    process.env.SEED_AUTOMATIONS_ENABLED = "false";
+    const result = await runSeeder(createWorkflowsSeeder([zeroConfigWorkflowSource()]), {
+      quiet: true,
+    });
+    expect(result).toMatchObject({ skippedUnchanged: 1, skippedUserModified: 0 });
+    expect((await getWorkflow("test-zero-config-workflow"))?.enabled).toBe(true);
   });
 
   test("preserves a workflow edited by the operator", async () => {

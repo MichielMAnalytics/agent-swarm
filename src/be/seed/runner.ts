@@ -14,6 +14,10 @@ import type { Seeder, SeederResult, SeederRunOptions } from "./types";
  *   - upstream pristine, src moved -> update
  *   - upstream pristine, src same  -> no-op
  *   - upstream user-modified       -> preserve (never overwrite)
+ *
+ * A recorded hash that matches the live row under a legacy hash formula
+ * ({@link Seeder.legacyUpstreamHashes}) counts as pristine; the row records
+ * the current formula and is counted in `rebaselined`.
  */
 export async function runSeeder(seeder: Seeder, opts?: SeederRunOptions): Promise<SeederResult> {
   const result: SeederResult = {
@@ -22,6 +26,7 @@ export async function runSeeder(seeder: Seeder, opts?: SeederRunOptions): Promis
     updated: 0,
     skippedUnchanged: 0,
     skippedUserModified: 0,
+    rebaselined: 0,
     failed: [],
   };
 
@@ -40,6 +45,15 @@ export async function runSeeder(seeder: Seeder, opts?: SeederRunOptions): Promis
 
       const state = await getSeedState(seeder.kind, item.key);
 
+      // A recorded hash from an older hash formula of this kind. If the live row
+      // still hashes to it under that formula, nothing user-authored changed:
+      // the row is pristine and gets rebaselined to the current formula below.
+      const legacy =
+        state && upstream !== state.seededHash
+          ? ((await seeder.legacyUpstreamHashes?.(item)) ?? [])
+          : [];
+      const legacyMatch = state ? legacy.includes(state.seededHash) : false;
+
       if (upstream === item.contentHash) {
         // Live copy is byte-identical to the current source, so there is nothing
         // user-authored to lose. Treat it as in sync regardless of seed state:
@@ -48,16 +62,18 @@ export async function runSeeder(seeder: Seeder, opts?: SeederRunOptions): Promis
         // detectable as an update instead of being preserved forever.
         if (state?.seededHash !== item.contentHash) {
           await recordSeedState(seeder.kind, item.key, item.contentHash);
+          if (legacyMatch) result.rebaselined += 1;
         }
         result.skippedUnchanged += 1;
         continue;
       }
 
-      // "Pristine" = the live upstream copy still matches what we last seeded.
-      // With no recorded state (first run after this framework landed, or a
-      // pre-existing entity) the live copy already differs from source here, so
-      // we conservatively assume a user authored it and must not clobber it.
-      const pristine = state ? upstream === state.seededHash : false;
+      // "Pristine" = the live upstream copy still matches what we last seeded,
+      // under the current hash formula or a legacy one. With no recorded state
+      // (first run after this framework landed, or a pre-existing entity) the
+      // live copy already differs from source here, so we conservatively
+      // assume a user authored it and must not clobber it.
+      const pristine = state ? upstream === state.seededHash || legacyMatch : false;
 
       if (!pristine) {
         // A user changed the upstream copy since our last seed — preserve it.
@@ -69,6 +85,7 @@ export async function runSeeder(seeder: Seeder, opts?: SeederRunOptions): Promis
       await seeder.apply(item, "update", opts);
       await recordSeedState(seeder.kind, item.key, item.contentHash);
       result.updated += 1;
+      if (legacyMatch) result.rebaselined += 1;
     } catch (err) {
       result.failed.push({
         key: item.key,
@@ -81,7 +98,7 @@ export async function runSeeder(seeder: Seeder, opts?: SeederRunOptions): Promis
     console.log(
       `[seed:${result.kind}] created=${result.created} updated=${result.updated} ` +
         `unchanged=${result.skippedUnchanged} preserved=${result.skippedUserModified} ` +
-        `failed=${result.failed.length}`,
+        `rebaselined=${result.rebaselined} failed=${result.failed.length}`,
     );
     for (const f of result.failed) {
       console.error(`[seed:${result.kind}] FAILED ${f.key}: ${f.error}`);

@@ -15,7 +15,8 @@
  *   - upstream user-modified              -> never overwrite (preserve)
  *
  * "Pristine" means the live upstream copy still hashes identically to what the
- * framework recorded on its last successful seed of that item.
+ * framework recorded on its last successful seed of that item, under the
+ * current hash formula or a legacy one ({@link Seeder.legacyUpstreamHashes}).
  */
 
 export type SeedAction =
@@ -51,6 +52,16 @@ export interface Seeder<TItem extends SeedItem = SeedItem> {
    * does not exist yet. Same hashing scheme as {@link SeedItem.contentHash}.
    */
   upstreamHash(item: TItem): string | null | Promise<string | null>;
+  /**
+   * Optional. Hashes of the live upstream entity under any *previous* hashing
+   * formula of this kind. When the recorded `seededHash` matches one of them,
+   * the row is still pristine: it was seeded under the old formula and not
+   * edited since. The harness then rebaselines it to the current formula. A
+   * seeder only implements this when it changes what its hash covers, and
+   * every legacy formula must be unable to collide with the current one.
+   * Return `[]` when the entity does not exist.
+   */
+  legacyUpstreamHashes?(item: TItem): Promise<string[]>;
   /** Create or update the upstream entity so it matches the source definition. */
   apply(item: TItem, action: "create" | "update", opts?: SeederRunOptions): void | Promise<void>;
 }
@@ -61,5 +72,11 @@ export type SeederResult = {
   updated: number;
   skippedUnchanged: number;
   skippedUserModified: number;
+  /**
+   * Rows whose recorded seed hash matched a legacy formula (see
+   * {@link Seeder.legacyUpstreamHashes}) and now record the current one. Not a
+   * separate outcome: each is also counted as `updated` or `skippedUnchanged`.
+   */
+  rebaselined: number;
   failed: Array<{ key: string; error: string }>;
 };

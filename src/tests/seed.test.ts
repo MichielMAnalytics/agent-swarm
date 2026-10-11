@@ -3,6 +3,7 @@ import { unlink } from "node:fs/promises";
 import { closeDb, initDb } from "../be/db";
 import {
   getSeedState,
+  recordSeedState,
   runSeeder,
   type Seeder,
   type SeederRunOptions,
@@ -185,6 +186,99 @@ describe("seeder harness — versioning rule", () => {
     await runSeeder(seeder, { quiet: true, scriptEmbeddingMode: "skip" });
     expect(capturedOpts).toHaveLength(1);
     expect(capturedOpts[0]?.scriptEmbeddingMode).toBe("skip");
+  });
+
+  describe("legacyUpstreamHashes", () => {
+    /**
+     * Like makeFakeSeeder, plus a `legacy` map: the live row's hash under an
+     * older hash formula. Records how often the hook was asked.
+     */
+    function makeLegacySeeder(
+      kind: string,
+      source: Map<string, string>,
+      upstream: Map<string, string>,
+      legacy: Map<string, string[]>,
+    ) {
+      const calls: string[] = [];
+      const seeder: Seeder<SeedItem> = {
+        ...makeFakeSeeder(kind, source, upstream),
+        legacyUpstreamHashes: async (item) => {
+          calls.push(item.key);
+          return legacy.get(item.key) ?? [];
+        },
+      };
+      return { seeder, calls };
+    }
+
+    test("legacy match + source moved -> updated, rebaselined to the current formula", async () => {
+      const source = new Map([["a", "h-new-src2"]]);
+      const upstream = new Map([["a", "h-new-live"]]);
+      const legacy = new Map([["a", ["h-old-live-x", "h-old-live-y"]]]);
+      await recordSeedState("legacy-update-test", "a", "h-old-live-y");
+      const { seeder } = makeLegacySeeder("legacy-update-test", source, upstream, legacy);
+
+      const result = await runSeeder(seeder, { quiet: true });
+      expect(result).toMatchObject({
+        updated: 1,
+        skippedUserModified: 0,
+        rebaselined: 1,
+        failed: [],
+      });
+      expect(upstream.get("a")).toBe("h-new-src2");
+      expect((await getSeedState("legacy-update-test", "a"))?.seededHash).toBe("h-new-src2");
+    });
+
+    test("legacy match + live equals source -> unchanged, rebaselined to the current formula", async () => {
+      const source = new Map([["a", "h-new"]]);
+      const upstream = new Map([["a", "h-new"]]);
+      const legacy = new Map([["a", ["h-old"]]]);
+      await recordSeedState("legacy-unchanged-test", "a", "h-old");
+      const { seeder } = makeLegacySeeder("legacy-unchanged-test", source, upstream, legacy);
+
+      const result = await runSeeder(seeder, { quiet: true });
+      expect(result).toMatchObject({ skippedUnchanged: 1, rebaselined: 1, updated: 0 });
+      expect((await getSeedState("legacy-unchanged-test", "a"))?.seededHash).toBe("h-new");
+
+      // Idempotent: the row now carries a current-formula hash.
+      const again = await runSeeder(seeder, { quiet: true });
+      expect(again).toMatchObject({ skippedUnchanged: 1, rebaselined: 0 });
+    });
+
+    test("no legacy match -> still preserved, nothing rebaselined", async () => {
+      const source = new Map([["a", "h-src2"]]);
+      const upstream = new Map([["a", "h-user-edit"]]);
+      const legacy = new Map([["a", ["h-old-of-user-edit"]]]);
+      await recordSeedState("legacy-miss-test", "a", "h-seeded");
+      const { seeder } = makeLegacySeeder("legacy-miss-test", source, upstream, legacy);
+
+      const result = await runSeeder(seeder, { quiet: true });
+      expect(result).toMatchObject({ skippedUserModified: 1, updated: 0, rebaselined: 0 });
+      expect(upstream.get("a")).toBe("h-user-edit");
+      expect((await getSeedState("legacy-miss-test", "a"))?.seededHash).toBe("h-seeded");
+    });
+
+    test("the hook is not consulted when the recorded hash already matches", async () => {
+      const source = new Map([["a", "h-1"]]);
+      const upstream = new Map<string, string>();
+      const { seeder, calls } = makeLegacySeeder("legacy-skip-test", source, upstream, new Map());
+
+      await runSeeder(seeder, { quiet: true }); // create
+      source.set("a", "h-2");
+      const result = await runSeeder(seeder, { quiet: true }); // pristine update
+      expect(result).toMatchObject({ updated: 1, rebaselined: 0 });
+      expect(calls).toEqual([]);
+    });
+
+    test("a seeder without the hook keeps the old rule: a recorded mismatch is preserved", async () => {
+      const source = new Map([["a", "h-new-src"]]);
+      const upstream = new Map([["a", "h-new-live"]]);
+      await recordSeedState("legacy-absent-test", "a", "h-old-live");
+      const seeder = makeFakeSeeder("legacy-absent-test", source, upstream);
+
+      const result = await runSeeder(seeder, { quiet: true });
+      expect(result).toMatchObject({ skippedUserModified: 1, rebaselined: 0 });
+      expect(upstream.get("a")).toBe("h-new-live");
+    });
   });
 
   test("a throwing apply is captured per-item without aborting the run", async () => {

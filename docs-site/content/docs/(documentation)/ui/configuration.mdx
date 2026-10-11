@@ -247,6 +247,10 @@ The API server reads this value at boot when seeding runs (`restartRequired`): f
 to change what a *future* seed pass creates. It does not retroactively enable or disable automations
 already created on this install.
 
+Enabling or disabling a seeded workflow or schedule yourself is not an edit: later releases keep
+updating it and keep your setting. Editing anything else, including its params, stops updates for
+that automation.
+
 ## Comb (beta)
 
 `COMB_ENABLED` (default `false`) turns on [Comb](/docs/ui/comb), the agent-fs review space in the dashboard. It needs agent-fs: the flag has no effect until `AGENT_FS_API_URL` is set. With the flag on, the sidebar shows a **Comb** item and `/file` opens the swarm drive. Each person connects their own agent-fs identity in the browser. The key stays in that browser and never reaches the swarm API. Saving the flag auto-reloads, and the dashboard picks it up on its next status poll (30 seconds at most).

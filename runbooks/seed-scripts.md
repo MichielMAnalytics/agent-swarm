@@ -25,6 +25,9 @@ A **`Seeder`** declares one entity *kind*. It exposes three things:
   `null` if it does not exist. Must use the same hashing scheme as
   `SeedItem.contentHash`.
 - `apply(item, action)` — create or update the upstream entity.
+- `legacyUpstreamHashes(item)` (optional) — the live entity's hashes under any
+  previous hashing formula of this kind. Only needed when a seeder changes what
+  its hash covers; see "Changing what a hash covers" below.
 
 Register the seeder in `registry.ts` and the harness picks it up — adding a new
 kind never touches `runner.ts`.
@@ -32,7 +35,7 @@ kind never touches `runner.ts`.
 ### Versioning rule (pristine vs user-modified)
 
 Re-seeding is **not** a blind overwrite. The harness records, per `(kind, key)`,
-the hash it last seeded (`seed_state` table, migration `069`). On each run, per
+the hash it last seeded (`seed_state` table, migration `070_seed_state.sql`). On each run, per
 item:
 
 | upstream state                          | source state | action       |
@@ -54,6 +57,30 @@ wrote. A user edit makes the upstream hash diverge, so it is never clobbered —
 even if the source definition also changed. With no recorded state (a
 pre-existing entity, or the first run after this framework landed), an entity
 that differs from the source is conservatively preserved.
+
+### Seeded workflows and schedules: `enabled` is not an edit
+
+The workflow and schedule seed hashes leave out `enabled`. Toggling `enabled` is
+not an edit: the row keeps receiving template updates on each release, and an
+update keeps the row's current `enabled` value (a schedule gets a fresh
+`nextRunAt` only when it is enabled). Editing anything else, including params,
+stops updates for that row. `enabled` comes from the template only when the row
+is created (`resolveSeededEnabled`, gated by `SEED_AUTOMATIONS_ENABLED`), so
+flipping that switch changes no hash.
+
+### Changing what a hash covers
+
+Rows seeded before a hash change record a hash under the old formula, which the
+live row no longer reproduces. Without help they would look user-modified and
+freeze. A seeder that changes its formula implements `legacyUpstreamHashes`
+and returns the live row's hash under the old formula. If the recorded hash
+matches one of them, the row is still pristine: the harness updates it (or
+treats it as unchanged) and records the current-formula hash. The summary line
+counts these as `rebaselined=` (each is also counted as `updated` or
+`unchanged`). This needs no SQL migration and is idempotent. The old formula
+must be unable to collide with the new one: the workflow and schedule legacy
+hashes always contain an `enabled` key and the current ones never do, so a
+later real edit cannot match a legacy hash.
 
 ## The scripts seeder — `src/be/seed-scripts/`
 

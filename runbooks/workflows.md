@@ -785,3 +785,7 @@ Two valid patterns:
 ### Multi-instance limitation
 
 `workflowEventBus` is an in-process `EventEmitter` (`src/workflows/event-bus.ts`). With multiple API replicas, a signal emitted on instance A will not reach a wait paused on instance B. Single-instance only for v1; cross-instance fan-out (Redis pub/sub, etc.) is a separate plan.
+
+## Seeded workflows
+
+Built-in workflow templates (`templates/workflows/`) are seeded at API boot by `src/be/seed/workflows-seeder.ts`, and later releases update rows nobody has edited. Toggling `enabled` is not an edit: the row keeps receiving template updates and keeps its current `enabled` value. Editing anything else, including params, stops updates for that row. Seeded schedules follow the same rule. Full versioning rule: [seed-scripts.md](./seed-scripts.md#seeded-workflows-and-schedules-enabled-is-not-an-edit).

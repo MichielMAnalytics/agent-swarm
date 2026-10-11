@@ -189,19 +189,43 @@ export function loadSeedWorkflows(
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
-function workflowSeedHash(workflow: SeedWorkflow): string {
+/**
+ * The part of a seeded workflow that the seed hash covers. `enabled` is left
+ * out on purpose: it is an operator switch, not content. Toggling it must not
+ * mark the row as user-edited, and flipping SEED_AUTOMATIONS_ENABLED must not
+ * change any source hash.
+ */
+type HashedSeedWorkflow = Omit<SeedWorkflow, "enabled">;
+
+function hashedWorkflow(workflow: SeedWorkflow): HashedSeedWorkflow {
+  const { enabled: _enabled, ...hashed } = workflow;
+  return hashed;
+}
+
+function workflowSeedHash(workflow: HashedSeedWorkflow): string {
   return computeContentHash(canonicalJson(workflow));
+}
+
+/**
+ * Seed hashes recorded before `enabled` left the hash covered it. Return the
+ * old-formula hash of the live row under both `enabled` values, so a row whose
+ * only change is an `enabled` toggle still counts as pristine and is
+ * rebaselined to the new formula.
+ */
+function legacyWorkflowSeedHashes(workflow: HashedSeedWorkflow): string[] {
+  return [true, false].map((enabled) =>
+    computeContentHash(canonicalJson({ ...workflow, enabled })),
+  );
 }
 
 async function findWorkflowByName(name: string): Promise<Workflow | null> {
   return (await listWorkflows()).find((workflow) => workflow.name === name) ?? null;
 }
 
-function workflowFromRow(workflow: Workflow): SeedWorkflow {
+function workflowFromRow(workflow: Workflow): HashedSeedWorkflow {
   return {
     name: workflow.name,
     description: workflow.description ?? "",
-    enabled: workflow.enabled,
     definition: workflow.definition,
     triggers: workflow.triggers,
     cooldown: workflow.cooldown,
@@ -223,7 +247,7 @@ export function createWorkflowsSeeder(
     items(): WorkflowSeedItem[] {
       return workflows.map((workflow) => ({
         key: workflow.name,
-        contentHash: workflowSeedHash(workflow),
+        contentHash: workflowSeedHash(hashedWorkflow(workflow)),
         workflow,
       }));
     },
@@ -231,6 +255,11 @@ export function createWorkflowsSeeder(
     async upstreamHash(item): Promise<string | null> {
       const existing = await findWorkflowByName(item.key);
       return existing ? workflowSeedHash(workflowFromRow(existing)) : null;
+    },
+
+    async legacyUpstreamHashes(item): Promise<string[]> {
+      const existing = await findWorkflowByName(item.key);
+      return existing ? legacyWorkflowSeedHashes(workflowFromRow(existing)) : [];
     },
 
     async apply(item): Promise<void> {
@@ -258,7 +287,9 @@ export function createWorkflowsSeeder(
         return;
       }
 
-      await updateWorkflow(existing.id, { ...data, enabled: workflow.enabled });
+      // `enabled` is the operator's switch: an update ships new content and
+      // keeps whatever the row is set to.
+      await updateWorkflow(existing.id, data);
     },
   };
 }
