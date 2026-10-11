@@ -266,6 +266,31 @@ The `next` field supports three formats:
 
 The webhook payload supplies `event` and `pull_request`. A nonmatching event ends the branch because no `false` target is declared.
 
+### Workflow inputs (`input`)
+
+A workflow can declare an `input` map of string values. The map resolves once, at run start, and nodes read it as `{{input.<key>}}`. Each value takes one of these forms:
+
+| Value | Resolves to |
+|-------|-------------|
+| `${NAME}` | The environment variable `NAME`. The run fails to start when it is unset. |
+| `${NAME:-default}` | `NAME` when it is set and non-empty, else the literal `default`. The default may be empty (`${NAME:-}`). `NAME` is limited to `A-Z`, `0-9` and `_`. |
+| `secret.NAME` | The global swarm secret `NAME` from the config store. |
+| anything else | The literal string. |
+
+Global config values saved in **Settings → Configuration** are loaded into the server's environment, and they win over the deployment environment. So `${NAME:-default}` reads a dashboard setting when one exists, the deployment env value otherwise, and the default when neither is set. That lets a workflow ship sensible defaults that operators override without editing it:
+
+```json
+{
+  "input": {
+    "enabled": "${DREAMING_ENABLED:-false}",
+    "budgetUsd": "${DREAMING_BUDGET_USD:-25}",
+    "githubToken": "secret.GITHUB_TOKEN"
+  }
+}
+```
+
+Values from `secret.*` references, and from `${NAME}` or `${NAME:-default}` references whose `NAME` looks sensitive (for example `*_TOKEN`, `*_KEY`, `*_SECRET`), are redacted in persisted step records. Executors still see the real value.
+
 ### Triggers
 
 | Type | Description |

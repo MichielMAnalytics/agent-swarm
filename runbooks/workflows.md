@@ -63,6 +63,19 @@ Do not include patch bodies, diff hunks, raw `git log --stat` output, downloaded
 
 `{{path.to.value}}` in any string field inside `config`. Objects get JSON-stringified; nulls become empty strings.
 
+### Workflow `input` values
+
+The workflow-level `input` map resolves once at run start (`src/workflows/input.ts`) and is read as `{{input.<key>}}`:
+
+- `${NAME}`: `process.env.NAME`. Throws (the run fails to start) when unset.
+- `${NAME:-default}`: `process.env.NAME` when set and non-empty, else the literal `default` (may be empty). `NAME` must match `[A-Z0-9_]+`. Checked before `${NAME}`.
+- `secret.NAME`: the global swarm secret from the config store.
+- Anything else: the literal string.
+
+Global `swarm_config` rows are injected into `process.env` at boot and on every config reload, and DB rows win over the deployment env. So `${NAME:-default}` reads a dashboard value first, then the env value, then the default. Use it for template-owned config knobs: the template ships the defaults, operators change values in Settings → Configuration.
+
+Redaction: `getSecretInputKeys` checks only the `NAME` part of `${NAME}` / `${NAME:-default}` against the secret-scrubber heuristic, plus every `secret.*` value. Matching keys are redacted in `workflow_run_steps.input`.
+
 ## Agent-task config fields
 
 - `template` (required)

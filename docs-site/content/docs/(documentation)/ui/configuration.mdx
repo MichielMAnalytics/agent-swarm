@@ -265,6 +265,34 @@ from the predefined catalog. Workers stay catalog-only. The value is read on eve
 restart. An enabled extension is trusted code in the API process, and a lead can change this key, so
 read [inline install](/docs/guides/extensions#inline-install) before turning it on.
 
+## Dreaming
+
+The **Dreaming** group configures the nightly dreaming workflow. The workflow reads every key
+through its `input` map with the `${KEY:-default}` syntax (see
+[Workflow inputs](/docs/concepts/workflows#workflow-inputs-input)), so a saved value applies to the
+next run without a restart, and an unset key uses the default below.
+
+| Key | Default | Accepts | Effect |
+|---|---|---|---|
+| `DREAMING_ENABLED` | `false` | boolean | Off: each scheduled run stops after gathering, with no changes. |
+| `DREAMING_LANE_HEARTBEAT` | `true` | boolean | Draft a prune of the lead's HEARTBEAT checklist. |
+| `DREAMING_LANE_TRIM` | `true` | boolean | Trim agent profiles (CLAUDE.md, SOUL.md, IDENTITY.md). |
+| `DREAMING_LANE_IDENTITY` | `true` | boolean | Apply identity edits. |
+| `DREAMING_LANE_MEMORY` | `true` | boolean | Memory triage: rename, edit, delete, store. |
+| `DREAMING_SLACK_CHANNEL` | empty | any string | Channel for the nightly summary. Empty skips the Slack post. |
+| `DREAMING_REPORT_TARGET` | `page` | `page`, `agent-fs`, `none` | Where the nightly report is written. |
+| `DREAMING_WORKER_AGENT_ID` | empty | UUID or empty | Agent that runs the trim, heartbeat draft, and publish steps. Empty means the lead. |
+| `DREAMING_BUDGET_USD` | `25` | integer 1–1000 | Over budget, the heartbeat draft is skipped and the report raises an alert. |
+| `DREAMING_CAP_IDENTITY_TOTAL` | `6` | integer ≥ 0 | Identity edits per night, across all agents. |
+| `DREAMING_CAP_IDENTITY_PER_AGENT` | `1` | integer ≥ 0 | Identity edits per agent per night. |
+| `DREAMING_CAP_TRIMS` | `3` | integer ≥ 0 | Profile trims per night. |
+| `DREAMING_CAP_MEMORY_STORE` | `5` | integer ≥ 0 | New memories per night. |
+| `DREAMING_CAP_MEMORY_EDIT` | `5` | integer ≥ 0 | Memory edits per night. |
+| `DREAMING_CAP_MEMORY_DELETE` | `10` | integer ≥ 0 | Memory deletions per night. |
+
+A lane that is off takes no actions and spends no tokens. A cap of `0` turns that action off for the
+night. The server rejects values outside the **Accepts** column, for example `DREAMING_CAP_TRIMS=-1`.
+
 ## Access control
 
 Reading configuration requires dashboard access (API key). Writes go through the config API's RBAC gate (`config.write.any`): operator and user tokens can save, and agent principals are restricted to lead agents.

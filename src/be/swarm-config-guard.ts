@@ -170,6 +170,27 @@ function boundedIntegerValidators(
   );
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Build `{ KEY: validator }` entries accepting a UUID or blank. Blank is how an
+ * operator selects the key's fallback without deleting the row.
+ */
+function uuidOrEmptyValidators(keys: string[]): Record<string, ConfigValidator> {
+  return Object.fromEntries(
+    keys.map((key) => [
+      key,
+      (value: unknown) => {
+        if (typeof value !== "string") return `Invalid ${key} (must be a UUID or empty)`;
+        const str = value.trim();
+        return str === "" || UUID_PATTERN.test(str)
+          ? null
+          : `Invalid ${key} (must be a UUID or empty)`;
+      },
+    ]),
+  );
+}
+
 /**
  * Blank or an http(s) URL with no query string or fragment. Returns `invalid`
  * for anything else. Blank is allowed: it is how an operator reverts to the
@@ -420,6 +441,30 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   // (~80k chars) it risks the SIGTERM-143 context-saturation failure mode
   // the cap exists to prevent (see context-preamble.ts).
   ...boundedIntegerValidators(["CONTEXT_PREAMBLE_MAX_TOKENS"], 100, 20000),
+  // Dreaming (nightly workflow). The workflow reads these through its `input`
+  // map (`${KEY:-default}`), so a bad value would otherwise reach it unchecked.
+  ...booleanValidators([
+    "DREAMING_ENABLED",
+    "DREAMING_LANE_HEARTBEAT",
+    "DREAMING_LANE_TRIM",
+    "DREAMING_LANE_IDENTITY",
+    "DREAMING_LANE_MEMORY",
+  ]),
+  ...enumValidator("DREAMING_REPORT_TARGET", ["page", "agent-fs", "none"]),
+  ...uuidOrEmptyValidators(["DREAMING_WORKER_AGENT_ID"]),
+  ...boundedIntegerValidators(["DREAMING_BUDGET_USD"], 1, 1000),
+  // 0 is meaningful for every cap: "take no actions of this kind tonight".
+  ...integerValidators(
+    [
+      "DREAMING_CAP_IDENTITY_TOTAL",
+      "DREAMING_CAP_IDENTITY_PER_AGENT",
+      "DREAMING_CAP_TRIMS",
+      "DREAMING_CAP_MEMORY_STORE",
+      "DREAMING_CAP_MEMORY_EDIT",
+      "DREAMING_CAP_MEMORY_DELETE",
+    ],
+    0,
+  ),
   MEMORY_MIN_SIMILARITY: (value) =>
     validateFloatRange("MEMORY_MIN_SIMILARITY", value, 0, 1, "between 0 and 1 inclusive"),
   MEMORY_ACCESS_BOOST_MAX: (value) =>

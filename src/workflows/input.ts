@@ -2,10 +2,27 @@ import { getSwarmConfigs } from "../be/db";
 import { isSensitiveKey } from "../utils/secret-scrubber";
 
 /**
+ * `${ENV_VAR:-default}`: the env var when it is set and non-empty, else the
+ * literal default (which may be empty). Checked before the plain `${ENV_VAR}`
+ * form, whose broader pattern would otherwise capture the whole `NAME:-default`.
+ */
+const ENV_DEFAULT_PATTERN = /^\$\{([A-Z0-9_]+):-(.*)\}$/;
+const ENV_PATTERN = /^\$\{(.+)\}$/;
+
+/**
+ * Return the env var name a `${NAME}` or `${NAME:-default}` reference points
+ * at, or `undefined` when the value is not an env reference.
+ */
+function envReferenceName(value: string): string | undefined {
+  return ENV_DEFAULT_PATTERN.exec(value)?.[1] ?? ENV_PATTERN.exec(value)?.[1];
+}
+
+/**
  * Resolve workflow input values.
  *
  * Patterns:
- *   - `${ENV_VAR}` -> process.env[ENV_VAR]
+ *   - `${ENV_VAR:-default}` -> process.env[ENV_VAR] if set and non-empty, else `default`
+ *   - `${ENV_VAR}` -> process.env[ENV_VAR] (throws when unset)
  *   - `secret.NAME` -> look up in DB config store (global scope, isSecret=true)
  *   - literal string -> pass through
  */
@@ -22,13 +39,21 @@ export async function resolveInputs(
 }
 
 /**
- * Resolve a single input value, supporting `${ENV_VAR}` and `secret.NAME`
- * references. A plain string is returned unchanged. Throws if a referenced
- * env var or swarm secret cannot be found.
+ * Resolve a single input value, supporting `${ENV_VAR:-default}`,
+ * `${ENV_VAR}` and `secret.NAME` references. A plain string is returned
+ * unchanged. Throws if a referenced env var (without a default) or swarm
+ * secret cannot be found.
  */
 export async function resolveInputValue(value: string): Promise<string> {
+  // Env var reference with a default: ${MY_VAR:-fallback}
+  const defaultMatch = ENV_DEFAULT_PATTERN.exec(value);
+  if (defaultMatch?.[1]) {
+    const envValue = process.env[defaultMatch[1]];
+    return envValue !== undefined && envValue !== "" ? envValue : (defaultMatch[2] ?? "");
+  }
+
   // Env var reference: ${MY_VAR}
-  const envMatch = /^\$\{(.+)\}$/.exec(value);
+  const envMatch = ENV_PATTERN.exec(value);
   if (envMatch?.[1]) {
     const envName = envMatch[1];
     const envValue = process.env[envName];
@@ -63,9 +88,10 @@ export const REDACTED_SECRET_VALUE = "***REDACTED***";
  * Determine which keys of a workflow's `input` map carry a secret value once
  * resolved. A key is treated as a secret iff it references either:
  *   - `secret.NAME` — always sensitive (DB-stored swarm secrets).
- *   - `${ENV_VAR}` where ENV_VAR's name matches the secret-scrubber sensitive
- *     heuristic (`*_TOKEN`, `*_KEY`, `*_SECRET`, etc., or an explicit
- *     `SENSITIVE_KEY_EXACT` entry).
+ *   - `${ENV_VAR}` or `${ENV_VAR:-default}` where ENV_VAR's name matches the
+ *     secret-scrubber sensitive heuristic (`*_TOKEN`, `*_KEY`, `*_SECRET`,
+ *     etc., or an explicit `SENSITIVE_KEY_EXACT` entry). Only the name part is
+ *     checked, so a default never hides a sensitive name.
  *
  * Pure function — does NOT resolve values. Safe to call during recovery
  * without DB lookups.
@@ -79,8 +105,8 @@ export function getSecretInputKeys(input: Record<string, string> | undefined): S
       keys.add(key);
       continue;
     }
-    const envMatch = /^\$\{(.+)\}$/.exec(value);
-    if (envMatch?.[1] && isSensitiveKey(envMatch[1])) {
+    const envName = envReferenceName(value);
+    if (envName && isSensitiveKey(envName)) {
       keys.add(key);
     }
   }
