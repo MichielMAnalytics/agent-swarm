@@ -29,6 +29,8 @@
     "scripts-external-apis",
     "scripts-credential-broker",
     "script-workflow-runs",
+    "dreaming",
+    "dreaming-heartbeat-prune",
     "claude-bridge-experimental",
     "worker-credential-recovery",
     "provider-auth",

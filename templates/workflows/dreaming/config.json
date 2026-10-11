@@ -1,0 +1,15 @@
+{
+  "kind": "workflow",
+  "name": "dreaming",
+  "displayName": "Dreaming",
+  "slug": "dreaming",
+  "title": "Dreaming",
+  "description": "Nightly self-improvement loop: agents report, Lead reviews, scripts apply capped identity, memory, trim and heartbeat changes and verify them. Off until DREAMING_ENABLED is true.",
+  "version": "1.0.0",
+  "category": "workflows",
+  "placeholders": [],
+  "requires": [],
+  "runAllSeedersCandidate": true,
+  "autoEnableCandidate": true,
+  "tags": ["memory", "skills", "operations"]
+}

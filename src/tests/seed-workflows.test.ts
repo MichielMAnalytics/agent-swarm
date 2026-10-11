@@ -126,9 +126,9 @@ afterEach(async () => {
 });
 
 describe("workflows seeder", () => {
-  test("loads all ten workflow templates with their setup metadata", () => {
+  test("loads all eleven workflow templates with their setup metadata", () => {
     const workflows = loadSeedWorkflows();
-    expect(workflows).toHaveLength(10);
+    expect(workflows).toHaveLength(11);
     expect(workflows.find((workflow) => workflow.name === "autopilot")).toMatchObject({
       enabled: false,
       requiredParams: ["REPO_URL"],
@@ -146,15 +146,24 @@ describe("workflows seeder", () => {
       requiredParams: ["GSC_PROPERTY"],
       requires: ["gsc", "agentfs"],
     });
-    expect(workflows.every((workflow) => !workflow.enabled)).toBe(true);
+    // dreaming is the one zero-config auto-enable candidate: the workflow arrives
+    // enabled and DREAMING_ENABLED (default false) is its real switch.
+    expect(workflows.find((workflow) => workflow.name === "dreaming")).toMatchObject({
+      enabled: true,
+      requiredParams: [],
+      requires: [],
+    });
+    expect(
+      workflows.filter((workflow) => workflow.name !== "dreaming").every((w) => !w.enabled),
+    ).toBe(true);
   });
 
   test("SEED_AUTOMATIONS_ENABLED=false still seeds all workflows disabled", async () => {
     process.env.SEED_AUTOMATIONS_ENABLED = "false";
     const result = await runSeeder(createWorkflowsSeeder(), { quiet: true });
-    expect(result).toMatchObject({ created: 10, failed: [] });
+    expect(result).toMatchObject({ created: 11, failed: [] });
     const workflows = await listWorkflows();
-    expect(workflows).toHaveLength(10);
+    expect(workflows).toHaveLength(11);
     expect(workflows.every((workflow) => workflow.enabled === false)).toBe(true);
   });
 
