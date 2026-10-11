@@ -3,6 +3,8 @@ import { unlink } from "node:fs/promises";
 import {
   closeDb,
   computeContentHash,
+  createWorkflow,
+  deleteWorkflow,
   getScheduledTaskByName,
   getScheduledTasks,
   initDb,
@@ -15,7 +17,7 @@ import {
   type ScheduleTemplateSource,
 } from "../be/seed/schedules-seeder";
 import { canonicalJson } from "../be/seed/workflows-seeder";
-import type { ScheduledTask } from "../types";
+import type { ScheduledTask, Workflow } from "../types";
 
 const TEST_DB_PATH = "./test-seed-schedules.sqlite";
 
@@ -75,6 +77,36 @@ function zeroConfigScheduleSource(opts?: {
   } satisfies ScheduleTemplateSource;
 }
 
+/** A schedule that fires a workflow by name, with no `## Scheduled Task` section. */
+function workflowScheduleSource(workflow = "dreaming", cron = "25 3 * * *") {
+  return {
+    config: JSON.stringify({
+      name: "test-workflow-schedule",
+      title: "Test workflow schedule",
+      description: "Fires a seeded workflow.",
+      placeholders: [],
+      requires: [],
+      runAllSeedersCandidate: true,
+      autoEnableCandidate: true,
+      tags: ["fixture"],
+    }),
+    content: `# Test\n\n## Schedule\n\n\`\`\`json\n${JSON.stringify({
+      cron,
+      timezone: "UTC",
+      enabled: true,
+      workflow,
+    })}\n\`\`\`\n`,
+  } satisfies ScheduleTemplateSource;
+}
+
+/**
+ * Stand-in for the seeded `dreaming` workflow, so these tests do not depend on
+ * the workflow template's content.
+ */
+function createFixtureWorkflow(name = "dreaming"): Promise<Workflow> {
+  return createWorkflow({ name, definition: { nodes: [] } });
+}
+
 /**
  * Local copy of the seed hash shape from before `enabled` left the hash: the
  * hashed fields of the row plus `enabled`. Deliberately not imported from the
@@ -131,9 +163,9 @@ afterEach(async () => {
 });
 
 describe("schedules seeder", () => {
-  test("loads all eleven schedule templates, including the unfenced schedule block", () => {
+  test("loads all twelve schedule templates, including the unfenced schedule block", () => {
     const schedules = loadSeedSchedules();
-    expect(schedules).toHaveLength(11);
+    expect(schedules).toHaveLength(12);
     // Zero-config, requires:[], placeholders:[], template enabled:true -> auto-enabled
     // under the default (unset -> on) SEED_AUTOMATIONS_ENABLED switch.
     expect(schedules.find((schedule) => schedule.name === "daily-status-report")).toMatchObject({
@@ -164,21 +196,24 @@ describe("schedules seeder", () => {
       "daily-status-report",
       "daily-swarm-update-check",
       "daily-workflow-health-audit",
+      "dreaming-nightly",
     ]);
   });
 
   test("SEED_AUTOMATIONS_ENABLED=false still seeds all schedules disabled", async () => {
     process.env.SEED_AUTOMATIONS_ENABLED = "false";
+    await createFixtureWorkflow();
     const result = await runSeeder(createSchedulesSeeder(), { quiet: true });
-    expect(result).toMatchObject({ created: 11, failed: [] });
+    expect(result).toMatchObject({ created: 12, failed: [] });
     const schedules = await getScheduledTasks();
-    expect(schedules).toHaveLength(11);
+    expect(schedules).toHaveLength(12);
     expect(schedules.every((schedule) => schedule.enabled === false)).toBe(true);
   });
 
   test("seeds a disabled schedule whose timezone still needs setup", async () => {
+    await createFixtureWorkflow();
     const result = await runSeeder(createSchedulesSeeder(), { quiet: true });
-    expect(result).toMatchObject({ created: 11, failed: [] });
+    expect(result).toMatchObject({ created: 12, failed: [] });
     expect(await getScheduledTaskByName("weekly-dependabot-triage")).toMatchObject({
       cronExpression: "40 3 * * 0",
       timezone: "{{TIMEZONE}}",
@@ -459,5 +494,146 @@ describe("schedules seeder", () => {
     expect(result.created).toBe(0);
     expect(result.failed[0]).toMatchObject({ key: "test-seeded-schedule" });
     expect(await getScheduledTaskByName("test-seeded-schedule")).toBeNull();
+  });
+});
+
+describe("workflow-target seeded schedules", () => {
+  test("the dreaming-nightly template targets the dreaming workflow and carries no prompt", () => {
+    const schedule = loadSeedSchedules().find((item) => item.name === "dreaming-nightly");
+    expect(schedule).toMatchObject({
+      cronExpression: "25 3 * * *",
+      timezone: "UTC",
+      enabled: true,
+      workflow: "dreaming",
+      taskTemplate: "",
+      requires: [],
+      requiredParams: [],
+    });
+  });
+
+  test("agent-task schedules carry no workflow key", () => {
+    for (const schedule of loadSeedSchedules().filter((s) => s.name !== "dreaming-nightly")) {
+      expect(schedule).not.toHaveProperty("workflow");
+    }
+  });
+
+  test("the dreaming-nightly template seeds a workflow target with the dreaming id", async () => {
+    const workflow = await createFixtureWorkflow();
+    const result = await runSeeder(createSchedulesSeeder(), { quiet: true });
+    expect(result.failed).toEqual([]);
+    const row = await getScheduledTaskByName("dreaming-nightly");
+    expect(row).toMatchObject({
+      targetType: "workflow",
+      workflowId: workflow.id,
+      cronExpression: "25 3 * * *",
+      enabled: true,
+    });
+    expect(row?.taskTemplate ?? null).toBeNull();
+    expect(row?.nextRunAt).toBeDefined();
+  });
+
+  test("creates a workflow-target schedule, and a re-run is a no-op", async () => {
+    const workflow = await createFixtureWorkflow();
+    const seeder = createSchedulesSeeder([workflowScheduleSource()]);
+
+    expect(await runSeeder(seeder, { quiet: true })).toMatchObject({ created: 1, failed: [] });
+    const row = await getScheduledTaskByName("test-workflow-schedule");
+    expect(row).toMatchObject({ targetType: "workflow", workflowId: workflow.id });
+    expect(row?.taskTemplate ?? null).toBeNull();
+
+    expect(await runSeeder(seeder, { quiet: true })).toMatchObject({
+      created: 0,
+      updated: 0,
+      skippedUnchanged: 1,
+      skippedUserModified: 0,
+      failed: [],
+    });
+    expect(await getScheduledTaskByName("test-workflow-schedule")).toEqual(row);
+  });
+
+  test("the hash is stable across a workflow id change (delete and re-seed)", async () => {
+    const original = await createFixtureWorkflow();
+    const seeder = createSchedulesSeeder([workflowScheduleSource()]);
+    await runSeeder(seeder, { quiet: true });
+    const seeded = await getSeedState("schedule", "test-workflow-schedule");
+
+    // The operator deletes the workflow; the workflows seeder re-creates it
+    // under a new id on the next boot.
+    expect(await deleteWorkflow(original.id)).toBe(true);
+    const reseeded = await createFixtureWorkflow();
+    expect(reseeded.id).not.toBe(original.id);
+
+    expect(await runSeeder(seeder, { quiet: true })).toMatchObject({
+      created: 0,
+      updated: 0,
+      skippedUnchanged: 1,
+      skippedUserModified: 0,
+      failed: [],
+    });
+    expect(await getSeedState("schedule", "test-workflow-schedule")).toMatchObject({
+      seededHash: seeded!.seededHash,
+    });
+    // The dangling binding is repointed at the live workflow.
+    expect(await getScheduledTaskByName("test-workflow-schedule")).toMatchObject({
+      targetType: "workflow",
+      workflowId: reseeded.id,
+    });
+  });
+
+  test("an edited workflow-target schedule is still preserved", async () => {
+    await createFixtureWorkflow();
+    await runSeeder(createSchedulesSeeder([workflowScheduleSource()]), { quiet: true });
+    const row = (await getScheduledTaskByName("test-workflow-schedule"))!;
+    await updateScheduledTask(row.id, { cronExpression: "0 5 * * *" });
+
+    const result = await runSeeder(
+      createSchedulesSeeder([workflowScheduleSource("dreaming", "30 3 * * *")]),
+      { quiet: true },
+    );
+    expect(result).toMatchObject({ updated: 0, skippedUserModified: 1, failed: [] });
+    expect(await getScheduledTaskByName("test-workflow-schedule")).toMatchObject({
+      cronExpression: "0 5 * * *",
+    });
+  });
+
+  test("an unknown workflow is reported in failed[], not thrown, and writes no row", async () => {
+    const result = await runSeeder(createSchedulesSeeder([workflowScheduleSource("no-such")]), {
+      quiet: true,
+    });
+    expect(result).toMatchObject({ created: 0 });
+    expect(result.failed).toEqual([
+      { key: "test-workflow-schedule", error: 'workflow "no-such" not found' },
+    ]);
+    expect(await getScheduledTaskByName("test-workflow-schedule")).toBeNull();
+  });
+
+  test("a seeded workflow the operator deleted fails the item and leaves the row alone", async () => {
+    const workflow = await createFixtureWorkflow();
+    const seeder = createSchedulesSeeder([workflowScheduleSource()]);
+    await runSeeder(seeder, { quiet: true });
+    const row = await getScheduledTaskByName("test-workflow-schedule");
+    await deleteWorkflow(workflow.id);
+
+    const result = await runSeeder(seeder, { quiet: true });
+    expect(result.failed).toEqual([
+      { key: "test-workflow-schedule", error: 'workflow "dreaming" not found' },
+    ]);
+    expect(await getScheduledTaskByName("test-workflow-schedule")).toEqual(row);
+  });
+
+  test("a template that switches an agent-task schedule to a workflow drops the prompt", async () => {
+    const workflow = await createFixtureWorkflow();
+    const agentTask = zeroConfigScheduleSource({ name: "test-workflow-schedule" });
+    await runSeeder(createSchedulesSeeder([agentTask]), { quiet: true });
+    expect((await getScheduledTaskByName("test-workflow-schedule"))?.taskTemplate).toBe(
+      "Run work.",
+    );
+
+    const seeder = createSchedulesSeeder([workflowScheduleSource()]);
+    expect(await runSeeder(seeder, { quiet: true })).toMatchObject({ updated: 1, failed: [] });
+    const row = await getScheduledTaskByName("test-workflow-schedule");
+    expect(row).toMatchObject({ targetType: "workflow", workflowId: workflow.id });
+    expect(row?.taskTemplate || null).toBeNull();
+    expect(await runSeeder(seeder, { quiet: true })).toMatchObject({ skippedUnchanged: 1 });
   });
 });

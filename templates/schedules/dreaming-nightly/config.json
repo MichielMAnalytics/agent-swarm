@@ -1,0 +1,15 @@
+{
+  "kind": "schedule",
+  "name": "dreaming-nightly",
+  "displayName": "Nightly Dreaming",
+  "slug": "dreaming-nightly",
+  "title": "Nightly Dreaming",
+  "description": "Fire the dreaming workflow once a night. The workflow stays a no-op until DREAMING_ENABLED is on.",
+  "version": "1.0.0",
+  "category": "schedules",
+  "placeholders": [],
+  "requires": [],
+  "runAllSeedersCandidate": true,
+  "autoEnableCandidate": true,
+  "tags": ["memory", "skills", "operations"]
+}

@@ -35,6 +35,12 @@ import dailyWorkflowHealthAuditConfig from "../../../templates/schedules/daily-w
 import dailyWorkflowHealthAuditContent from "../../../templates/schedules/daily-workflow-health-audit/content.md" with {
   type: "text",
 };
+import dreamingNightlyConfig from "../../../templates/schedules/dreaming-nightly/config.json" with {
+  type: "text",
+};
+import dreamingNightlyContent from "../../../templates/schedules/dreaming-nightly/content.md" with {
+  type: "text",
+};
 import gtmWeeklyReviewConfig from "../../../templates/schedules/gtm-weekly-review/config.json" with {
   type: "text",
 };
@@ -65,11 +71,13 @@ import weeklyHarnessUpgradeCheckConfig from "../../../templates/schedules/weekly
 import weeklyHarnessUpgradeCheckContent from "../../../templates/schedules/weekly-harness-upgrade-check/content.md" with {
   type: "text",
 };
-import type { AutomationIntegrationId, ScheduledTask } from "../../types";
+import type { AutomationIntegrationId, ScheduledTask, Workflow } from "../../types";
 import {
   computeContentHash,
   createScheduledTask,
   getScheduledTaskByName,
+  getWorkflow,
+  listWorkflows,
   updateScheduledTask,
 } from "../db";
 import { resolveSeededEnabled } from "./automation-toggle";
@@ -92,6 +100,8 @@ type ScheduleBlock = {
   cron: string;
   timezone?: string;
   enabled?: boolean;
+  /** Name of a (seeded) workflow to fire instead of an agent task. */
+  workflow?: string;
 };
 
 export type SeedSchedule = {
@@ -106,6 +116,13 @@ export type SeedSchedule = {
   params: Record<string, unknown>;
   requiredParams: string[];
   requires: AutomationIntegrationId[];
+  /**
+   * Workflow target, by NAME. Present only on workflow-target schedules, so the
+   * hash of every agent-task schedule is unchanged. The id is resolved at apply
+   * time and never hashed: re-seeding the workflow under a new id is not a
+   * content change.
+   */
+  workflow?: string;
 };
 
 export type ScheduleTemplateSource = { config: string; content: string };
@@ -129,6 +146,7 @@ const BUILT_IN_SCHEDULE_SOURCES: readonly ScheduleTemplateSource[] = [
     config: asText(dailyWorkflowHealthAuditConfig),
     content: asText(dailyWorkflowHealthAuditContent),
   },
+  { config: asText(dreamingNightlyConfig), content: asText(dreamingNightlyContent) },
   { config: asText(gtmWeeklyReviewConfig), content: asText(gtmWeeklyReviewContent) },
   {
     config: asText(weeklyCodeHealthReportsConfig),
@@ -158,12 +176,25 @@ function parseScheduleSource(source: ScheduleTemplateSource): SeedSchedule | nul
     scheduleText.match(/^\s*```json\s*\n([\s\S]*?)\n```/) ?? scheduleText.match(/(\{[\s\S]*?\})/);
   if (!blockMatch?.[1]) throw new Error(`Schedule template ${config.name} has no schedule JSON`);
   const block = JSON.parse(blockMatch[1]) as ScheduleBlock;
+  if (
+    block.workflow !== undefined &&
+    (typeof block.workflow !== "string" || block.workflow.trim() === "")
+  ) {
+    throw new Error(`Schedule template ${config.name} has an invalid workflow target`);
+  }
+  const workflow = block.workflow?.trim();
   const afterBlock = scheduleStart + blockMatch.index! + blockMatch[0].length;
   const taskHeading = source.content.indexOf("## Scheduled Task", afterBlock);
-  const taskTemplate = source.content
-    .slice(taskHeading >= 0 ? taskHeading + "## Scheduled Task".length : afterBlock)
-    .trim();
-  if (!taskTemplate) throw new Error(`Schedule template ${config.name} has no task prompt`);
+  // A workflow-target schedule fires the workflow, not a task: it carries no
+  // task prompt, and `## Scheduled Task` is optional (ignored if present).
+  const taskTemplate = workflow
+    ? ""
+    : source.content
+        .slice(taskHeading >= 0 ? taskHeading + "## Scheduled Task".length : afterBlock)
+        .trim();
+  if (!workflow && !taskTemplate) {
+    throw new Error(`Schedule template ${config.name} has no task prompt`);
+  }
 
   const requires = config.requires ?? [];
   const requiredParams = config.placeholders ?? [];
@@ -189,6 +220,7 @@ function parseScheduleSource(source: ScheduleTemplateSource): SeedSchedule | nul
     params: {},
     requiredParams,
     requires,
+    ...(workflow ? { workflow } : {}),
   };
 }
 
@@ -230,7 +262,38 @@ function legacyScheduleSeedHashes(schedule: HashedSeedSchedule): string[] {
   );
 }
 
-function scheduleFromRow(schedule: ScheduledTask): HashedSeedSchedule {
+async function findWorkflowByName(name: string): Promise<Workflow | null> {
+  return (await listWorkflows()).find((workflow) => workflow.name === name) ?? null;
+}
+
+function workflowNotFound(name: string): Error {
+  return new Error(`workflow "${name}" not found`);
+}
+
+/**
+ * The workflow NAME a workflow-target row points at, which is what the seed
+ * hash covers. The row stores an id, and there is no FK from schedules to
+ * workflows: deleting the seeded workflow leaves the id dangling, and the
+ * workflows seeder then re-creates it under a new id. A dangling id carries no
+ * operator intent, so it is rebound to the seed's workflow by name and the row
+ * keeps its hash. When that workflow is gone too, the item fails.
+ */
+async function rowWorkflowName(row: ScheduledTask, seedWorkflow?: string): Promise<string> {
+  const bound = row.workflowId ? await getWorkflow(row.workflowId) : null;
+  if (bound) return bound.name;
+  if (!seedWorkflow) return "";
+  const live = await findWorkflowByName(seedWorkflow);
+  if (!live) throw workflowNotFound(seedWorkflow);
+  await updateScheduledTask(row.id, { workflowId: live.id });
+  return live.name;
+}
+
+async function scheduleFromRow(
+  schedule: ScheduledTask,
+  seedWorkflow?: string,
+): Promise<HashedSeedSchedule> {
+  const workflow =
+    schedule.targetType === "workflow" ? await rowWorkflowName(schedule, seedWorkflow) : undefined;
   return {
     name: schedule.name,
     description: schedule.description ?? "",
@@ -242,6 +305,7 @@ function scheduleFromRow(schedule: ScheduledTask): HashedSeedSchedule {
     params: schedule.params ?? {},
     requiredParams: schedule.requiredParams ?? [],
     requires: schedule.requires ?? [],
+    ...(workflow !== undefined ? { workflow } : {}),
   };
 }
 
@@ -280,22 +344,32 @@ export function createSchedulesSeeder(
 
     async upstreamHash(item): Promise<string | null> {
       const existing = await getScheduledTaskByName(item.key);
-      return existing ? scheduleSeedHash(scheduleFromRow(existing)) : null;
+      return existing
+        ? scheduleSeedHash(await scheduleFromRow(existing, item.schedule.workflow))
+        : null;
     },
 
     async legacyUpstreamHashes(item): Promise<string[]> {
       const existing = await getScheduledTaskByName(item.key);
-      return existing ? legacyScheduleSeedHashes(scheduleFromRow(existing)) : [];
+      return existing
+        ? legacyScheduleSeedHashes(await scheduleFromRow(existing, item.schedule.workflow))
+        : [];
     },
 
     async apply(item): Promise<void> {
       const { schedule } = item;
+      // Resolve a workflow target by name before touching the row: an unknown
+      // (or operator-deleted) workflow fails this item with no row written.
+      const workflow = schedule.workflow ? await findWorkflowByName(schedule.workflow) : null;
+      if (schedule.workflow && !workflow) throw workflowNotFound(schedule.workflow);
+      const target = workflow
+        ? { targetType: "workflow" as const, workflowId: workflow.id }
+        : { targetType: "agent-task" as const, taskTemplate: schedule.taskTemplate };
       const data = {
         description: schedule.description,
         cronExpression: schedule.cronExpression,
         timezone: schedule.timezone,
-        targetType: "agent-task" as const,
-        taskTemplate: schedule.taskTemplate,
+        ...target,
         taskType: schedule.taskType,
         tags: schedule.tags,
         params: schedule.params,
@@ -308,8 +382,14 @@ export function createSchedulesSeeder(
         // keeps whatever the row is set to. The cron is validated either way,
         // but only an enabled row gets a fresh nextRunAt.
         const resolvedNextRunAt = nextRunAt(schedule, existing.enabled);
+        // Clear the field of the other target type, so a template that
+        // switches target leaves no stale prompt or workflow binding behind.
+        const clearStaleTarget = workflow
+          ? { ...(existing.taskTemplate ? { taskTemplate: "" } : {}) }
+          : { ...(existing.workflowId ? { workflowId: null } : {}) };
         await updateScheduledTask(existing.id, {
           ...data,
+          ...clearStaleTarget,
           ...(existing.enabled ? { nextRunAt: resolvedNextRunAt } : {}),
         });
       } else {
