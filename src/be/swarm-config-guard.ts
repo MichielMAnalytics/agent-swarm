@@ -449,11 +449,14 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
     "DREAMING_LANE_TRIM",
     "DREAMING_LANE_IDENTITY",
     "DREAMING_LANE_MEMORY",
+    "DREAMING_LANE_SKILLIFY",
+    "DREAMING_LANE_SCRIPTIFY",
   ]),
   ...enumValidator("DREAMING_REPORT_TARGET", ["page", "agent-fs", "none"]),
   ...uuidOrEmptyValidators(["DREAMING_WORKER_AGENT_ID"]),
   ...boundedIntegerValidators(["DREAMING_BUDGET_USD"], 1, 1000),
-  // 0 is meaningful for every cap: "take no actions of this kind tonight".
+  // 0 is meaningful for every cap ("take no actions of this kind tonight") and
+  // for the adoption gate ("count uses, never retire").
   ...integerValidators(
     [
       "DREAMING_CAP_IDENTITY_TOTAL",
@@ -461,6 +464,10 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
       "DREAMING_CAP_MEMORY_STORE",
       "DREAMING_CAP_MEMORY_EDIT",
       "DREAMING_CAP_MEMORY_DELETE",
+      "DREAMING_CAP_SKILL_CREATE",
+      "DREAMING_CAP_SKILL_UPDATE",
+      "DREAMING_CAP_SCRIPT_BUILDS",
+      "DREAMING_ADOPTION_GATE_DAYS",
     ],
     0,
   ),

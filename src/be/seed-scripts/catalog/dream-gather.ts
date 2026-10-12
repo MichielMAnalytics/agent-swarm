@@ -30,6 +30,9 @@ export const argsSchema = z.object({
   laneTrim: scalar.describe("Profile trim lane (default true)"),
   laneIdentity: scalar.describe("Identity edit lane (default true)"),
   laneMemory: scalar.describe("Memory triage lane (default true)"),
+  laneSkillify: scalar.describe("Skill create/update lane, adoption-gated (default true)"),
+  laneScriptify: scalar.describe("Script build lane, adoption-gated (default true)"),
+  gateDays: scalar.describe("Adoption gate: days an unused dreaming artifact lives; 0 never retires (default 14)"),
   slackChannel: scalar.describe("Slack channel for the nightly summary; empty means no post"),
   reportTarget: scalar.describe('Where the nightly report goes: "page" (default), "agent-fs" or "none"'),
   workerAgentId: scalar.describe("Agent that runs the worker lanes; empty or unknown means Lead"),
@@ -40,6 +43,9 @@ export const argsSchema = z.object({
   capMemoryStore: scalar.describe("Max memory stores per night (default 5)"),
   capMemoryEdit: scalar.describe("Max memory edits per night (default 5)"),
   capMemoryDelete: scalar.describe("Max memory deletes per night (default 10)"),
+  capSkillCreate: scalar.describe("Max skills created per night (default 1)"),
+  capSkillUpdate: scalar.describe("Max skills updated per night (default 3)"),
+  capScriptBuilds: scalar.describe("Max scripts built per night (default 1)"),
 });
 
 // true / false for a recognizable boolean, undefined for absent, empty or anything else.
@@ -132,6 +138,8 @@ export default async function (args: unknown, ctx: ScriptContext) {
     trim: parseBool(a.laneTrim) ?? true,
     identity: parseBool(a.laneIdentity) ?? true,
     memory: parseBool(a.laneMemory) ?? true,
+    skillify: parseBool(a.laneSkillify) ?? true,
+    scriptify: parseBool(a.laneScriptify) ?? true,
   };
   const caps = {
     identityOpsTotal: parseInt0(a.capIdentityTotal, 6),
@@ -140,6 +148,9 @@ export default async function (args: unknown, ctx: ScriptContext) {
     memoryStore: parseInt0(a.capMemoryStore, 5),
     memoryEdit: parseInt0(a.capMemoryEdit, 5),
     memoryDelete: parseInt0(a.capMemoryDelete, 10),
+    skillCreate: parseInt0(a.capSkillCreate, 1),
+    skillUpdate: parseInt0(a.capSkillUpdate, 3),
+    scriptBuilds: parseInt0(a.capScriptBuilds, 1),
   };
   const reportTargetRaw = parseStr(a.reportTarget);
   const reportTarget = (REPORT_TARGETS as readonly string[]).includes(reportTargetRaw)
@@ -150,6 +161,7 @@ export default async function (args: unknown, ctx: ScriptContext) {
     slackChannel: parseStr(a.slackChannel),
     reportTarget,
     budgetUsd: parseInt0(a.budgetUsd, 25, 1, 1000),
+    gateDays: parseInt0(a.gateDays, 14),
   };
   // An absent `enabled` (manual run) is on; an unparseable value fails closed.
   const enabledRaw = raw.enabled;

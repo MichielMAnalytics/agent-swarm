@@ -7,9 +7,17 @@ import { z } from "zod";
 //    They go first: trims run after apply, so their pre-image already holds apply's edits.
 // 2. Ledger: KV dreaming/ledger:<runId>; undoes each applied item in reverse order, re-reads after each restore.
 // agentId/field select profile pre-images only; actionIds select ledger items only. See the dreaming design.
+// mode "artifact" {kind, name}: undo one adoption-gate retirement from KV dreaming/artifact:<kind>:<name>. A skill is
+// re-enabled; a script is re-upserted at its recorded scope from the record's `source`. The record becomes `restored`,
+// so the gate stops checking it.
 
 export const argsSchema = z.object({
-  runId: z.string(),
+  // Required for the run rollback; unused in mode "artifact".
+  runId: z.string().optional(),
+  mode: z.enum(["run", "artifact"]).optional(),
+  // mode "artifact": which retired artifact to bring back.
+  kind: z.enum(["skill", "script"]).optional(),
+  name: z.string().optional(),
   actionIds: z.array(z.string()).optional(),
   dryRun: z.union([z.boolean(), z.string()]).optional(),
   // dryRun only: run the read control on the plain (scrubbed) read. Negative control, never live.
@@ -64,6 +72,7 @@ export default async function (args: unknown, ctx: ScriptContext) {
   const failed: any[] = [];
   const planned: any[] = [];
   const dry = a.dryRun === true || a.dryRun === "true";
+  if (a.mode === "artifact") return rollbackArtifact(a, ctx, dry);
   const runId = typeof a.runId === "string" ? a.runId : "";
   if (!runId) return { restored, failed: [{ actionId: null, reason: "runId required" }], planned };
   const only: string[] = Array.isArray(a.actionIds) ? a.actionIds.map(String) : [];
@@ -282,6 +291,75 @@ export default async function (args: unknown, ctx: ScriptContext) {
     } catch (e: any) {
       failed.push({ actionId: id, reason: String(e?.message ?? e).slice(0, 200) });
     }
+  }
+  return done();
+}
+
+/** mode "artifact": bring back one skill or script the adoption gate retired. Never throws. */
+async function rollbackArtifact(a: any, ctx: ScriptContext, dry: boolean) {
+  const restored: any[] = [];
+  const failed: any[] = [];
+  const planned: any[] = [];
+  const kind = a.kind === "skill" || a.kind === "script" ? a.kind : "";
+  const name = typeof a.name === "string" ? a.name : "";
+  const key = `artifact:${kind}:${name}`;
+  const done = () => ({ mode: dry ? "dry-run" : "live", target: "artifact", key, restored, failed, planned });
+  if (!kind || !name) {
+    failed.push({ key, reason: "mode artifact needs kind (skill|script) and name" });
+    return done();
+  }
+  const q = async (sql: string, params: unknown[] = []) => rows(await ctx.swarm.db_query({ sql, params }));
+  try {
+    // Stored bytes (hex): the script source must survive the scrubber byte-exact.
+    const kv = await q(`SELECT hex(CAST(value AS BLOB)) AS hx FROM kv_entries WHERE namespace = ? AND key = ?`, [NS, key]);
+    let rec: any = null;
+    try { rec = kv.length ? JSON.parse(decodeHex(kv[0].hx)) : null; } catch {}
+    if (!rec || typeof rec !== "object") { failed.push({ key, reason: "no artifact record" }); return done(); }
+    const mark = async (extra: Record<string, unknown>) =>
+      ctx.swarm.kv_set({ namespace: NS, key, value: { ...rec, ...extra, status: "restored", restoredAt: new Date().toISOString() } as any });
+
+    if (kind === "skill") {
+      const skillId = String(rec.id ?? "");
+      const live = skillId ? await q(`SELECT isEnabled FROM skills WHERE id = ?`, [skillId]) : [];
+      if (!live.length) { failed.push({ key, reason: "skill row is gone" }); return done(); }
+      if (dry) { planned.push({ key, how: "skill_update isEnabled:true" }); return done(); }
+      if (!Number(live[0].isEnabled)) await ctx.swarm.skill_update({ skillId, isEnabled: true });
+      const back = await q(`SELECT isEnabled FROM skills WHERE id = ?`, [skillId]);
+      if (back.length && Number(back[0].isEnabled)) {
+        await mark({});
+        restored.push({ key, how: "skill re-enabled" });
+      } else failed.push({ key, reason: "skill still disabled after skill_update" });
+      return done();
+    }
+
+    const scope = rec.scope === "global" ? "global" : "agent";
+    const source = typeof rec.source === "string" ? rec.source : "";
+    if (!source) { failed.push({ key, reason: "record has no source" }); return done(); }
+    if ((await sha(source)) !== String(rec.contentHash ?? "")) { failed.push({ key, reason: "record source does not match its contentHash" }); return done(); }
+    const ownerClause = scope === "agent" && rec.agentId ? " AND scopeId = ?" : "";
+    const ownerParam = ownerClause ? [String(rec.agentId)] : [];
+    const live = await q(`SELECT id, contentHash FROM scripts WHERE name = ? AND scope = ?${ownerClause}`, [name, scope, ...ownerParam]);
+    if (live.length && String(live[0].contentHash) === String(rec.contentHash)) {
+      if (!dry) await mark({ id: String(live[0].id) });
+      restored.push({ key, how: "script already present with the recorded contentHash" });
+      return done();
+    }
+    if (live.length) { failed.push({ key, reason: "another script now holds this name; not overwritten" }); return done(); }
+    if (dry) { planned.push({ key, how: `script_upsert scope ${scope} from the recorded source` }); return done(); }
+    await ctx.swarm.script_upsert({
+      name,
+      source,
+      scope,
+      description: typeof rec.description === "string" && rec.description ? rec.description : `Restored ${name} (dreaming adoption-gate rollback).`,
+      intent: typeof rec.intent === "string" && rec.intent ? rec.intent : "Brought back by hand after the dreaming adoption gate retired it.",
+    });
+    const back = await q(`SELECT id FROM scripts WHERE name = ? AND scope = ? AND contentHash = ?${ownerClause}`, [name, scope, String(rec.contentHash), ...ownerParam]);
+    if (back.length) {
+      await mark({ id: String(back[0].id) });
+      restored.push({ key, how: `script_upsert scope ${scope}` });
+    } else failed.push({ key, reason: `script not visible after script_upsert${ownerClause ? " (an agent-scope script restores only when its owner runs the rollback)" : ""}` });
+  } catch (e: any) {
+    failed.push({ key, reason: String(e?.message ?? e).slice(0, 200) });
   }
   return done();
 }

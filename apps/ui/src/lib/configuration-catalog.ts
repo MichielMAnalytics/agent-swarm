@@ -1219,6 +1219,35 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         docsUrl: `${DOCS}guides/dreaming`,
       },
       {
+        key: "DREAMING_LANE_SKILLIFY",
+        label: "Skillify lane",
+        description:
+          "Create and update skills from repeated procedures. New skills are retired by the adoption gate when nobody uses them.",
+        kind: "boolean",
+        defaultValue: "true",
+        docsUrl: `${DOCS}guides/dreaming`,
+      },
+      {
+        key: "DREAMING_LANE_SCRIPTIFY",
+        label: "Scriptify lane",
+        description:
+          "Build agent-scope scripts for deterministic steps done by hand. Unused scripts are retired by the adoption gate.",
+        kind: "boolean",
+        defaultValue: "true",
+        docsUrl: `${DOCS}guides/dreaming`,
+      },
+      {
+        key: "DREAMING_ADOPTION_GATE_DAYS",
+        label: "Adoption gate (days)",
+        description:
+          "Days a dreaming-created skill or script may go unused before it is retired (skill disabled, script deleted). 0 counts uses but never retires.",
+        kind: "number",
+        unit: "days",
+        defaultValue: "14",
+        placeholder: "14",
+        docsUrl: `${DOCS}guides/dreaming`,
+      },
+      {
         key: "DREAMING_SLACK_CHANNEL",
         label: "Slack channel",
         description:
@@ -1240,7 +1269,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "DREAMING_WORKER_AGENT_ID",
         label: "Worker agent ID",
         description:
-          "Agent (UUID) that runs the trim, heartbeat draft, and publish steps. Leave empty to use the lead.",
+          "Agent (UUID) that runs the trim, heartbeat draft, scriptify, and publish steps. Leave empty to use the lead.",
         kind: "string",
         defaultValue: "",
         placeholder: "00000000-0000-0000-0000-000000000000",
@@ -1308,6 +1337,33 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         kind: "number",
         defaultValue: "10",
         placeholder: "10",
+        docsUrl: `${DOCS}guides/dreaming`,
+      },
+      {
+        key: "DREAMING_CAP_SKILL_CREATE",
+        label: "Skills created per night",
+        description: "Maximum new skills created in one night.",
+        kind: "number",
+        defaultValue: "1",
+        placeholder: "1",
+        docsUrl: `${DOCS}guides/dreaming`,
+      },
+      {
+        key: "DREAMING_CAP_SKILL_UPDATE",
+        label: "Skills updated per night",
+        description: "Maximum existing skills rewritten in one night.",
+        kind: "number",
+        defaultValue: "3",
+        placeholder: "3",
+        docsUrl: `${DOCS}guides/dreaming`,
+      },
+      {
+        key: "DREAMING_CAP_SCRIPT_BUILDS",
+        label: "Scripts built per night",
+        description: "Maximum new scripts built in one night.",
+        kind: "number",
+        defaultValue: "1",
+        placeholder: "1",
         docsUrl: `${DOCS}guides/dreaming`,
       },
     ],

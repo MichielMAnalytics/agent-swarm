@@ -7,6 +7,8 @@ const BOOLEAN_KEYS = [
   "DREAMING_LANE_TRIM",
   "DREAMING_LANE_IDENTITY",
   "DREAMING_LANE_MEMORY",
+  "DREAMING_LANE_SKILLIFY",
+  "DREAMING_LANE_SCRIPTIFY",
 ] as const;
 
 const CAP_KEYS = [
@@ -15,6 +17,11 @@ const CAP_KEYS = [
   "DREAMING_CAP_MEMORY_STORE",
   "DREAMING_CAP_MEMORY_EDIT",
   "DREAMING_CAP_MEMORY_DELETE",
+  "DREAMING_CAP_SKILL_CREATE",
+  "DREAMING_CAP_SKILL_UPDATE",
+  "DREAMING_CAP_SCRIPT_BUILDS",
+  // 0 turns the adoption gate's retirement off, so it shares the cap rule.
+  "DREAMING_ADOPTION_GATE_DAYS",
 ] as const;
 
 describe("dreaming boolean validators", () => {

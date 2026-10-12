@@ -439,13 +439,14 @@ export default async function (args: unknown, ctx: ScriptContext) {
   const taskIds = runTasks.map((t: any) => t.id);
   const runAgents = [...new Set([LEAD, ...runTasks.map((t: any) => t.agentId)].filter(Boolean))];
 
-  // 1. Skills claims.
+  // 1. Skills claims. A confirmed create becomes an adoption-gate artifact (section 5b).
   const skillResults: any[] = Array.isArray(skills?.results) ? skills.results : [];
   const claimedSkillIds = new Set<string>();
+  const createdArtifacts: any[] = [];
   for (const r of skillResults) {
     if (r?.status !== "applied") continue;
     if (r.skillId) claimedSkillIds.add(String(r.skillId));
-    const s = await q("skillClaim", `SELECT version, content FROM skills WHERE id = ?`, [String(r.skillId ?? "")]);
+    const s = await q("skillClaim", `SELECT version, content, name, scope, ownerAgentId, createdAt FROM skills WHERE id = ?`, [String(r.skillId ?? "")]);
     if (!s.length) {
       claimMismatch.push({ actionId: r.actionId, lane: "skills", detail: "skill row missing" });
       continue;
@@ -453,8 +454,31 @@ export default async function (args: unknown, ctx: ScriptContext) {
     const cSha = await sha(String(s[0].content ?? ""));
     const vOk = r.versionAfter === undefined || Number(s[0].version) === Number(r.versionAfter);
     const hOk = !r.contentSha256 || cSha === r.contentSha256;
-    if (vOk && hOk) confirmed.push({ actionId: r.actionId, lane: "skills", skillId: r.skillId, version: Number(s[0].version), contentSha256: cSha });
+    if (vOk && hOk) {
+      confirmed.push({ actionId: r.actionId, lane: "skills", skillId: r.skillId, version: Number(s[0].version), contentSha256: cSha });
+      const isCreate = r.op === "create" || (r.op === undefined && !(Number(r.versionBefore) > 0));
+      if (isCreate)
+        createdArtifacts.push({ kind: "skill", name: String(s[0].name), id: String(r.skillId), scope: s[0].scope ?? null, agentId: s[0].ownerAgentId ?? null, createdAt: String(s[0].createdAt ?? ""), contentHash: cSha, actionId: r.actionId ?? null });
+    }
     else claimMismatch.push({ actionId: r.actionId, lane: "skills", detail: `version ${s[0].version} vs ${r.versionAfter}; sha ${cSha.slice(0, 12)} vs ${String(r.contentSha256 ?? "").slice(0, 12)}` });
+  }
+
+  // 1b. Scriptify claims: a "built" script must exist with the claimed contentHash. Read the source as hex so the
+  // artifact record keeps stored bytes (db_query responses pass the secret scrubber).
+  const builtScripts: any[] = Array.isArray(scriptify?.built) ? scriptify.built.filter((b: any) => b?.status === "built") : [];
+  for (const b of builtScripts) {
+    const name = String(b.name ?? "");
+    const scope = b.scope === "global" ? "global" : "agent";
+    const sr = name
+      ? await q("scriptClaim", `SELECT id, name, scope, scopeId, createdByAgentId, contentHash, createdAt, description, intent, hex(CAST(source AS BLOB)) hx FROM scripts WHERE name = ? AND scope = ? ORDER BY updatedAt DESC`, [name, scope])
+      : [];
+    const row = sr.find((x: any) => !b.contentHash || String(x.contentHash) === String(b.contentHash));
+    if (!row) {
+      claimMismatch.push({ actionId: b.actionId, lane: "scriptify", detail: sr.length ? `script ${name} contentHash differs from the claim` : `script ${name || "(no name)"} (${scope}) missing` });
+      continue;
+    }
+    confirmed.push({ actionId: b.actionId, lane: "scriptify", name, scope, contentHash: row.contentHash });
+    createdArtifacts.push({ kind: "script", name, id: String(row.id), scope, agentId: row.scopeId ?? row.createdByAgentId ?? null, createdAt: String(row.createdAt ?? ""), contentHash: String(row.contentHash), source: decodeHex(row.hx), description: row.description ?? null, intent: row.intent ?? null, actionId: b.actionId ?? null });
   }
 
   // Apply claims are re-checked against the database, not trusted.
@@ -558,6 +582,7 @@ export default async function (args: unknown, ctx: ScriptContext) {
   if (dry) for (const it of trimApplied) dryRunViolations.push({ kind: "trim-claimed-write", agentId: it.agentId, field: it.field });
   if (dry) for (const it of applied) dryRunViolations.push({ kind: "apply-claimed-write", actionId: it.actionId });
   if (dry) for (const r of skillResults) if (r?.status === "applied") dryRunViolations.push({ kind: "skills-claimed-write", actionId: r.actionId });
+  if (dry) for (const b of builtScripts) dryRunViolations.push({ kind: "script-claimed-write", actionId: b.actionId });
 
   // 2. Unclaimed writes since `since`.
   const cv = await q(
@@ -829,6 +854,29 @@ export default async function (args: unknown, ctx: ScriptContext) {
     }
   }
 
+  // 5b. Artifact registry (live only): one KV record per confirmed create, read by dream-adoption and rollback.
+  // No TTL: the record must outlive the adoption window, and a retired script is restored from its `source`.
+  const artifacts: any = { written: [], kept: [] };
+  if (!dry && !replay && runId) {
+    for (const art of createdArtifacts) {
+      const key = `artifact:${art.kind}:${art.name}`;
+      try {
+        const prev: any = await ctx.swarm.kv_getOrNull({ namespace: NS, key });
+        const pv = parseObj(prev?.value) ?? prev?.value;
+        if (pv && String(pv.id ?? "") === art.id) {
+          artifacts.kept.push(key);
+          continue;
+        }
+        const { actionId, ...rest } = art;
+        const value = { ...rest, createdAt: art.createdAt || new Date().toISOString(), runId, actionId, status: "active" };
+        await ctx.swarm.kv_set({ namespace: NS, key, value: value as any });
+        artifacts.written.push(key);
+      } catch (e: any) {
+        errors.push(`artifact ${key}: ${String(e?.message ?? e).slice(0, 200)}`);
+      }
+    }
+  }
+
   // 6. Green dry run (dry only): gather reads this key to allow the first live run.
   const greenDryRun: any = { key: GREEN_KEY, written: false };
   // Steps that ended badly before verify (onNodeFailure: continue still routes a failed node here).
@@ -861,7 +909,7 @@ export default async function (args: unknown, ctx: ScriptContext) {
     if (failedSteps.length) greenDryRun.failedSteps = failedSteps.map((s: any) => `${s.nodeId}:${s.status}`);
   }
 
-  return { ok, mode: dry ? "dry-run" : replay ? "replay" : "live", since, controls, metrics, confirmed, claimMismatch, unclaimed, concurrent: concurrent.slice(0, 30), concurrentCount: concurrent.length, dryRunViolations, missingLanes, survival, ...(replay ? { syntheticSurvival } : {}), trimSurvival, ledgerKey, greenDryRun, stagedPreimages, errors };
+  return { ok, mode: dry ? "dry-run" : replay ? "replay" : "live", since, controls, metrics, confirmed, artifacts, claimMismatch, unclaimed, concurrent: concurrent.slice(0, 30), concurrentCount: concurrent.length, dryRunViolations, missingLanes, survival, ...(replay ? { syntheticSurvival } : {}), trimSurvival, ledgerKey, greenDryRun, stagedPreimages, errors };
 }
 
 

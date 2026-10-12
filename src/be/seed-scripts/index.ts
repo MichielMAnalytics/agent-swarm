@@ -30,6 +30,7 @@ import completeTaskSrc from "./catalog/complete-task.ts" with { type: "text" };
 import compoundInsightsSrc from "./catalog/compound-insights.inline.ts" with { type: "text" };
 import dateResolveSrc from "./catalog/date-resolve.ts" with { type: "text" };
 import delegateSrc from "./catalog/delegate.ts" with { type: "text" };
+import dreamAdoptionSrc from "./catalog/dream-adoption.ts" with { type: "text" };
 import dreamApplySrc from "./catalog/dream-apply.ts" with { type: "text" };
 import dreamGatherSrc from "./catalog/dream-gather.ts" with { type: "text" };
 import dreamHeartbeatSrc from "./catalog/dream-heartbeat.ts" with { type: "text" };
@@ -365,9 +366,17 @@ export const SEED_SCRIPTS: SeedScript[] = [
   {
     name: "dream-rollback",
     description:
-      "Dreaming rollback: restore profile fields, identity edits and memories a dreaming run wrote, from its KV pre-images.",
-    intent: "Undo one dreaming run by hand.",
+      "Dreaming rollback: restore profile fields, identity edits and memories a dreaming run wrote, from its KV pre-images, or bring back one retired skill or script.",
+    intent: "Undo one dreaming run, or one adoption-gate retirement, by hand.",
     source: asText(dreamRollbackSrc),
+  },
+  {
+    name: "dream-adoption",
+    description:
+      "Dreaming adoption gate: count real uses of every skill and script dreaming created, and retire the ones nobody used within the gate window.",
+    intent:
+      "Run from the dreaming workflow so unused dreaming-built skills are disabled and unused scripts deleted, with records kept for rollback.",
+    source: asText(dreamAdoptionSrc),
   },
 ];
 

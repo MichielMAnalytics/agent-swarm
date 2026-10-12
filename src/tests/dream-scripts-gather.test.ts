@@ -142,9 +142,16 @@ describe("dream-gather", () => {
     const h = harness();
     const r: any = await dreamGather({ enabled: "false", laneTrim: "false", capTrims: "2" }, h.ctx);
     expect(r).toMatchObject({ ok: true, mode: "off", dryRun: true, agents: [], overlap: [] });
-    expect(r.lanes).toEqual({ heartbeat: true, trim: false, identity: true, memory: true });
+    expect(r.lanes).toEqual({
+      heartbeat: true,
+      trim: false,
+      identity: true,
+      memory: true,
+      skillify: true,
+      scriptify: true,
+    });
     expect(r.caps.trims).toBe(2);
-    expect(r.cfg).toEqual({ slackChannel: "", reportTarget: "page", budgetUsd: 25 });
+    expect(r.cfg).toEqual({ slackChannel: "", reportTarget: "page", budgetUsd: 25, gateDays: 14 });
     expect(h.calls).toEqual([]);
   });
 
@@ -218,19 +225,32 @@ describe("dream-gather", () => {
         laneTrim: "false",
         laneIdentity: "1",
         laneMemory: false,
+        laneSkillify: "false",
+        laneScriptify: "1",
+        gateDays: "0",
         capIdentityTotal: "-3",
         capIdentityPerAgent: "2",
         capTrims: -1,
         capMemoryStore: "4.7",
         capMemoryEdit: "abc",
         capMemoryDelete: "12",
+        capSkillCreate: "0",
+        capSkillUpdate: "-2",
+        capScriptBuilds: "2",
         budgetUsd: "0",
         slackChannel: "  #nightly  ",
         reportTarget: "none",
       },
       harness().ctx,
     );
-    expect(r.lanes).toEqual({ heartbeat: false, trim: false, identity: true, memory: false });
+    expect(r.lanes).toEqual({
+      heartbeat: false,
+      trim: false,
+      identity: true,
+      memory: false,
+      skillify: false,
+      scriptify: true,
+    });
     expect(r.caps).toEqual({
       identityOpsTotal: 0,
       identityOpsPerAgent: 2,
@@ -238,8 +258,16 @@ describe("dream-gather", () => {
       memoryStore: 4,
       memoryEdit: 5,
       memoryDelete: 12,
+      skillCreate: 0,
+      skillUpdate: 0,
+      scriptBuilds: 2,
     });
-    expect(r.cfg).toEqual({ slackChannel: "#nightly", reportTarget: "none", budgetUsd: 1 });
+    expect(r.cfg).toEqual({
+      slackChannel: "#nightly",
+      reportTarget: "none",
+      budgetUsd: 1,
+      gateDays: 0,
+    });
 
     const big: any = await dreamGather({ budgetUsd: "5000", reportTarget: "bogus" }, harness().ctx);
     expect(big.cfg.budgetUsd).toBe(1000);
@@ -249,7 +277,14 @@ describe("dream-gather", () => {
 
     // No lane args at all: every lane is on, caps at their defaults.
     const defaults: any = await dreamGather({}, harness().ctx);
-    expect(defaults.lanes).toEqual({ heartbeat: true, trim: true, identity: true, memory: true });
+    expect(defaults.lanes).toEqual({
+      heartbeat: true,
+      trim: true,
+      identity: true,
+      memory: true,
+      skillify: true,
+      scriptify: true,
+    });
     expect(defaults.caps).toEqual({
       identityOpsTotal: 6,
       identityOpsPerAgent: 1,
@@ -257,7 +292,11 @@ describe("dream-gather", () => {
       memoryStore: 5,
       memoryEdit: 5,
       memoryDelete: 10,
+      skillCreate: 1,
+      skillUpdate: 3,
+      scriptBuilds: 1,
     });
+    expect(defaults.cfg.gateDays).toBe(14);
   });
 
   test("workerId falls back to leadId when empty, malformed or unknown", async () => {
