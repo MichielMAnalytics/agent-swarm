@@ -264,6 +264,10 @@ export {
   getLatestContextVersion,
 } from "./db/context-versions";
 export { getScriptRunExecutionArgs } from "./db/script-runs";
+export {
+  isWorkflowRunLeadPrincipalEligible,
+  revokeWorkflowRunLeadPrincipal,
+} from "./db/workflow-runs";
 
 configureAgentDependencies({
   createLogEntry: (entry) => createLogEntry(entry),
@@ -7685,6 +7689,8 @@ type WorkflowRunRow = {
   finishedAt: string | null;
   /** The `sub-workflow` step that started this run (migration 203). */
   parentStepId?: string | null;
+  /** See `isWorkflowRunLeadPrincipalEligible` (migration 209). */
+  leadPrincipalEligible?: number;
 };
 
 /**
@@ -7718,10 +7724,12 @@ export async function createWorkflowRun(data: {
   triggerData?: unknown;
   createdBy?: string;
   parentStepId?: string;
+  /** The workflow is the unedited seeded template (migration 209). */
+  leadPrincipalEligible?: boolean;
 }): Promise<WorkflowRun> {
   const now = new Date().toISOString();
   const row = await getDbClient().get<WorkflowRunRow>(
-    `INSERT INTO workflow_runs (id, workflowId, triggerType, startedAt, triggerData, created_by, parentStepId) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+    `INSERT INTO workflow_runs (id, workflowId, triggerType, startedAt, triggerData, created_by, parentStepId, leadPrincipalEligible) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     [
       data.id,
       data.workflowId,
@@ -7730,6 +7738,7 @@ export async function createWorkflowRun(data: {
       data.triggerData ? scrubJsonValue(data.triggerData) : null,
       data.createdBy ?? null,
       data.parentStepId ?? null,
+      data.leadPrincipalEligible ? 1 : 0,
     ],
   );
   if (!row) throw new Error("Failed to create workflow run");

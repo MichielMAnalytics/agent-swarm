@@ -15,11 +15,15 @@ import {
   getLatestStepForNode,
   getStepByIdempotencyKey,
   getStepCountForNode,
+  getWorkflow,
   getWorkflowRun,
   getWorkflowRunStepsByRunId,
+  isWorkflowRunLeadPrincipalEligible,
+  revokeWorkflowRunLeadPrincipal,
   updateWorkflowRun,
   updateWorkflowRunStep,
 } from "../be/db";
+import { isPristineSeededLeadWorkflow } from "../be/seed/workflows-seeder";
 import { WorkflowReplayStateError } from "../be/workflow-replay";
 import { telemetry } from "../telemetry";
 import type { Workflow, WorkflowDefinition, WorkflowNode, WorkflowRunStep } from "../types";
@@ -153,6 +157,7 @@ export async function startWorkflowExecution(
     triggerData,
     createdBy: options.requestedByUserId,
     parentStepId: options.parentStepId,
+    leadPrincipalEligible: await isPristineSeededLeadWorkflow(workflow),
   });
   telemetry.workflow("started", {
     workflowId: workflow.id,
@@ -312,6 +317,24 @@ export async function walkGraph(
   }
 }
 
+/**
+ * Seeded `runAs: "lead"` scripts run as the Lead only while every walk of the
+ * run executed the shipped definition. Resume, retry and recovery walk the
+ * stored row, which may have been edited and restored since an earlier walk,
+ * so the verdict is kept on the run: the first walk of an edited definition
+ * revokes it before any node executes, and no later walk restores it.
+ */
+async function revokeLeadPrincipalIfEdited(
+  runId: string,
+  def: WorkflowDefinition,
+  workflowId: string | undefined,
+): Promise<void> {
+  if (!(await isWorkflowRunLeadPrincipalEligible(runId))) return;
+  const workflow = workflowId ? await getWorkflow(workflowId) : null;
+  if (workflow && (await isPristineSeededLeadWorkflow({ ...workflow, definition: def }))) return;
+  await revokeWorkflowRunLeadPrincipal(runId);
+}
+
 async function walkGraphOwned(
   def: WorkflowDefinition,
   runId: string,
@@ -330,6 +353,7 @@ async function walkGraphOwned(
       requestedByUserId: (await getWorkflowRun(runId))?.createdBy,
     };
   }
+  await revokeLeadPrincipalIfEdited(runId, def, workflowId);
   let nodeExecutionCount = 0;
   // `run.id` is a context builtin (like `trigger` / `input`) so nodes can reference
   // their own run — e.g. an audit/receipt node correlating its output with the run

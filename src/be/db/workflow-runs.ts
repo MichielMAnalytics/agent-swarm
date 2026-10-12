@@ -93,3 +93,25 @@ function emitAfterCommit(childRunId: string, parentStepId: string): void {
       );
   });
 }
+
+// Lead eligibility of a seeded run (migration 209).
+
+/**
+ * Whether the run may still run seeded `runAs: "lead"` scripts as the Lead.
+ * False for an unknown run.
+ */
+export async function isWorkflowRunLeadPrincipalEligible(runId: string): Promise<boolean> {
+  const row = await getDbClient().get<{ leadPrincipalEligible: number }>(
+    "SELECT leadPrincipalEligible FROM workflow_runs WHERE id = ?",
+    [runId],
+  );
+  return row?.leadPrincipalEligible === 1;
+}
+
+/** Clears the run's Lead eligibility. One-way: nothing sets it again. */
+export async function revokeWorkflowRunLeadPrincipal(runId: string): Promise<void> {
+  await getDbClient().run(
+    "UPDATE workflow_runs SET leadPrincipalEligible = 0 WHERE id = ? AND leadPrincipalEligible = 1",
+    [runId],
+  );
+}

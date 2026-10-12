@@ -474,6 +474,7 @@ value:isPoolAffinityEnforcementEnabled
 value:isSettledSlackMessage
 value:isSlackThreadAwaitingHuman
 value:isSqliteVecAvailable
+value:isWorkflowRunLeadPrincipalEligible
 value:kvPrefixUpperBound
 value:listAgentsWithCredStatusByProvider
 value:listAllMetrics
@@ -558,6 +559,7 @@ value:resolvePromptTemplate
 value:resolveSqliteVecExtensionPath
 value:resolveWaitState
 value:resumeTask
+value:revokeWorkflowRunLeadPrincipal
 value:searchSkills
 value:setAgentHarnessProvider
 value:setApiKeyName

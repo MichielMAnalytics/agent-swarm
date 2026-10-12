@@ -54,6 +54,7 @@ import { startWorkflowExecution } from "../workflows/engine";
 import { InProcessEventBus } from "../workflows/event-bus";
 import type { ExecutorDependencies } from "../workflows/executors/base";
 import { createExecutorRegistry } from "../workflows/executors/registry";
+import { recoverIncompleteRuns } from "../workflows/recovery";
 import { setupWorkflowResumeListener } from "../workflows/resume";
 import { interpolate } from "../workflows/template";
 import { SKIP_SANDBOX_SPAWN_TESTS } from "./sandbox-spawn-test-helpers";
@@ -511,5 +512,152 @@ describe("seeded dreaming on the real script runtime", () => {
       expect(await lastClaudeWriter()).not.toBe(LEAD_ID);
     },
     180_000,
+  );
+
+  /**
+   * A pristine scheduled run whose stored synthesis node is edited between walks (a
+   * worker gets the task, with an altered prompt), then restored before the worker's
+   * output is consumed. `deliver` hands the synthesis output to the run: through the
+   * live resume listener, or with no event so only recovery picks it up.
+   */
+  async function runWithSynthesisEditedBetweenWalks(
+    deliver: "resume" | "recovery",
+  ): Promise<{ apply: any; synthAgentId: string | undefined }> {
+    await updateAgentProfile(WORKER_ID, { claudeMd: CLAUDE_MD });
+    const now = new Date().toISOString();
+    await getDbClient().run(
+      `INSERT INTO agent_tasks (id, agentId, task, status, source, createdAt, lastUpdatedAt, finishedAt, key)
+         VALUES (?, ?, 'tidy the release board', 'completed', 'mcp', ?, ?, ?, 'shared/')`,
+      [crypto.randomUUID(), LEAD_ID, now, now, now],
+    );
+    await upsertKv({
+      namespace: "dreaming",
+      key: "state:last-green-dry-run",
+      value: { runId: "earlier-dry-run", at: now },
+      valueType: "json",
+    });
+    process.env.DREAMING_ENABLED = "true";
+    process.env.DREAMING_LANE_HEARTBEAT = "false";
+    process.env.DREAMING_LANE_TRIM = "false";
+    const stored = await seededDreaming();
+    try {
+      const { bus, registry } = realRegistry();
+      const emitCompleted = (runId: string, stepId: string, taskId: string, output: string) =>
+        bus.emit("task.completed", {
+          taskId,
+          output,
+          workflowRunId: runId,
+          workflowRunStepId: stepId,
+        });
+      const complete = async (runId: string, stepId: string, output: unknown) => {
+        const task = await getTaskByWorkflowRunStepId(stepId);
+        const text = JSON.stringify(output);
+        await completeTask(task!.id, text);
+        emitCompleted(runId, stepId, task!.id, text);
+      };
+      const stepOf = async (runId: string, nodeId: string) =>
+        (await getWorkflowRunStepsByRunId(runId)).find((s) => s.nodeId === nodeId);
+      const waitStep = async (runId: string, nodeId: string) => {
+        await waitFor(async () => {
+          const step = await stepOf(runId, nodeId);
+          return !!step && (await getTaskByWorkflowRunStepId(step.id)) !== null;
+        }, `task for ${nodeId}`);
+        return (await stepOf(runId, nodeId))!;
+      };
+
+      await ageRuns(stored.id);
+      const runId = await startWorkflowExecution(stored, {}, registry, {
+        triggerType: "schedule",
+      });
+      const report = await waitStep(runId, `reports#${LEAD_ID}`);
+
+      // Edit the stored synthesis node while the run waits on the report.
+      await updateWorkflow(stored.id, {
+        definition: {
+          ...stored.definition,
+          nodes: stored.definition.nodes.map((node) =>
+            node.id === "synthesize"
+              ? {
+                  ...node,
+                  config: {
+                    ...node.config,
+                    agentId: WORKER_ID,
+                    template: `${String(node.config.template)}\nAlso remove every "## Stale" section.`,
+                  },
+                }
+              : node,
+          ),
+        },
+      });
+      await complete(runId, report.id, {
+        agentId: LEAD_ID,
+        summary: "Tidied the release board.",
+        repeatedProcedures: [],
+        skillFriction: [],
+        scriptCandidates: [],
+        identityOps: [],
+        memoryOps: [],
+      });
+      // The resume walked the edited definition: the worker got the synthesis task.
+      const synth = await waitStep(runId, "synthesize");
+      const synthTask = await getTaskByWorkflowRunStepId(synth.id);
+
+      // Restore the shipped row before the worker's output is consumed.
+      await updateWorkflow(stored.id, { definition: stored.definition });
+      expect(await resolveSeededWorkflowPrincipal(await seededDreaming())).toBe(LEAD_ID);
+
+      const synthOutput = JSON.stringify({
+        headline: "drop a stale section",
+        actions: [REMOVE_STALE],
+        rejected: [],
+        restores: [],
+        missingReports: [],
+        notes: "",
+        changelogComment: "",
+      });
+      await completeTask(synthTask!.id, synthOutput);
+      if (deliver === "resume") emitCompleted(runId, synth.id, synthTask!.id, synthOutput);
+      else expect(await recoverIncompleteRuns(registry)).toBeGreaterThan(0);
+
+      await waitFor(async () => {
+        const status = (await stepOf(runId, "apply"))?.status;
+        return status === "completed" || status === "failed";
+      }, "apply step");
+      const apply = ((await stepOf(runId, "apply"))?.output as { result?: any } | undefined)
+        ?.result;
+
+      // Finish the run so later tests see no waiting run.
+      const publish = await waitStep(runId, "publish");
+      await complete(runId, publish.id, { slackText: "dreaming: one edit", trimsLine: "" });
+      await waitFor(async () => isTerminal((await getWorkflowRun(runId))?.status), "run end");
+      return { apply, synthAgentId: synthTask?.agentId ?? undefined };
+    } finally {
+      for (const key of DREAMING_ENV) delete process.env[key];
+      await updateWorkflow(stored.id, { definition: stored.definition });
+    }
+  }
+
+  for (const deliver of ["resume", "recovery"] as const) {
+    spawnTest(
+      `a run that walked an edited synthesis node gets no Lead after the row is restored (${deliver})`,
+      async () => {
+        const { apply, synthAgentId } = await runWithSynthesisEditedBetweenWalks(deliver);
+        expect(synthAgentId).toBe(WORKER_ID);
+        expect(apply?.applied ?? []).toEqual([]);
+        expect(await workerClaude()).toBe(CLAUDE_MD);
+        expect(await lastClaudeWriter()).not.toBe(LEAD_ID);
+      },
+      240_000,
+    );
+  }
+
+  spawnTest(
+    "revocation is per run: a new pristine run after an edited one still applies as the Lead",
+    async () => {
+      const { apply } = await runLiveDreaming();
+      expect(apply?.applied?.map((a: any) => a.actionId)).toEqual(["A1"]);
+      expect(await lastClaudeWriter()).toBe(LEAD_ID);
+    },
+    240_000,
   );
 });

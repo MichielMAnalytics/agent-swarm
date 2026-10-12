@@ -619,6 +619,8 @@ describe("script connections", () => {
       markMigrationApplied(database, "203_workflow_run_parent_step.sql");
       // 205 copies user_favorites rows, which this migration-112-only fixture does not create.
       markMigrationApplied(database, "205_favorites_per_dashboard_user.sql");
+      // 209 alters workflow_runs, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "209_workflow_run_lead_principal.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();

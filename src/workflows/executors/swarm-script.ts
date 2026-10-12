@@ -95,8 +95,14 @@ export class SwarmScriptExecutor extends BaseExecutor<
     // that opts in (runAs: "lead") runs its scripts as the current Lead instead.
     // Check the definition this walk executes, not the stored row: an edited
     // definition captured by a run must not inherit Lead after the row is restored.
+    // The run's durable flag covers earlier walks: once any walk of this run
+    // executed an edited definition, a later resume or recovery walking the
+    // restored row must not consume that output as Lead.
     const seededPrincipal =
-      workflow && !workflow.createdByAgentId && meta.definition
+      workflow &&
+      !workflow.createdByAgentId &&
+      meta.definition &&
+      (await this.deps.db.isWorkflowRunLeadPrincipalEligible(meta.runId))
         ? await resolveSeededWorkflowPrincipal({ ...workflow, definition: meta.definition })
         : undefined;
     let agentId = workflow?.createdByAgentId ?? seededPrincipal ?? agentIdFromContext(context);

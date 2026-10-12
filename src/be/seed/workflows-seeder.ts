@@ -261,19 +261,33 @@ export function seededLeadPrincipalWorkflowNames(
  * Lead. Returns undefined otherwise, or when no Lead is registered, so the
  * caller fails closed to its existing fallback. This checks the workflow only:
  * the swarm-script executor also requires each script to be the shipped
- * catalog source before it runs as this principal.
+ * catalog source before it runs as this principal, and the engine requires the
+ * run to have walked only such definitions (`isWorkflowRunLeadPrincipalEligible`).
  */
 export async function resolveSeededWorkflowPrincipal(
   workflow: Workflow,
   sources: readonly WorkflowTemplateSource[] = BUILT_IN_WORKFLOW_SOURCES,
 ): Promise<string | undefined> {
-  if (!seededLeadPrincipalWorkflowNames(sources).has(workflow.name)) return undefined;
-  const template = loadSeedWorkflows(sources).find((w) => w.name === workflow.name);
-  if (!template) return undefined;
-  if (workflowSeedHash(workflowFromRow(workflow)) !== workflowSeedHash(hashedWorkflow(template)))
-    return undefined;
-  if (!(await getSeedState("workflow", workflow.name))) return undefined;
+  if (!(await isPristineSeededLeadWorkflow(workflow, sources))) return undefined;
   return (await getLeadAgent())?.id ?? undefined;
+}
+
+/**
+ * Whether `workflow` is a creator-less, seeder-recorded row of a `runAs: "lead"`
+ * template whose content still hashes to the shipped template. The Lead-agent
+ * lookup is left out, so a missing Lead does not count as an edit.
+ */
+export async function isPristineSeededLeadWorkflow(
+  workflow: Workflow,
+  sources: readonly WorkflowTemplateSource[] = BUILT_IN_WORKFLOW_SOURCES,
+): Promise<boolean> {
+  if (workflow.createdByAgentId) return false;
+  if (!seededLeadPrincipalWorkflowNames(sources).has(workflow.name)) return false;
+  const template = loadSeedWorkflows(sources).find((w) => w.name === workflow.name);
+  if (!template) return false;
+  if (workflowSeedHash(workflowFromRow(workflow)) !== workflowSeedHash(hashedWorkflow(template)))
+    return false;
+  return !!(await getSeedState("workflow", workflow.name));
 }
 
 async function findWorkflowByName(name: string): Promise<Workflow | null> {
