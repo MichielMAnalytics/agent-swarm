@@ -624,6 +624,8 @@ describe("script connections", () => {
       markMigrationApplied(database, "206_runtime_pools.sql");
       // 207 rebuilds session_tokens, which this migration-112-only fixture does not create.
       markMigrationApplied(database, "207_runtime_session_tokens.sql");
+      // 211 alters swarm_config, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "211_swarm_config_exposure.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();

@@ -16,6 +16,7 @@ import {
 } from "../be/multi-runtime";
 import { fillOrgLogoFromWebsite } from "../be/org-profile";
 import { getUserGrant } from "../be/rbac-roles";
+import { secretExposureFor, validateExposureWrite } from "../be/secret-exposure";
 import {
   internalConfigKeyError,
   isInternalConfigKey,
@@ -24,7 +25,7 @@ import {
   validateConfigValue,
 } from "../be/swarm-config-guard";
 import { can, isRbacEnabled, type PermissionVerb } from "../rbac";
-import { SwarmConfigSchema } from "../types";
+import { type SecretExposure, SecretExposureSchema, SwarmConfigSchema } from "../types";
 import { getRequestAuth } from "../utils/request-auth-context";
 import { registerVolatileSecret } from "../utils/secret-scrubber";
 import { reloadGlobalConfigsAndIntegrations, scheduleIntegrationsReload } from "./core";
@@ -35,16 +36,17 @@ const MAX_ENV_PRESENCE_KEYS = 200;
 const SECRETS_FORCE_MASK_NOTE =
   " (secret values masked: this token cannot read secrets in this scope)";
 
-// Config keys the API server owns for its own use and must NEVER hand out over
-// HTTP — workers/entrypoints read config to build their env, and the agent-fs
-// bootstrap admin key would let a compromised worker administer the shared org.
-// The API materializes these into its own process.env at boot via
-// getInjectableGlobalConfigs, so no HTTP consumer legitimately needs them.
-const API_ONLY_CONFIG_KEYS = new Set(["API_AGENT_FS_API_KEY", "SLACK_SIGNING_SECRET"]);
-
-function stripApiOnlyKeys<T extends { key: string }>(configs: T[]): T[] {
+// Rows with exposure `api` belong to the API server and are NEVER handed out
+// over HTTP — workers/entrypoints read config to build their env, and the
+// agent-fs bootstrap admin key would let a compromised worker administer the
+// shared org. The API materializes these into its own process.env at boot via
+// getInjectableGlobalConfigs, so no HTTP consumer legitimately needs them. The
+// key list lives in src/be/secret-exposure.ts.
+function stripApiOnlyKeys<T extends { key: string; exposure?: SecretExposure | null }>(
+  configs: T[],
+): T[] {
   return configs.filter(
-    (config) => !API_ONLY_CONFIG_KEYS.has(config.key) && !isInternalConfigKey(config.key),
+    (config) => secretExposureFor(config) !== "api" && !isInternalConfigKey(config.key),
   );
 }
 
@@ -276,6 +278,9 @@ const upsertConfig = route({
     isSecret: z.boolean().optional(),
     envPath: z.string().nullish(),
     description: z.string().nullish(),
+    exposure: SecretExposureSchema.nullish().describe(
+      "Who may read this secret's value: worker, lead or api. Omit to keep the stored value; null clears the override so the key default applies.",
+    ),
   }),
   responses: {
     200: { description: "Config entry upserted", schema: SwarmConfigSchema },
@@ -442,7 +447,7 @@ export async function handleConfig(
     const parsed = await upsertConfig.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
     if (!(await ensureConfigAdmin(req, res, "config.write.any"))) return true;
-    const { scope, scopeId, key, value, isSecret, envPath, description } = parsed.body;
+    const { scope, scopeId, key, value, isSecret, envPath, description, exposure } = parsed.body;
 
     if (scope === "global" && scopeId) {
       jsonError(res, "Global scope must not have scopeId", 400);
@@ -464,7 +469,7 @@ export async function handleConfig(
       return true;
     }
 
-    const validationError = validateConfigValue(key, value);
+    const validationError = validateConfigValue(key, value) ?? validateExposureWrite(key, exposure);
     if (validationError) {
       jsonError(res, validationError, 400);
       return true;
@@ -480,6 +485,7 @@ export async function handleConfig(
         isSecret: isSecret || false,
         envPath: envPath || null,
         description: description || null,
+        exposure,
       });
       // Auto-reload integrations when a global-scoped config changes so callers
       // (CLI, automation, dashboard) don't have to remember to hit /reload.

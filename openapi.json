@@ -1399,6 +1399,26 @@
           },
           "encrypted": {
             "type": "boolean"
+          },
+          "exposure": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "worker",
+              "lead",
+              "api",
+              null
+            ]
+          },
+          "effectiveExposure": {
+            "type": "string",
+            "enum": [
+              "worker",
+              "lead",
+              "api"
+            ]
           }
         },
         "required": [
@@ -15734,6 +15754,19 @@
                       "string",
                       "null"
                     ]
+                  },
+                  "exposure": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "enum": [
+                      "worker",
+                      "lead",
+                      "api",
+                      null
+                    ],
+                    "description": "Who may read this secret's value: worker, lead or api. Omit to keep the stored value; null clears the override so the key default applies."
                   }
                 },
                 "required": [

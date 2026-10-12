@@ -4815,6 +4815,11 @@ export interface paths {
                         isSecret?: boolean;
                         envPath?: string | null;
                         description?: string | null;
+                        /**
+                         * @description Who may read this secret's value: worker, lead or api. Omit to keep the stored value; null clears the override so the key default applies.
+                         * @enum {string|null}
+                         */
+                        exposure?: "worker" | "lead" | "api" | null;
                     };
                 };
             };
@@ -24677,6 +24682,10 @@ export interface components {
             createdAt: string;
             lastUpdatedAt: string;
             encrypted: boolean;
+            /** @enum {string|null} */
+            exposure?: "worker" | "lead" | "api" | null;
+            /** @enum {string} */
+            effectiveExposure?: "worker" | "lead" | "api";
         };
         ContextSnapshot: {
             /** Format: uuid */

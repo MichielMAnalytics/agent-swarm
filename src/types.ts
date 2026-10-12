@@ -1817,6 +1817,11 @@ export type ScheduledTask = z.infer<typeof ScheduledTaskSchema>;
 
 export const SwarmConfigScopeSchema = z.enum(["global", "agent", "repo"]);
 
+// Who may read a secret row's value: `worker` (any agent), `lead` (lead,
+// operator and users with config.read.secrets), `api` (the API process only,
+// never over HTTP). Resolution lives in src/be/secret-exposure.ts.
+export const SecretExposureSchema = z.enum(["worker", "lead", "api"]);
+
 export const SwarmConfigSchema = z
   .object({
     id: z.string().uuid(),
@@ -1834,9 +1839,15 @@ export const SwarmConfigSchema = z
     // auto-encrypted during initDb; if that fails, boot aborts before normal API
     // reads occur.
     encrypted: z.boolean(),
+    // Stored per-row override. NULL means the key's code default applies.
+    exposure: SecretExposureSchema.nullable().optional(),
+    // The exposure that applies to this row: the stored override, else the
+    // key registry default, else SECRET_EXPOSURE_DEFAULT.
+    effectiveExposure: SecretExposureSchema.optional(),
   })
   .openapi("SwarmConfig");
 
+export type SecretExposure = z.infer<typeof SecretExposureSchema>;
 export type SwarmConfigScope = z.infer<typeof SwarmConfigScopeSchema>;
 export type SwarmConfig = z.infer<typeof SwarmConfigSchema>;
 
