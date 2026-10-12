@@ -982,12 +982,13 @@ describe("dream-verify artifact records", () => {
   const since = () => ago(3600_000);
 
   test("a live run records each confirmed create with no TTL; scripts keep their source", async () => {
-    const skillId = insertSkill("triage-flaky-ci", ago(600_000));
+    // Created after the run started (one minute ago), by the run's Lead.
+    const skillId = insertSkill("triage-flaky-ci", ago(30_000));
     const content = String(
       (getDb().query("SELECT content FROM skills WHERE id = ?").get(skillId) as any).content,
     );
     const source = "export default async () => ({ open: 3 });\n";
-    const script = insertScript("open-pr-count", source, { createdAt: ago(500_000) });
+    const script = insertScript("open-pr-count", source, { createdAt: ago(20_000) });
     const h = harness();
     const r: any = await dreamVerify(
       {
@@ -1127,5 +1128,66 @@ describe("dream-verify artifact records", () => {
     );
     expect(dry.artifacts.written).toEqual([]);
     expect(h.calls.filter((c) => c.startsWith("kv_set artifact:"))).toEqual([]);
+  });
+
+  test("a create or built claim for a row this run did not create records nothing and is a mismatch", async () => {
+    // An older skill and script, matching the claim byte for byte, created before this run started.
+    const oldSkill = insertSkill("deploy-checklist", daysAgo(30));
+    const oldSource = "export default async () => ({ open: 1 });\n";
+    const oldScript = insertScript("old-pr-count", oldSource, { createdAt: daysAgo(30) });
+    // Created during the run, but by an agent that ran none of its tasks.
+    const outsider = crypto.randomUUID();
+    getDb().run(
+      `INSERT INTO agents (id, name, isLead, status, claudeMd, soulMd, identityMd, toolsMd, heartbeatMd, createdAt, lastUpdatedAt)
+       VALUES (?, 'outsider', 0, 'idle', '', '', '', '', '', ?, ?)`,
+      [outsider, daysAgo(60), daysAgo(60)],
+    );
+    const outsiderSkill = insertSkill("outsider-skill", ago(30_000));
+    getDb().run("UPDATE skills SET ownerAgentId = ? WHERE id = ?", [outsider, outsiderSkill]);
+    const claim = (actionId: string, skillId: string, name: string) => ({
+      actionId,
+      op: "create",
+      status: "applied",
+      skillId,
+      name,
+      versionAfter: 1,
+      contentSha256: sha256(
+        String(
+          (getDb().query("SELECT content FROM skills WHERE id = ?").get(skillId) as any).content,
+        ),
+      ),
+    });
+    const h = harness();
+    const r: any = await dreamVerify(
+      {
+        runId: RUN_ID,
+        leadId: LEAD_ID,
+        dryRun: false,
+        since: since(),
+        skills: {
+          results: [
+            claim("A1", oldSkill, "deploy-checklist"),
+            claim("A2", outsiderSkill, "outsider-skill"),
+          ],
+        },
+        scriptify: {
+          built: [
+            {
+              actionId: "A3",
+              status: "built",
+              name: "old-pr-count",
+              scope: "agent",
+              contentHash: oldScript.contentHash,
+            },
+          ],
+        },
+      },
+      h.ctx,
+    );
+    expect(r.artifacts.written).toEqual([]);
+    expect(h.calls.filter((c) => c.startsWith("kv_set artifact:"))).toEqual([]);
+    expect(r.confirmed).toEqual([]);
+    expect(r.claimMismatch.map((m: any) => m.actionId).sort()).toEqual(["A1", "A2", "A3"]);
+    expect(r.ok).toBe(false);
   });
 });

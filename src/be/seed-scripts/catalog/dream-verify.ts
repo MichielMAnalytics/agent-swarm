@@ -438,6 +438,14 @@ export default async function (args: unknown, ctx: ScriptContext) {
   const runTasks = runId ? await q("runTasks", `SELECT id, agentId, workflowRunStepId FROM agent_tasks WHERE workflowRunId = ?`, [runId]) : [];
   const taskIds = runTasks.map((t: any) => t.id);
   const runAgents = [...new Set([LEAD, ...runTasks.map((t: any) => t.agentId)].filter(Boolean))];
+  // Same-run creation evidence, from server-set columns only: one of this run's agents created the row after the
+  // run started (replay: before verify ran). A task's `op: create` is a claim, not evidence; without this, an older
+  // matching row would get an artifact record and dream-adoption could later retire it.
+  const runStart = runId ? String((await q("runStart", `SELECT startedAt FROM workflow_runs WHERE id = ?`, [runId]))[0]?.startedAt ?? "") : "";
+  const createdThisRun = (createdAt: unknown, creator: unknown) => {
+    const at = String(createdAt ?? "");
+    return !!runStart && at >= runStart && at <= untilIso && runAgents.includes(String(creator ?? ""));
+  };
 
   // 1. Skills claims. A confirmed create becomes an adoption-gate artifact (section 5b).
   const skillResults: any[] = Array.isArray(skills?.results) ? skills.results : [];
@@ -454,9 +462,11 @@ export default async function (args: unknown, ctx: ScriptContext) {
     const cSha = await sha(String(s[0].content ?? ""));
     const vOk = r.versionAfter === undefined || Number(s[0].version) === Number(r.versionAfter);
     const hOk = !r.contentSha256 || cSha === r.contentSha256;
-    if (vOk && hOk) {
+    const isCreate = r.op === "create" || (r.op === undefined && !(Number(r.versionBefore) > 0));
+    if (vOk && hOk && isCreate && !createdThisRun(s[0].createdAt, s[0].ownerAgentId))
+      claimMismatch.push({ actionId: r.actionId, lane: "skills", detail: `create claim, but skill ${r.skillId} was not created by this run (createdAt ${s[0].createdAt}, owner ${s[0].ownerAgentId ?? "none"})` });
+    else if (vOk && hOk) {
       confirmed.push({ actionId: r.actionId, lane: "skills", skillId: r.skillId, version: Number(s[0].version), contentSha256: cSha });
-      const isCreate = r.op === "create" || (r.op === undefined && !(Number(r.versionBefore) > 0));
       if (isCreate)
         createdArtifacts.push({ kind: "skill", name: String(s[0].name), id: String(r.skillId), scope: s[0].scope ?? null, agentId: s[0].ownerAgentId ?? null, createdAt: String(s[0].createdAt ?? ""), contentHash: cSha, actionId: r.actionId ?? null });
     }
@@ -475,6 +485,10 @@ export default async function (args: unknown, ctx: ScriptContext) {
     const row = sr.find((x: any) => !b.contentHash || String(x.contentHash) === String(b.contentHash));
     if (!row) {
       claimMismatch.push({ actionId: b.actionId, lane: "scriptify", detail: sr.length ? `script ${name} contentHash differs from the claim` : `script ${name || "(no name)"} (${scope}) missing` });
+      continue;
+    }
+    if (!createdThisRun(row.createdAt, row.createdByAgentId)) {
+      claimMismatch.push({ actionId: b.actionId, lane: "scriptify", detail: `built claim, but script ${name} (${scope}) was not created by this run (createdAt ${row.createdAt})` });
       continue;
     }
     confirmed.push({ actionId: b.actionId, lane: "scriptify", name, scope, contentHash: row.contentHash });
