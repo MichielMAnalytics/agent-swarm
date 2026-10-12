@@ -55,6 +55,8 @@ if [[ "$probe_status" -eq 134 ]]; then
     src/tests/apps-spike2.test.ts \
     src/tests/apps-sync-engine.test.ts \
     src/tests/connection-embedded-auth.test.ts \
+    src/tests/dream-scripts-apply.test.ts \
+    src/tests/dream-scripts-verify.test.ts \
     src/tests/sandboxed-process.test.ts \
     src/tests/schedule-target-type.test.ts \
     src/tests/script-connections.test.ts \
@@ -69,6 +71,8 @@ if [[ "$probe_status" -eq 134 ]]; then
     src/tests/scripts-runtime-secret-egress.test.ts \
     src/tests/scripts-runtime.test.ts \
     src/tests/slack-read-boundaries.test.ts \
+    src/tests/workflow-dreaming-principal.test.ts \
+    src/tests/workflow-dreaming.test.ts \
     src/tests/workflow-e2e.test.ts \
     src/tests/workflow-engine-v2.test.ts \
     src/tests/workflow-executors.test.ts \

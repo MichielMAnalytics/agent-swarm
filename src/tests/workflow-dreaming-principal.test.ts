@@ -1,0 +1,368 @@
+/**
+ * Seeded dreaming: the principal its script nodes run as.
+ *
+ * A seeded workflow row has no `createdByAgentId` and a scheduled trigger carries no agent, so
+ * the swarm-script executor used to run every dream-* script as the literal `workflow`, which
+ * profile and other privileged writes refuse. The template opts in with `runAs: "lead"`.
+ *
+ * The run tests use the real executor registry (real SwarmScriptExecutor, sandboxed script
+ * subprocess) against an in-process API on an isolated file-backed DB. Never the live DB.
+ */
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { unlink } from "node:fs/promises";
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
+import * as db from "../be/db";
+import {
+  closeDb,
+  completeTask,
+  createAgent,
+  createWorkflow,
+  getDbClient,
+  getTaskByWorkflowRunStepId,
+  getWorkflowRun,
+  getWorkflowRunStepsByRunId,
+  initDb,
+  listWorkflows,
+  updateAgentProfile,
+  upsertKv,
+} from "../be/db";
+import { setScriptEmbeddingProviderForTests } from "../be/scripts/embeddings";
+import { runAllSeeders } from "../be/seed/registry";
+import { recordSeedState } from "../be/seed/state-db";
+import {
+  resolveSeededWorkflowPrincipal,
+  seededLeadPrincipalWorkflowNames,
+} from "../be/seed/workflows-seeder";
+import { resolveHttpRequestAuth } from "../http/auth";
+import { handleDbQuery } from "../http/db-query";
+import { handleKv } from "../http/kv";
+import { handleMcpBridge } from "../http/mcp-bridge";
+import { handleMemory } from "../http/memory";
+import { getPathSegments, parseQueryParams } from "../http/utils";
+import type { Workflow } from "../types";
+import { setRequestAuth } from "../utils/request-auth-context";
+import { refreshSecretScrubberCache } from "../utils/secret-scrubber";
+import { startWorkflowExecution } from "../workflows/engine";
+import { InProcessEventBus } from "../workflows/event-bus";
+import type { ExecutorDependencies } from "../workflows/executors/base";
+import { createExecutorRegistry } from "../workflows/executors/registry";
+import { setupWorkflowResumeListener } from "../workflows/resume";
+import { interpolate } from "../workflows/template";
+import { SKIP_SANDBOX_SPAWN_TESTS } from "./sandbox-spawn-test-helpers";
+
+const TEST_DB_PATH = `/tmp/test-workflow-dreaming-principal-${process.pid}.sqlite`;
+const API_KEY = "example-test-workflow-dreaming-principal-key-0123456789";
+const LEAD_ID = crypto.randomUUID();
+const WORKER_ID = crypto.randomUUID();
+const CLAUDE_MD = "# Worker\n\n## Rules\n- keep this rule\n\n## Stale\n- old host foo\n";
+const DREAMING_ENV = ["DREAMING_ENABLED", "DREAMING_LANE_HEARTBEAT", "DREAMING_LANE_TRIM"];
+
+const savedEnv = { ...process.env };
+let server: Server;
+let base = "";
+// db_query runs bounded in a child process that opens the DB file, so this suite needs a
+// file-backed DB, not the in-memory migration template the test preload installs.
+const templateGlobals = globalThis as typeof globalThis & {
+  __testMigrationTemplate?: Uint8Array;
+  __savedPrincipalTemplate?: Uint8Array;
+};
+
+async function removeDbFiles() {
+  for (const suffix of ["", "-wal", "-shm"])
+    await unlink(`${TEST_DB_PATH}${suffix}`).catch(() => {});
+}
+
+async function waitFor(predicate: () => Promise<boolean>, label: string, ms = 90_000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await Bun.sleep(50);
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
+const isTerminal = (status: string | undefined) =>
+  status === "completed" || status === "failed" || status === "cancelled";
+
+async function workerClaude(): Promise<string> {
+  const r = await getDbClient().get<{ v: string | null }>(
+    "SELECT claudeMd AS v FROM agents WHERE id = ?",
+    [WORKER_ID],
+  );
+  return r?.v ?? "";
+}
+
+async function seededDreaming(): Promise<Workflow> {
+  const wf = (await listWorkflows()).find((w) => w.name === "dreaming");
+  if (!wf) throw new Error("dreaming was not seeded");
+  return wf;
+}
+
+function realRegistry() {
+  const bus = new InProcessEventBus();
+  const deps: ExecutorDependencies = {
+    db,
+    eventBus: bus,
+    interpolate: (template, ctx) => interpolate(template, ctx).result,
+  };
+  const registry = createExecutorRegistry(deps);
+  setupWorkflowResumeListener(bus, registry);
+  return { bus, registry };
+}
+
+// The same auto identity action in both runs: drop the worker's stale CLAUDE section.
+const REMOVE_STALE = {
+  id: "A1",
+  lane: "identity",
+  tier: "auto",
+  owner: LEAD_ID,
+  op: "remove-section",
+  target: { agentId: WORKER_ID, file: "CLAUDE", anchor: "## Stale" },
+  content: "",
+  reason: "dead host",
+  evidence: ["t1"],
+};
+
+beforeAll(async () => {
+  templateGlobals.__savedPrincipalTemplate = templateGlobals.__testMigrationTemplate;
+  templateGlobals.__testMigrationTemplate = undefined;
+  closeDb();
+  await removeDbFiles();
+  for (const key of DREAMING_ENV) delete process.env[key];
+  process.env.AGENT_SWARM_API_KEY = API_KEY;
+  delete process.env.API_KEY;
+  refreshSecretScrubberCache();
+  initDb(TEST_DB_PATH);
+  setScriptEmbeddingProviderForTests({
+    name: "test/noop-dreaming-principal-embedding",
+    dimensions: 1,
+    async embed() {
+      return null;
+    },
+    async embedBatch(texts: string[]) {
+      return texts.map(() => null);
+    },
+  });
+  const results = await runAllSeeders({ quiet: true });
+  for (const kind of ["script", "workflow"]) {
+    expect(results.find((r) => r.kind === kind)?.failed ?? ["missing"]).toEqual([]);
+  }
+  await createAgent({ id: LEAD_ID, name: "principal-lead", isLead: true, status: "idle" } as any);
+  await createAgent({
+    id: WORKER_ID,
+    name: "principal-worker",
+    isLead: false,
+    status: "idle",
+  } as any);
+
+  server = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
+    setRequestAuth(req, await resolveHttpRequestAuth(req, API_KEY));
+    res.setHeader("Content-Type", "application/json");
+    const segs = getPathSegments(req.url || "");
+    const qp = parseQueryParams(req.url || "");
+    const agentId = req.headers["x-agent-id"] as string | undefined;
+    if (await handleKv(req, res, segs, qp)) return;
+    if (await handleDbQuery(req, res, segs, qp)) return;
+    if (await handleMemory(req, res, segs, agentId)) return;
+    if (await handleMcpBridge(req, res, segs, qp, agentId)) return;
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: "not found" }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test server did not bind a port");
+  base = `http://127.0.0.1:${address.port}`;
+  process.env.MCP_BASE_URL = base;
+}, 180_000);
+
+afterAll(async () => {
+  server?.closeAllConnections();
+  await new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
+  setScriptEmbeddingProviderForTests(null);
+  closeDb();
+  templateGlobals.__testMigrationTemplate = templateGlobals.__savedPrincipalTemplate;
+  templateGlobals.__savedPrincipalTemplate = undefined;
+  for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+  for (const [key, value] of Object.entries(savedEnv)) process.env[key] = value;
+  refreshSecretScrubberCache();
+  await removeDbFiles();
+});
+
+describe("resolveSeededWorkflowPrincipal", () => {
+  const source = (name: string, runAs?: "lead") => ({
+    config: JSON.stringify({ name, description: name, runAllSeedersCandidate: true, runAs }),
+    content: '```json\n{"nodes": []}\n```',
+  });
+
+  test("only an opted-in template with a seed_state row resolves to the Lead", async () => {
+    const sources = [source("principal-optin", "lead"), source("principal-plain")];
+    expect([...seededLeadPrincipalWorkflowNames(sources)]).toEqual(["principal-optin"]);
+    expect(seededLeadPrincipalWorkflowNames().has("dreaming")).toBe(true);
+
+    // No seed_state row: a same-name workflow the seeder never wrote gets no principal.
+    expect(await resolveSeededWorkflowPrincipal({ name: "principal-optin" }, sources)).toBe(
+      undefined,
+    );
+    await recordSeedState("workflow", "principal-optin", "h");
+    await recordSeedState("workflow", "principal-plain", "h");
+    expect(await resolveSeededWorkflowPrincipal({ name: "principal-optin" }, sources)).toBe(
+      LEAD_ID,
+    );
+    // Seeded but not opted in: unchanged behaviour.
+    expect(await resolveSeededWorkflowPrincipal({ name: "principal-plain" }, sources)).toBe(
+      undefined,
+    );
+    // The seeded dreaming row has no creator, is opted in and recorded.
+    const wf = await seededDreaming();
+    expect(wf.createdByAgentId ?? null).toBeNull();
+    expect(await resolveSeededWorkflowPrincipal(wf)).toBe(LEAD_ID);
+  });
+});
+
+describe("seeded dreaming on the real script runtime", () => {
+  const spawnTest = test.skipIf(SKIP_SANDBOX_SPAWN_TESTS);
+
+  spawnTest(
+    "negative control: a creator-less, non-seeded workflow runs dream-apply as `workflow` and the write is refused",
+    async () => {
+      await updateAgentProfile(WORKER_ID, { claudeMd: CLAUDE_MD });
+      const wf = await createWorkflow({
+        name: `principal-control-${crypto.randomUUID()}`,
+        definition: {
+          nodes: [
+            {
+              id: "apply",
+              type: "swarm-script",
+              config: {
+                scriptName: "dream-apply",
+                scope: "global",
+                timeoutMs: 120_000,
+                args: {
+                  runId: "principal-control",
+                  dryRun: false,
+                  synth: { actions: [REMOVE_STALE] },
+                  lanes: { identity: true, memory: true, trim: false, heartbeat: false },
+                },
+              },
+            },
+          ],
+          onNodeFailure: "continue",
+        },
+      });
+      expect(wf.createdByAgentId ?? null).toBeNull();
+      const { registry } = realRegistry();
+      const runId = await startWorkflowExecution(wf, {}, registry, { triggerType: "schedule" });
+      await waitFor(async () => isTerminal((await getWorkflowRun(runId))?.status), "run end");
+
+      const step = (await getWorkflowRunStepsByRunId(runId)).find((s) => s.nodeId === "apply");
+      const result = (step?.output as { result?: any } | undefined)?.result;
+      expect(result?.applied ?? []).toEqual([]);
+      expect(await workerClaude()).toBe(CLAUDE_MD);
+    },
+    180_000,
+  );
+
+  spawnTest(
+    "enabled live run on a scheduled trigger applies the identity edit as the Lead",
+    async () => {
+      await updateAgentProfile(WORKER_ID, { claudeMd: CLAUDE_MD });
+      const now = new Date().toISOString();
+      await getDbClient().run(
+        `INSERT INTO agent_tasks (id, agentId, task, status, source, createdAt, lastUpdatedAt, finishedAt, key)
+         VALUES (?, ?, 'tidy the release board', 'completed', 'mcp', ?, ?, ?, 'shared/')`,
+        [crypto.randomUUID(), LEAD_ID, now, now, now],
+      );
+      // A prior green dry run admits live mode.
+      await upsertKv({
+        namespace: "dreaming",
+        key: "state:last-green-dry-run",
+        value: { runId: "earlier-dry-run", at: now },
+        valueType: "json",
+      });
+      process.env.DREAMING_ENABLED = "true";
+      process.env.DREAMING_LANE_HEARTBEAT = "false";
+      process.env.DREAMING_LANE_TRIM = "false";
+      try {
+        const { bus, registry } = realRegistry();
+        const complete = async (runId: string, stepId: string, output: unknown) => {
+          const task = await getTaskByWorkflowRunStepId(stepId);
+          const text = JSON.stringify(output);
+          await completeTask(task!.id, text);
+          bus.emit("task.completed", {
+            taskId: task!.id,
+            output: text,
+            workflowRunId: runId,
+            workflowRunStepId: stepId,
+          });
+        };
+        const waitStep = async (runId: string, nodeId: string) => {
+          const stepOf = async () =>
+            (await getWorkflowRunStepsByRunId(runId)).find((s) => s.nodeId === nodeId);
+          await waitFor(async () => {
+            const step = await stepOf();
+            return !!step && (await getTaskByWorkflowRunStepId(step.id)) !== null;
+          }, `task for ${nodeId}`);
+          return (await stepOf())!;
+        };
+
+        // Scheduled-trigger shape: no agentId in the trigger, no creator on the row.
+        const runId = await startWorkflowExecution(await seededDreaming(), {}, registry, {
+          triggerType: "schedule",
+        });
+        const report = await waitStep(runId, `reports#${LEAD_ID}`);
+        await complete(runId, report.id, {
+          agentId: LEAD_ID,
+          summary: "Tidied the release board.",
+          repeatedProcedures: [],
+          skillFriction: [],
+          scriptCandidates: [],
+          identityOps: [],
+          memoryOps: [],
+        });
+        const synth = await waitStep(runId, "synthesize");
+        await complete(runId, synth.id, {
+          headline: "drop a stale section",
+          actions: [REMOVE_STALE],
+          rejected: [],
+          restores: [],
+          missingReports: [],
+          notes: "",
+          changelogComment: "",
+        });
+        const publish = await waitStep(runId, "publish");
+        await complete(runId, publish.id, { slackText: "dreaming: one edit", trimsLine: "" });
+        await waitFor(async () => isTerminal((await getWorkflowRun(runId))?.status), "run end");
+
+        const steps = await getWorkflowRunStepsByRunId(runId);
+        const out = (id: string) =>
+          (steps.find((s) => s.nodeId === id)?.output as { result: any } | undefined)?.result;
+        expect(out("gather")).toMatchObject({ mode: "live", dryRun: false, leadId: LEAD_ID });
+        const apply = out("apply");
+        expect({ refused: apply?.refused, silently: apply?.refusedSilently }).toEqual({
+          refused: [],
+          silently: [],
+        });
+        expect(apply?.applied?.map((a: any) => a.actionId)).toEqual(["A1"]);
+
+        // Re-read: the section is gone, and the version row names the Lead as the writer.
+        const claude = await workerClaude();
+        expect(claude).toContain("## Rules");
+        expect(claude).not.toContain("## Stale");
+        const version = await getDbClient().get<{ changedByAgentId: string | null }>(
+          `SELECT changedByAgentId FROM context_versions WHERE agentId = ? AND field = 'claudeMd'
+           ORDER BY version DESC LIMIT 1`,
+          [WORKER_ID],
+        );
+        expect(version?.changedByAgentId).toBe(LEAD_ID);
+      } finally {
+        for (const key of DREAMING_ENV) delete process.env[key];
+      }
+    },
+    240_000,
+  );
+});

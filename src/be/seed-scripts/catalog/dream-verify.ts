@@ -37,9 +37,37 @@ export function isProfilePreimageKey(key: string, runId: string): boolean {
   const p = String(key ?? "").split(":");
   return p.length === 4 && p[0] === "preimage" && p[1] === runId && !!p[2] && PROFILE_PREIMAGE_FIELDS.includes(p[3] ?? "");
 }
-// Green dry run: a dry run with no dry-run violations, no claim mismatches, and passing controls.
-export function isGreenDryRun(e: { dry: boolean; replay: boolean; runId: string; dryRunViolations: number; claimMismatch: number; controlsOk: boolean }): boolean {
-  return e.dry && !e.replay && !!e.runId && e.dryRunViolations === 0 && e.claimMismatch === 0 && e.controlsOk;
+// Green dry run: a complete, error-free dry run. It unlocks live writes, so any verify error (a
+// failed read, a missing lane), an unclaimed write, or a failed/cancelled step keeps it absent.
+export type GreenDryRunInput = {
+  dry: boolean;
+  replay: boolean;
+  runId: string;
+  dryRunViolations: number;
+  claimMismatch: number;
+  controlsOk: boolean;
+  unclaimed: number;
+  missingLanes: number;
+  failedSteps: number;
+  errors: number;
+};
+export function isGreenDryRun(e: GreenDryRunInput): boolean {
+  return (
+    e.dry && !e.replay && !!e.runId && e.dryRunViolations === 0 && e.claimMismatch === 0 && e.controlsOk &&
+    e.unclaimed === 0 && e.missingLanes === 0 && e.failedSteps === 0 && e.errors === 0
+  );
+}
+export function greenDryRunBlockers(e: GreenDryRunInput): string[] {
+  const out: string[] = [];
+  if (e.replay || !e.runId) out.push("replay or no runId");
+  if (e.dryRunViolations) out.push(`dryRunViolations ${e.dryRunViolations}`);
+  if (e.claimMismatch) out.push(`claimMismatch ${e.claimMismatch}`);
+  if (!e.controlsOk) out.push("controls failed");
+  if (e.unclaimed) out.push(`unclaimed ${e.unclaimed}`);
+  if (e.missingLanes) out.push(`missingLanes ${e.missingLanes}`);
+  if (e.failedSteps) out.push(`failedSteps ${e.failedSteps}`);
+  if (e.errors) out.push(`errors ${e.errors}`);
+  return out;
 }
 const AUTO_MEMORY_SOURCES = ["task_completion", "session_summary", "file_index"];
 const LANES = ["skillify", "skill-refactor", "scriptify", "identity", "memory"];
@@ -803,7 +831,21 @@ export default async function (args: unknown, ctx: ScriptContext) {
 
   // 6. Green dry run (dry only): gather reads this key to allow the first live run.
   const greenDryRun: any = { key: GREEN_KEY, written: false };
-  if (isGreenDryRun({ dry, replay, runId, dryRunViolations: dryRunViolations.length, claimMismatch: claimMismatch.length, controlsOk: !!controls.ok })) {
+  // Steps that ended badly before verify (onNodeFailure: continue still routes a failed node here).
+  const failedSteps = steps.filter((s: any) => s.nodeId !== "verify" && (s.status === "failed" || s.status === "cancelled"));
+  const green: GreenDryRunInput = {
+    dry,
+    replay,
+    runId,
+    dryRunViolations: dryRunViolations.length,
+    claimMismatch: claimMismatch.length,
+    controlsOk: !!controls.ok,
+    unclaimed: unclaimed.length,
+    missingLanes: missingLanes.length,
+    failedSteps: failedSteps.length,
+    errors: errors.length,
+  };
+  if (isGreenDryRun(green)) {
     try {
       const value = { runId, at: new Date().toISOString() };
       await ctx.swarm.kv_set({ namespace: NS, key: GREEN_KEY, value: value as any });
@@ -815,7 +857,8 @@ export default async function (args: unknown, ctx: ScriptContext) {
       errors.push(`green dry run: ${String(e?.message ?? e).slice(0, 200)}`);
     }
   } else if (dry) {
-    greenDryRun.reason = replay || !runId ? "replay or no runId" : `dryRunViolations ${dryRunViolations.length}, claimMismatch ${claimMismatch.length}, controls ${controls.ok ? "ok" : "failed"}`;
+    greenDryRun.reason = greenDryRunBlockers(green).join(", ");
+    if (failedSteps.length) greenDryRun.failedSteps = failedSteps.map((s: any) => `${s.nodeId}:${s.status}`);
   }
 
   return { ok, mode: dry ? "dry-run" : replay ? "replay" : "live", since, controls, metrics, confirmed, claimMismatch, unclaimed, concurrent: concurrent.slice(0, 30), concurrentCount: concurrent.length, dryRunViolations, missingLanes, survival, ...(replay ? { syntheticSurvival } : {}), trimSurvival, ledgerKey, greenDryRun, stagedPreimages, errors };

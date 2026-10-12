@@ -285,7 +285,7 @@ next run without a restart, and an unset key uses the default below.
 | `DREAMING_BUDGET_USD` | `25` | integer 1–1000 | Over budget, the heartbeat draft is skipped and the report raises an alert. |
 | `DREAMING_CAP_IDENTITY_TOTAL` | `6` | integer ≥ 0 | Identity edits per night, across all agents. |
 | `DREAMING_CAP_IDENTITY_PER_AGENT` | `1` | integer ≥ 0 | Identity edits per agent per night. |
-| `DREAMING_CAP_TRIMS` | `3` | integer ≥ 0 | Profile trims per night. |
+| `DREAMING_CAP_TRIMS` | `3` | integer 0–12 | Profile trims per night. |
 | `DREAMING_CAP_MEMORY_STORE` | `5` | integer ≥ 0 | New memories per night. |
 | `DREAMING_CAP_MEMORY_EDIT` | `5` | integer ≥ 0 | Memory edits per night. |
 | `DREAMING_CAP_MEMORY_DELETE` | `10` | integer ≥ 0 | Memory deletions per night. |

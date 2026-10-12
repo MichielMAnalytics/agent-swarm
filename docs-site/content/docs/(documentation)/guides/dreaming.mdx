@@ -68,7 +68,7 @@ The workflow reads every key at the start of each run, so a saved value applies 
 2. Optional: set `DREAMING_SLACK_CHANNEL` for a nightly summary, and turn off any lane you do not want.
 3. Wait for the next scheduled run, or start one now with `trigger-workflow` on `dreaming`.
 
-The first run after you enable it is a **dry run**. It drafts every change and writes none. Dreaming switches to live writes only after one **green** dry run: `verify` found no writes during the dry run, every claim matched the live state, and its own checks passed. Until then, every night stays a dry run.
+The first run after you enable it is a **dry run**. It drafts every change and writes none. Dreaming switches to live writes only after one **green** dry run: every lane that was due ran, no step failed, `verify` read everything it needed, found no writes during the dry run and no unclaimed writes, every claim matched the live state, and its own checks passed. Until then, every night stays a dry run.
 
 To force a dry run later, trigger the workflow with `{ "dryRun": true }`.
 
@@ -78,7 +78,9 @@ The default schedule runs at 03:25 UTC. Move it to about one hour after your dep
 
 ## Safety
 
-**Caps.** Each night has hard limits. By default: 6 identity edits in total and 1 per agent, 3 profile trims, 5 new memories, 5 memory edits, and 10 memory deletions. A cap of `0` turns that action off.
+**Caps.** Each night has hard limits. By default: 6 identity edits in total and 1 per agent, 3 profile trims, 5 new memories, 5 memory edits, and 10 memory deletions. A cap of `0` turns that action off. The trim cap goes up to 12.
+
+**Who writes.** The seeded workflow has no creator and the nightly schedule names no agent, so its scripts run as the current lead. That is what lets them edit other agents' profiles. Without a lead, the run stops at gather.
 
 **Pre-images.** Before a write, dreaming saves the old content. Memory and identity changes go to a per-run ledger. Profile and heartbeat changes go to a per-run pre-image keyed by agent and field. A trim is refused when the live profile no longer matches its pre-image.
 

@@ -6,6 +6,7 @@
  * spawns unavailable (SWARM_SKIP_SANDBOX_SPAWN_TESTS=1), the same default export runs in-process
  * with the real script SDK, so every ctx.swarm call still goes over HTTP to the spawned server.
  */
+import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import type { Subprocess } from "bun";
@@ -133,6 +134,48 @@ async function run(name: "dream-heartbeat" | "dream-verify", args: unknown): Pro
   });
   if (out.error) throw new Error(`${name} ${out.error}: ${out.stderr.slice(0, 500)}`);
   return out.result;
+}
+
+/** Run dream-verify in-process on the real SDK, failing every db_query whose SQL contains `failSql`. */
+async function runWithFailingQuery(failSql: string | null, args: unknown): Promise<any> {
+  const swarm: any = createSwarmSdk(
+    new SwarmConfig({
+      system: {
+        apiKey: { value: API_KEY, isSecret: true },
+        agentId: { value: leadId, isSecret: false },
+        mcpBaseUrl: { value: base, isSecret: false },
+      },
+      user: {},
+    }),
+  );
+  const faulty = new Proxy(swarm, {
+    get(target, prop, receiver) {
+      const v = Reflect.get(target, prop, receiver);
+      if (prop !== "db_query" || !failSql) return v;
+      return async (q: { sql: string; params?: unknown[] }) => {
+        if (q.sql.includes(failSql)) throw new Error("injected read failure");
+        return v.call(target, q);
+      };
+    },
+  });
+  return verifyDefault(args, { swarm: faulty } as any);
+}
+
+/** Seed workflow_run_steps rows for `runId` straight into the spawned server's DB (FKs off). */
+function insertSteps(runId: string, steps: Array<{ nodeId: string; status: string }>): void {
+  const db = new Database(TEST_DB_PATH);
+  try {
+    db.exec("PRAGMA busy_timeout = 5000");
+    const ins = db.prepare(
+      "INSERT INTO workflow_run_steps (id, runId, nodeId, nodeType, status, startedAt, finishedAt) VALUES (?, ?, ?, 'script', ?, ?, ?)",
+    );
+    for (const s of steps) {
+      const at = new Date().toISOString();
+      ins.run(crypto.randomUUID(), runId, s.nodeId, s.status, at, at);
+    }
+  } finally {
+    db.close();
+  }
 }
 
 beforeAll(async () => {
@@ -353,6 +396,10 @@ describe("dream-verify green dry run", () => {
       dryRunViolations: 0,
       claimMismatch: 0,
       controlsOk: true,
+      unclaimed: 0,
+      missingLanes: 0,
+      failedSteps: 0,
+      errors: 0,
     };
     expect(isGreenDryRun(clean)).toBe(true);
     expect(isGreenDryRun({ ...clean, dry: false })).toBe(false);
@@ -360,7 +407,71 @@ describe("dream-verify green dry run", () => {
     expect(isGreenDryRun({ ...clean, claimMismatch: 1 })).toBe(false);
     expect(isGreenDryRun({ ...clean, controlsOk: false })).toBe(false);
     expect(isGreenDryRun({ ...clean, replay: true })).toBe(false);
+    expect(isGreenDryRun({ ...clean, unclaimed: 1 })).toBe(false);
+    expect(isGreenDryRun({ ...clean, missingLanes: 1 })).toBe(false);
+    expect(isGreenDryRun({ ...clean, failedSteps: 1 })).toBe(false);
+    expect(isGreenDryRun({ ...clean, errors: 1 })).toBe(false);
   });
+
+  test("a failed lane, a failed step, or a read failure leaves the marker absent", async () => {
+    await kvDelete("state:last-green-dry-run");
+    const since = new Date().toISOString();
+
+    // Failed synthesis (onNodeFailure: continue still routes to verify): the step row exists, its result does not.
+    insertSteps("verify-failed-synth", [{ nodeId: "synthesize", status: "failed" }]);
+    const failedSynth = await run("dream-verify", {
+      runId: "verify-failed-synth",
+      leadId,
+      dryRun: true,
+      since,
+    });
+    expect(failedSynth.ok).toBe(false);
+    expect(failedSynth.missingLanes).toContainEqual(
+      expect.objectContaining({ lane: "synthesize" }),
+    );
+    expect(failedSynth.errors.some((e: string) => e.startsWith("lane-missing: synthesize"))).toBe(
+      true,
+    );
+    expect(failedSynth.greenDryRun.written).toBe(false);
+    expect(failedSynth.greenDryRun.reason).toContain("missingLanes 1");
+    expect(await kvGet("state:last-green-dry-run")).toBeNull();
+
+    // A step that failed outside the lane gates (no missing lane, no error) still blocks.
+    insertSteps("verify-failed-step", [{ nodeId: "skills", status: "failed" }]);
+    const failedStep = await run("dream-verify", {
+      runId: "verify-failed-step",
+      leadId,
+      dryRun: true,
+      since,
+    });
+    expect(failedStep.missingLanes).toEqual([]);
+    expect(failedStep.greenDryRun.written).toBe(false);
+    expect(failedStep.greenDryRun.failedSteps).toEqual(["skills:failed"]);
+    expect(await kvGet("state:last-green-dry-run")).toBeNull();
+
+    // A read failure: the real SDK over HTTP, with one db_query (the metrics step read) failing.
+    const readFail = await runWithFailingQuery("FROM workflow_run_steps s", {
+      runId: "verify-read-fail",
+      leadId,
+      dryRun: true,
+      since,
+    });
+    expect(readFail.errors.some((e: string) => e.startsWith("steps:"))).toBe(true);
+    expect(readFail.greenDryRun.written).toBe(false);
+    expect(readFail.greenDryRun.reason).toContain("errors");
+    expect(await kvGet("state:last-green-dry-run")).toBeNull();
+
+    // Positive control: the same path with no fault and no failed steps writes the marker.
+    const control = await runWithFailingQuery(null, {
+      runId: "verify-read-ok",
+      leadId,
+      dryRun: true,
+      since,
+    });
+    expect(control.errors).toEqual([]);
+    expect(control.greenDryRun.written).toBe(true);
+    await kvDelete("state:last-green-dry-run");
+  }, 120_000);
 
   test("writes state:last-green-dry-run only on a clean dry run", async () => {
     await kvDelete("state:last-green-dry-run");

@@ -11,5 +11,6 @@
   "requires": [],
   "runAllSeedersCandidate": true,
   "autoEnableCandidate": true,
+  "runAs": "lead",
   "tags": ["memory", "skills", "operations"]
 }

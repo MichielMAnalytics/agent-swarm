@@ -73,8 +73,15 @@ import type {
   WorkflowDefinition,
 } from "../../types";
 import { validateDefinition } from "../../workflows/definition";
-import { computeContentHash, createWorkflow, listWorkflows, updateWorkflow } from "../db";
+import {
+  computeContentHash,
+  createWorkflow,
+  getLeadAgent,
+  listWorkflows,
+  updateWorkflow,
+} from "../db";
 import { resolveSeededEnabled } from "./automation-toggle";
+import { getSeedState } from "./state-db";
 import type { Seeder, SeedItem } from "./types";
 
 type AutomationTemplateConfig = {
@@ -85,6 +92,13 @@ type AutomationTemplateConfig = {
   runAllSeedersCandidate?: boolean;
   /** Explicit, reviewed opt-in into the auto-enable policy — see ./automation-toggle. */
   autoEnableCandidate?: boolean;
+  /**
+   * Principal for the seeded workflow's script nodes. A seeded row has no
+   * `createdByAgentId` and scheduled triggers carry no agent, so without this
+   * scripts run as the literal `workflow`, which privileged writes refuse.
+   * `"lead"` resolves the current Lead at run time. See {@link resolveSeededWorkflowPrincipal}.
+   */
+  runAs?: "lead";
 };
 
 type WorkflowTemplatePayload = {
@@ -223,6 +237,34 @@ function legacyWorkflowSeedHashes(workflow: HashedSeedWorkflow): string[] {
   return [true, false].map((enabled) =>
     computeContentHash(canonicalJson({ ...workflow, enabled })),
   );
+}
+
+/** Names of seeded workflow templates that declare `runAs: "lead"`. Not part of the seed hash. */
+export function seededLeadPrincipalWorkflowNames(
+  sources: readonly WorkflowTemplateSource[] = BUILT_IN_WORKFLOW_SOURCES,
+): Set<string> {
+  const names = new Set<string>();
+  for (const source of sources) {
+    const config = JSON.parse(source.config) as AutomationTemplateConfig;
+    if (config.runAllSeedersCandidate && config.runAs === "lead") names.add(config.name);
+  }
+  return names;
+}
+
+/**
+ * The agent a seeded workflow's script nodes run as when the row has no
+ * `createdByAgentId`: the current Lead, but only for a template that opts in
+ * with `runAs: "lead"` and a row the seeder created or adopted (a `seed_state`
+ * record exists). Returns undefined otherwise, or when no Lead is registered,
+ * so the caller fails closed to its existing fallback.
+ */
+export async function resolveSeededWorkflowPrincipal(
+  workflow: Pick<Workflow, "name">,
+  sources: readonly WorkflowTemplateSource[] = BUILT_IN_WORKFLOW_SOURCES,
+): Promise<string | undefined> {
+  if (!seededLeadPrincipalWorkflowNames(sources).has(workflow.name)) return undefined;
+  if (!(await getSeedState("workflow", workflow.name))) return undefined;
+  return (await getLeadAgent())?.id ?? undefined;
 }
 
 async function findWorkflowByName(name: string): Promise<Workflow | null> {

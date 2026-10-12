@@ -10,6 +10,7 @@ import {
   restoreScratchScriptLastUsedIfUnchanged,
   touchScratchScriptLastUsed,
 } from "../../be/scripts/db";
+import { resolveSeededWorkflowPrincipal } from "../../be/seed/workflows-seeder";
 import {
   DEFAULT_SCRIPT_RESOURCES,
   MAX_SCRIPT_WALL_CLOCK_MS,
@@ -89,7 +90,12 @@ export class SwarmScriptExecutor extends BaseExecutor<
     }
 
     const workflow = await this.deps.db.getWorkflow(meta.workflowId);
-    const agentId = workflow?.createdByAgentId ?? agentIdFromContext(context);
+    // A seeded workflow has no creator and a scheduled trigger no agent; a template
+    // that opts in (runAs: "lead") runs its scripts as the current Lead instead.
+    const agentId =
+      workflow?.createdByAgentId ??
+      (workflow ? await resolveSeededWorkflowPrincipal(workflow) : undefined) ??
+      agentIdFromContext(context);
     const resolved = await resolveScriptSource(config, agentId);
 
     if (!resolved.ok) {

@@ -458,13 +458,14 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
     [
       "DREAMING_CAP_IDENTITY_TOTAL",
       "DREAMING_CAP_IDENTITY_PER_AGENT",
-      "DREAMING_CAP_TRIMS",
       "DREAMING_CAP_MEMORY_STORE",
       "DREAMING_CAP_MEMORY_EDIT",
       "DREAMING_CAP_MEMORY_DELETE",
     ],
     0,
   ),
+  // dream-trim plans at most 12 trims a night (its maxTrims ceiling); reject more instead of clamping.
+  ...boundedIntegerValidators(["DREAMING_CAP_TRIMS"], 0, 12),
   MEMORY_MIN_SIMILARITY: (value) =>
     validateFloatRange("MEMORY_MIN_SIMILARITY", value, 0, 1, "between 0 and 1 inclusive"),
   MEMORY_ACCESS_BOOST_MAX: (value) =>

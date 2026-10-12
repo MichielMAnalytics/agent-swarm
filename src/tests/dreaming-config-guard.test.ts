@@ -12,7 +12,6 @@ const BOOLEAN_KEYS = [
 const CAP_KEYS = [
   "DREAMING_CAP_IDENTITY_TOTAL",
   "DREAMING_CAP_IDENTITY_PER_AGENT",
-  "DREAMING_CAP_TRIMS",
   "DREAMING_CAP_MEMORY_STORE",
   "DREAMING_CAP_MEMORY_EDIT",
   "DREAMING_CAP_MEMORY_DELETE",
@@ -49,9 +48,15 @@ describe("dreaming cap validators", () => {
     });
   }
 
-  test("DREAMING_CAP_TRIMS=-1 is rejected with the integer message", () => {
+  test("DREAMING_CAP_TRIMS accepts 0..12, the dream-trim ceiling, and rejects the rest", () => {
+    for (const value of ["0", "3", "12"]) {
+      expect(validateConfigValue("DREAMING_CAP_TRIMS", value)).toBeNull();
+    }
+    for (const value of ["13", "100", "1.5", "x", ""]) {
+      expect(typeof validateConfigValue("DREAMING_CAP_TRIMS", value)).toBe("string");
+    }
     expect(validateConfigValue("DREAMING_CAP_TRIMS", "-1")).toBe(
-      "Invalid DREAMING_CAP_TRIMS (must be an integer >= 0)",
+      "Invalid DREAMING_CAP_TRIMS (must be an integer between 0 and 12)",
     );
   });
 });

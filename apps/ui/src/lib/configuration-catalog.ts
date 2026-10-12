@@ -1277,7 +1277,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
       {
         key: "DREAMING_CAP_TRIMS",
         label: "Profile trims per night",
-        description: "Maximum profile trim tasks started in one night.",
+        description: "Maximum profile trim tasks started in one night (0 to 12).",
         kind: "number",
         defaultValue: "3",
         placeholder: "3",
