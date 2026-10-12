@@ -93,9 +93,11 @@ export class SwarmScriptExecutor extends BaseExecutor<
     const workflow = await this.deps.db.getWorkflow(meta.workflowId);
     // A seeded workflow has no creator and a scheduled trigger no agent; a template
     // that opts in (runAs: "lead") runs its scripts as the current Lead instead.
+    // Check the definition this walk executes, not the stored row: an edited
+    // definition captured by a run must not inherit Lead after the row is restored.
     const seededPrincipal =
-      workflow && !workflow.createdByAgentId
-        ? await resolveSeededWorkflowPrincipal(workflow)
+      workflow && !workflow.createdByAgentId && meta.definition
+        ? await resolveSeededWorkflowPrincipal({ ...workflow, definition: meta.definition })
         : undefined;
     let agentId = workflow?.createdByAgentId ?? seededPrincipal ?? agentIdFromContext(context);
     let resolved = await resolveScriptSource(config, agentId);

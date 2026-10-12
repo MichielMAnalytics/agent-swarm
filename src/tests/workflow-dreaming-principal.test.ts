@@ -131,6 +131,35 @@ const REMOVE_STALE = {
   evidence: ["t1"],
 };
 
+/** A lone live dream-apply node that applies REMOVE_STALE, with no gather or synthesis. */
+function applyNode(runId: string) {
+  return {
+    id: "apply",
+    type: "swarm-script",
+    config: {
+      scriptName: "dream-apply",
+      scope: "global",
+      timeoutMs: 120_000,
+      args: {
+        runId,
+        dryRun: false,
+        synth: { actions: [REMOVE_STALE] },
+        lanes: { identity: true, memory: true, trim: false, heartbeat: false },
+      },
+    },
+  };
+}
+
+/** Earlier runs in this file would trip the dreaming workflow's 60-minute cooldown. */
+async function ageRuns(workflowId: string) {
+  const aged = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+  await getDbClient().run(
+    `UPDATE workflow_runs SET startedAt = ?, finishedAt = CASE WHEN finishedAt IS NULL THEN NULL ELSE ? END
+     WHERE workflowId = ?`,
+    [aged, aged, workflowId],
+  );
+}
+
 beforeAll(async () => {
   templateGlobals.__savedPrincipalTemplate = templateGlobals.__testMigrationTemplate;
   templateGlobals.__testMigrationTemplate = undefined;
@@ -255,23 +284,7 @@ describe("seeded dreaming on the real script runtime", () => {
       const wf = await createWorkflow({
         name: `principal-control-${crypto.randomUUID()}`,
         definition: {
-          nodes: [
-            {
-              id: "apply",
-              type: "swarm-script",
-              config: {
-                scriptName: "dream-apply",
-                scope: "global",
-                timeoutMs: 120_000,
-                args: {
-                  runId: "principal-control",
-                  dryRun: false,
-                  synth: { actions: [REMOVE_STALE] },
-                  lanes: { identity: true, memory: true, trim: false, heartbeat: false },
-                },
-              },
-            },
-          ],
+          nodes: [applyNode("principal-control")],
           onNodeFailure: "continue",
         },
       });
@@ -333,14 +346,8 @@ describe("seeded dreaming on the real script runtime", () => {
         return (await stepOf())!;
       };
 
-      // Earlier runs in this file would trip the 60-minute cooldown; age them out.
       const workflow = await seededDreaming();
-      const aged = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
-      await getDbClient().run(
-        `UPDATE workflow_runs SET startedAt = ?, finishedAt = CASE WHEN finishedAt IS NULL THEN NULL ELSE ? END
-         WHERE workflowId = ?`,
-        [aged, aged, workflow.id],
-      );
+      await ageRuns(workflow.id);
       // Scheduled-trigger shape: no agentId in the trigger, no creator on the row.
       const runId = await startWorkflowExecution(workflow, {}, registry, {
         triggerType: "schedule",
@@ -475,5 +482,34 @@ describe("seeded dreaming on the real script runtime", () => {
       expect(restored?.contentHash).toBe(pristine!.contentHash);
     },
     240_000,
+  );
+
+  spawnTest(
+    "a run that captured an edited definition gets no Lead after the stored row is restored",
+    async () => {
+      await updateAgentProfile(WORKER_ID, { claudeMd: CLAUDE_MD });
+      const stored = await seededDreaming();
+      await ageRuns(stored.id);
+      // The stored row is the shipped template and resolves to the Lead; the run
+      // walks an edited copy, as if the row was restored after the run started.
+      expect(await resolveSeededWorkflowPrincipal(stored)).toBe(LEAD_ID);
+      const captured = {
+        ...stored,
+        definition: { nodes: [applyNode("principal-toctou")], onNodeFailure: "continue" as const },
+      };
+      const { registry } = realRegistry();
+      const runId = await startWorkflowExecution(captured, {}, registry, {
+        triggerType: "schedule",
+      });
+      await waitFor(async () => isTerminal((await getWorkflowRun(runId))?.status), "run end");
+
+      const step = (await getWorkflowRunStepsByRunId(runId)).find((s) => s.nodeId === "apply");
+      const result = (step?.output as { result?: any } | undefined)?.result;
+      expect(step?.status).toBe("completed");
+      expect(result?.applied ?? []).toEqual([]);
+      expect(await workerClaude()).toBe(CLAUDE_MD);
+      expect(await lastClaudeWriter()).not.toBe(LEAD_ID);
+    },
+    180_000,
   );
 });

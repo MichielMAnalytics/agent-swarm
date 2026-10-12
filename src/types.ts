@@ -2025,6 +2025,9 @@ export const ExecutorMetaSchema = z
     // per-item body pass) must use THIS — not the full run context — so deferred
     // config obeys the same explicit-dataflow boundary as normal node config.
     inputCtx: z.record(z.string(), z.unknown()).optional(),
+    // The definition this walk is executing. A run started from an in-memory
+    // workflow keeps it even if the stored row changes mid-run.
+    definition: z.custom<WorkflowDefinition>().optional(),
   })
   .openapi("ExecutorMeta");
 export type ExecutorMeta = z.infer<typeof ExecutorMetaSchema>;

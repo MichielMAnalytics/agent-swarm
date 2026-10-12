@@ -878,6 +878,7 @@ async function runClaimedStep(
     dryRun: false,
     requestedByUserId: options.requestedByUserId,
     inputCtx: interpolationCtx,
+    definition: def,
   };
 
   // Inline script nodes historically expose their wall-clock budget as
