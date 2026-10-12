@@ -37,11 +37,20 @@ async function removeDbFiles(path: string): Promise<void> {
 
 type Harness = { calls: string[]; ctx: any };
 
-/** The script SDK surface the dreaming scripts use, backed by the test DB. Every call is recorded. */
-function harness(): Harness {
+/**
+ * The script SDK surface the dreaming scripts use, backed by the test DB. Every call is recorded.
+ * `caller` is the agent the script runs as: like the API, agent-scope script writes resolve to it.
+ */
+function harness(caller: string = LEAD_ID): Harness {
   const calls: string[] = [];
   const ctx = {
+    stdlib: { Redacted: { value: (r: { v: string }) => r.v } },
     swarm: {
+      config: { agentId: { v: caller } },
+      async task_send(a: { agentId?: string; task: string }) {
+        calls.push(`task_send ${a.agentId}`);
+        return { success: true };
+      },
       async db_query({ sql, params = [] }: { sql: string; params?: unknown[] }) {
         try {
           const r = executeReadOnlyQuery(sql, params);
@@ -87,7 +96,7 @@ function harness(): Harness {
         // Agent scope deletes only the caller's own row, as the API does.
         getDb().run(
           "DELETE FROM scripts WHERE name = ? AND scope = ? AND (scope = 'global' OR scopeId = ?)",
-          [name, scope, LEAD_ID],
+          [name, scope, caller],
         );
         return { success: true, data: { deleted: true } };
       },
@@ -101,6 +110,7 @@ function harness(): Harness {
         calls.push(`script_upsert ${a.name} ${a.scope}`);
         insertScript(a.name, a.source, {
           scope: a.scope ?? "agent",
+          owner: caller,
           createdAt: new Date().toISOString(),
         });
         return { success: true };
@@ -111,7 +121,7 @@ function harness(): Harness {
 }
 
 const writesIn = (calls: string[]) =>
-  calls.filter((c) => /^(kv_set|skill_update|script_delete|script_upsert) /.test(c));
+  calls.filter((c) => /^(kv_set|skill_update|script_delete|script_upsert|task_send) /.test(c));
 
 // ---- fixtures ----
 
@@ -140,7 +150,7 @@ function insertInvocation(
 function insertScript(
   name: string,
   source: string,
-  o: { scope?: string; createdAt: string },
+  o: { scope?: string; owner?: string; createdAt: string },
 ): { id: string; contentHash: string } {
   const id = crypto.randomUUID();
   const scope = o.scope ?? "agent";
@@ -152,7 +162,7 @@ function insertScript(
       id,
       name,
       scope,
-      scope === "agent" ? LEAD_ID : null,
+      scope === "agent" ? (o.owner ?? LEAD_ID) : null,
       source,
       contentHash,
       LEAD_ID,
@@ -240,13 +250,14 @@ async function scriptArtifact(
   name: string,
   ageDays: number,
   source = `export default async () => ({ name: "${name}" });\n`,
+  owner: string = LEAD_ID,
 ) {
   const createdAt = daysAgo(ageDays);
-  const row = insertScript(name, source, { createdAt });
+  const row = insertScript(name, source, { createdAt, owner });
   await putArtifact("script", name, {
     id: row.id,
     scope: "agent",
-    agentId: LEAD_ID,
+    agentId: owner,
     createdAt,
     contentHash: row.contentHash,
     source,
@@ -262,6 +273,10 @@ const skillEnabled = (id: string) =>
   Number((getDb().query("SELECT isEnabled FROM skills WHERE id = ?").get(id) as any)?.isEnabled);
 const scriptCount = (name: string) =>
   Number((getDb().query("SELECT COUNT(*) n FROM scripts WHERE name = ?").get(name) as any)?.n);
+const scriptRow = (name: string, owner: string) =>
+  getDb()
+    .query("SELECT id, contentHash FROM scripts WHERE name = ? AND scope = 'agent' AND scopeId = ?")
+    .get(name, owner) as { id: string; contentHash: string } | null;
 
 // The current dreaming run: its workflow is excluded from every count.
 let DREAMING_WF = "";
@@ -645,6 +660,108 @@ describe("dream-rollback mode artifact", () => {
       harness().ctx,
     );
     expect(b.failed[0].reason).toBe("no artifact record");
+  });
+});
+
+describe("artifact owner is not the caller", () => {
+  const WORKER = "00000000-0000-4000-8000-0000000000aa";
+  const LEAD_SOURCE = 'export default async () => ({ lead: "unrelated" });\n';
+
+  test("adoption never deletes the caller's same-name script; it asks the owner once", async () => {
+    // A worker-owned dreaming artifact, and an unrelated Lead-owned script with the same name.
+    const art = await scriptArtifact("open-pr-count", 20, undefined, WORKER);
+    const leadRow = insertScript("open-pr-count", LEAD_SOURCE, { createdAt: daysAgo(90) });
+
+    const dry: any = await dreamAdoption(live({ dryRun: true }), harness().ctx);
+    expect(dry.wouldRetire).toEqual([
+      expect.objectContaining({
+        name: "open-pr-count",
+        action: `ask owner ${WORKER} to script_delete`,
+      }),
+    ]);
+
+    const h = harness();
+    const r: any = await dreamAdoption(live(), h.ctx);
+    expect(h.calls.some((c) => c.startsWith("script_delete"))).toBe(false);
+    expect(h.calls).toContain(`task_send ${WORKER}`);
+    expect(r.errors).toEqual([]);
+    expect(r.retired).toEqual([]);
+    expect(r.delegated).toEqual([
+      expect.objectContaining({ name: "open-pr-count", owner: WORKER }),
+    ]);
+    // Both rows untouched.
+    expect(scriptRow("open-pr-count", LEAD_ID)).toMatchObject({ id: leadRow.id });
+    expect(scriptRow("open-pr-count", WORKER)).toMatchObject({ id: art.id });
+    expect(await record("script", "open-pr-count")).toMatchObject({
+      status: "active",
+      retireRequestedFrom: WORKER,
+    });
+
+    // The next run does not ask again.
+    const h2 = harness();
+    const again: any = await dreamAdoption(live(), h2.ctx);
+    expect(writesIn(h2.calls)).toEqual([]);
+    expect(again.pending).toEqual([
+      expect.objectContaining({ name: "open-pr-count", owner: WORKER }),
+    ]);
+  });
+
+  test("run as the owner, adoption deletes exactly the recorded row", async () => {
+    const art = await scriptArtifact("open-pr-count", 20, undefined, WORKER);
+    const leadRow = insertScript("open-pr-count", LEAD_SOURCE, { createdAt: daysAgo(90) });
+    const r: any = await dreamAdoption(live(), harness(WORKER).ctx);
+    expect(r.retired).toEqual([expect.objectContaining({ name: "open-pr-count" })]);
+    expect(scriptRow("open-pr-count", WORKER)).toBeNull();
+    expect(scriptRow("open-pr-count", LEAD_ID)).toMatchObject({ id: leadRow.id });
+    expect(art.id).not.toBe(leadRow.id);
+  });
+
+  test("an agent-scope record with no owner is skipped, not resolved by name", async () => {
+    insertScript("open-pr-count", LEAD_SOURCE, { createdAt: daysAgo(90) });
+    await putArtifact("script", "open-pr-count", {
+      scope: "agent",
+      createdAt: daysAgo(20),
+      contentHash: sha256(LEAD_SOURCE),
+      source: LEAD_SOURCE,
+    });
+    const h = harness();
+    const r: any = await dreamAdoption(live(), h.ctx);
+    expect(r.skipped).toEqual([
+      expect.objectContaining({ reason: "agent-scope record has no owner (agentId)" }),
+    ]);
+    expect(h.calls.some((c) => c.startsWith("script_delete"))).toBe(false);
+    expect(scriptCount("open-pr-count")).toBe(1);
+  });
+
+  test("artifact rollback restores an agent-scope script only as its owner", async () => {
+    const art = await scriptArtifact("open-pr-count", 20, undefined, WORKER);
+    await dreamAdoption(live(), harness(WORKER).ctx);
+    expect(scriptRow("open-pr-count", WORKER)).toBeNull();
+    // The Lead now holds its own same-name script with other content.
+    const leadRow = insertScript("open-pr-count", LEAD_SOURCE, { createdAt: daysAgo(1) });
+
+    const h = harness();
+    const asLead: any = await dreamRollback(
+      { mode: "artifact", kind: "script", name: "open-pr-count" },
+      h.ctx,
+    );
+    expect(asLead.restored).toEqual([]);
+    expect(asLead.failed[0].reason).toBe(
+      `agent-scope script restores only when its owner ${WORKER} runs the rollback`,
+    );
+    expect(h.calls.some((c) => c.startsWith("script_upsert"))).toBe(false);
+    expect(scriptRow("open-pr-count", LEAD_ID)).toMatchObject({
+      id: leadRow.id,
+      contentHash: sha256(LEAD_SOURCE),
+    });
+
+    const asOwner: any = await dreamRollback(
+      { mode: "artifact", kind: "script", name: "open-pr-count" },
+      harness(WORKER).ctx,
+    );
+    expect(asOwner.failed).toEqual([]);
+    expect(scriptRow("open-pr-count", WORKER)).toMatchObject({ contentHash: art.contentHash });
+    expect(scriptRow("open-pr-count", LEAD_ID)).toMatchObject({ id: leadRow.id });
   });
 });
 

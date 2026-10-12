@@ -336,8 +336,20 @@ async function rollbackArtifact(a: any, ctx: ScriptContext, dry: boolean) {
     const source = typeof rec.source === "string" ? rec.source : "";
     if (!source) { failed.push({ key, reason: "record has no source" }); return done(); }
     if ((await sha(source)) !== String(rec.contentHash ?? "")) { failed.push({ key, reason: "record source does not match its contentHash" }); return done(); }
-    const ownerClause = scope === "agent" && rec.agentId ? " AND scopeId = ?" : "";
-    const ownerParam = ownerClause ? [String(rec.agentId)] : [];
+    // script_upsert writes an agent-scope row under the CALLER, not the recorded owner: run by anyone else it
+    // would create or overwrite the caller's own same-name script. Only the owner restores an agent-scope script.
+    const owner = scope === "agent" ? String(rec.agentId ?? "") : "";
+    if (scope === "agent") {
+      if (!owner) { failed.push({ key, reason: "agent-scope record has no owner (agentId)" }); return done(); }
+      let caller = "";
+      try { caller = String(ctx.stdlib.Redacted.value(ctx.swarm.config.agentId) ?? ""); } catch {}
+      if (caller !== owner) {
+        failed.push({ key, reason: `agent-scope script restores only when its owner ${owner} runs the rollback`, owner });
+        return done();
+      }
+    }
+    const ownerClause = scope === "agent" ? " AND scopeId = ?" : "";
+    const ownerParam = ownerClause ? [owner] : [];
     const live = await q(`SELECT id, contentHash FROM scripts WHERE name = ? AND scope = ?${ownerClause}`, [name, scope, ...ownerParam]);
     if (live.length && String(live[0].contentHash) === String(rec.contentHash)) {
       if (!dry) await mark({ id: String(live[0].id) });
@@ -357,7 +369,7 @@ async function rollbackArtifact(a: any, ctx: ScriptContext, dry: boolean) {
     if (back.length) {
       await mark({ id: String(back[0].id) });
       restored.push({ key, how: `script_upsert scope ${scope}` });
-    } else failed.push({ key, reason: `script not visible after script_upsert${ownerClause ? " (an agent-scope script restores only when its owner runs the rollback)" : ""}` });
+    } else failed.push({ key, reason: "script not visible after script_upsert" });
   } catch (e: any) {
     failed.push({ key, reason: String(e?.message ?? e).slice(0, 200) });
   }

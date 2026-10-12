@@ -6,7 +6,9 @@ import { z } from "zod";
 // `active` record and retires the ones nobody used within `gateDays`:
 //   skill  -> skill_update isEnabled:false, re-read to confirm.
 //   script -> script_delete, only when the live contentHash still equals the recorded one (an edit is adoption)
-//             and no workflow, schedule or other script names it (a wiring is adoption).
+//             and no workflow, schedule or other script names it (a wiring is adoption). The row is the
+//             recorded owner's; an agent-scope script owned by another agent is never deleted from here
+//             (script_delete targets the caller's own row): its owner gets one task to delete it.
 // A use is a skill_invocations row, a script_runs row more than an hour after the build (the build-time controls
 // run within minutes of it), or a swarm-script workflow step whose node names the script. Dreaming's own workflow
 // runs never count. `gateDays` 0 counts but never retires. dryRun reports `wouldRetire` and writes nothing.
@@ -78,6 +80,20 @@ export default async function (args: unknown, ctx: ScriptContext) {
   const pending: any[] = [];
   const wouldRetire: any[] = [];
   const skipped: any[] = [];
+  const delegated: any[] = [];
+  // The agent this script runs as: an agent-scope delete only ever reaches this agent's own rows.
+  // Resolved on first need; unresolved ("") means every agent-scope retire goes to its owner.
+  let caller: string | null = null;
+  const callerId = (): string => {
+    if (caller !== null) return caller;
+    try {
+      caller = String(ctx.stdlib.Redacted.value(ctx.swarm.config.agentId) ?? "");
+    } catch (e: any) {
+      caller = "";
+      errors.push(`caller: ${String(e?.message ?? e).slice(0, 200)}`);
+    }
+    return caller;
+  };
   // Fail closed: only an explicit false makes a live run.
   const dry = parseBool(a.dryRun) !== false;
   const gateDays = parseInt0(a.gateDays, 14);
@@ -272,12 +288,18 @@ export default async function (args: unknown, ctx: ScriptContext) {
       }
 
       const scope = rec.scope === "global" ? "global" : "agent";
+      const owner = scope === "agent" ? String(rec.agentId ?? "") : "";
+      if (scope === "agent" && !owner) {
+        // Without the owner the row is ambiguous: another agent may hold a script of the same name.
+        skipped.push({ ...item, reason: "agent-scope record has no owner (agentId)" });
+        continue;
+      }
       const live =
         (await q(
           "scriptRow",
           `SELECT id, contentHash, scope, scopeId FROM scripts WHERE name = ? AND scope = ?
-           ${scope === "agent" && rec.agentId ? "AND scopeId = ?" : ""} ORDER BY updatedAt DESC LIMIT 1`,
-          [name, scope, ...(scope === "agent" && rec.agentId ? [String(rec.agentId)] : [])],
+           ${scope === "agent" ? "AND scopeId = ?" : ""} ORDER BY updatedAt DESC LIMIT 1`,
+          [name, scope, ...(scope === "agent" ? [owner] : [])],
         )) ?? null;
       if (!live) throw new Error("script read failed");
       if (!live.length && scope === "agent") {
@@ -307,8 +329,32 @@ export default async function (args: unknown, ctx: ScriptContext) {
         if (!dry) await writeRecord(key, { ...rec, status: "adopted-ref", refs: r, checkedAt: nowIso });
         continue;
       }
+      // script_delete resolves an agent-scope row from the CALLER, not from the record: called for another
+      // agent's script it would delete the caller's own same-name row. Only the owner deletes it, so ask them.
+      const delegate = scope === "agent" && owner !== callerId();
       if (dry) {
-        wouldRetire.push({ ...item, action: `script_delete scope ${scope}`, reason });
+        wouldRetire.push({ ...item, action: delegate ? `ask owner ${owner} to script_delete` : `script_delete scope ${scope}`, reason });
+        continue;
+      }
+      if (delegate) {
+        if (rec.retireRequestedFrom === owner) {
+          pending.push({ ...item, owner, reason: `retire requested from its owner at ${rec.retireRequestedAt}` });
+          continue;
+        }
+        await ctx.swarm.task_send({
+          agentId: owner,
+          routingReason: "skill",
+          routingNote: "dreaming adoption gate: only a script's owner can delete an agent-scope script",
+          tags: ["dreaming", "dreaming-adoption"],
+          task:
+            `dreaming adoption gate: your agent-scope script "${name}" was built by a dreaming run and has had ${reason}. ` +
+            `Check that it is still unused and unwired, and that its contentHash is still ${String(rec.contentHash)} ` +
+            `(db-query \`SELECT contentHash FROM scripts WHERE name = '${name}' AND scope = 'agent' AND scopeId = '${owner}'\`). ` +
+            `If so, delete it with script-delete name "${name}" scope "agent". Otherwise keep it. ` +
+            `Its source stays in KV dreaming/${key} for a restore. Reply with what you did.`,
+        } as any);
+        delegated.push({ ...item, owner, reason });
+        await writeRecord(key, { ...rec, retireRequestedFrom: owner, retireRequestedAt: nowIso, checkedAt: nowIso });
         continue;
       }
       await ctx.swarm.script_delete({ name, scope });
@@ -317,7 +363,7 @@ export default async function (args: unknown, ctx: ScriptContext) {
         retired.push({ ...item, how: `script_delete scope ${scope}`, reason });
         await writeRecord(key, { ...rec, status: "retired", retiredAt: nowIso, reason, uses: 0 });
       } else
-        errors.push(`${key}: script still present after script_delete (an agent-scope row can only be deleted by its owner)`);
+        errors.push(`${key}: script still present after script_delete`);
     } catch (err: any) {
       errors.push(`${key}: ${String(err?.message ?? err).slice(0, 200)}`);
     }
@@ -387,6 +433,7 @@ export default async function (args: unknown, ctx: ScriptContext) {
     adopted,
     pending,
     wouldRetire,
+    delegated,
     skipped,
     errors,
     controls,
