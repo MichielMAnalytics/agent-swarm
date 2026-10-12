@@ -126,7 +126,8 @@ export function unknownSecretExposureDefault(): Exclude<SecretExposure, "api"> {
   return raw === "worker" || raw === "lead" ? raw : DEFAULT_UNKNOWN_SECRET_EXPOSURE;
 }
 
-function isPinnedApiKey(key: string): boolean {
+/** True for the registry's API-only keys; a stored row value never changes this. */
+export function isPinnedApiKey(key: string): boolean {
   return registryExposureFor(key) === "api";
 }
 
@@ -148,16 +149,16 @@ export function secretExposureFor(row: {
 }
 
 /**
- * Exposure to store on INSERT. An explicit value wins. Otherwise a secret row
- * whose key has no registry default gets NEW_UNKNOWN_SECRET_EXPOSURE, and
- * everything else stays NULL (code default).
+ * Exposure to store on INSERT. An explicit value wins, including an explicit
+ * null (code default). Otherwise a secret row whose key has no registry
+ * default gets NEW_UNKNOWN_SECRET_EXPOSURE, and everything else stays NULL.
  */
 export function exposureToStampOnInsert(data: {
   key: string;
   isSecret: boolean;
   exposure?: SecretExposure | null;
 }): SecretExposure | null {
-  if (data.exposure) return data.exposure;
+  if (data.exposure !== undefined) return data.exposure;
   if (data.isSecret && registryExposureFor(data.key) === null) return NEW_UNKNOWN_SECRET_EXPOSURE;
   return null;
 }

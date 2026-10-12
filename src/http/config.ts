@@ -16,7 +16,7 @@ import {
 } from "../be/multi-runtime";
 import { fillOrgLogoFromWebsite } from "../be/org-profile";
 import { getUserGrant } from "../be/rbac-roles";
-import { secretExposureFor, validateExposureWrite } from "../be/secret-exposure";
+import { isPinnedApiKey, validateExposureWrite } from "../be/secret-exposure";
 import {
   internalConfigKeyError,
   isInternalConfigKey,
@@ -25,7 +25,7 @@ import {
   validateConfigValue,
 } from "../be/swarm-config-guard";
 import { can, isRbacEnabled, type PermissionVerb } from "../rbac";
-import { type SecretExposure, SecretExposureSchema, SwarmConfigSchema } from "../types";
+import { SecretExposureSchema, SwarmConfigSchema } from "../types";
 import { getRequestAuth } from "../utils/request-auth-context";
 import { registerVolatileSecret } from "../utils/secret-scrubber";
 import { reloadGlobalConfigsAndIntegrations, scheduleIntegrationsReload } from "./core";
@@ -36,17 +36,16 @@ const MAX_ENV_PRESENCE_KEYS = 200;
 const SECRETS_FORCE_MASK_NOTE =
   " (secret values masked: this token cannot read secrets in this scope)";
 
-// Rows with exposure `api` belong to the API server and are NEVER handed out
-// over HTTP — workers/entrypoints read config to build their env, and the
-// agent-fs bootstrap admin key would let a compromised worker administer the
-// shared org. The API materializes these into its own process.env at boot via
+// Pinned API-only keys belong to the API server and are NEVER handed out over
+// HTTP — workers/entrypoints read config to build their env, and the agent-fs
+// bootstrap admin key would let a compromised worker administer the shared
+// org. The API materializes these into its own process.env at boot via
 // getInjectableGlobalConfigs, so no HTTP consumer legitimately needs them. The
-// key list lives in src/be/secret-exposure.ts.
-function stripApiOnlyKeys<T extends { key: string; exposure?: SecretExposure | null }>(
-  configs: T[],
-): T[] {
+// key list lives in src/be/secret-exposure.ts. This filters on the registry
+// only: a stored `api` override on any other key does not hide the row yet.
+function stripApiOnlyKeys<T extends { key: string }>(configs: T[]): T[] {
   return configs.filter(
-    (config) => secretExposureFor(config) !== "api" && !isInternalConfigKey(config.key),
+    (config) => !isPinnedApiKey(config.key) && !isInternalConfigKey(config.key),
   );
 }
 

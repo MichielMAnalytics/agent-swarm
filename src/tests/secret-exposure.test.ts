@@ -172,6 +172,20 @@ describe("upsertSwarmConfig exposure", () => {
     });
   });
 
+  test("INSERT with an explicit null exposure stores NULL, not the lead stamp", async () => {
+    await upsertSwarmConfig({
+      scope: "global",
+      key: "TEST_UNKNOWN_SECRET_NULL",
+      value: syntheticValue(),
+      isSecret: true,
+      exposure: null,
+    });
+    expect(await storedRow("TEST_UNKNOWN_SECRET_NULL")).toMatchObject({
+      exposure: null,
+      effectiveExposure: "worker",
+    });
+  });
+
   test("a registry-worker key rewritten without exposure stays worker", async () => {
     for (let i = 0; i < 2; i++) {
       await upsertSwarmConfig({
@@ -265,6 +279,29 @@ describe("HTTP PUT /api/config exposure", () => {
   test("rejects an exposure outside the enum", async () => {
     const res = await put({ key: "TEST_HTTP_BOGUS", value: syntheticValue(), exposure: "bogus" });
     expect(res.status).toBe(400);
+  });
+
+  test("INSERT with an explicit null exposure stores NULL", async () => {
+    const res = await put({
+      key: "TEST_HTTP_INSERT_NULL",
+      value: syntheticValue(),
+      exposure: null,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ exposure: null, effectiveExposure: "worker" });
+  });
+
+  test("list reads keep an ordinary row with an api override and still omit pinned keys", async () => {
+    await put({ key: "TEST_HTTP_API_OVERRIDE", value: syntheticValue(), exposure: "api" });
+    await put({ key: "SLACK_SIGNING_SECRET", value: syntheticValue() });
+    for (const path of ["/api/config?scope=global", "/api/config/resolved"]) {
+      const res = await fetch(`http://localhost:${port}${path}`);
+      expect(res.status).toBe(200);
+      const { configs } = (await res.json()) as { configs: Array<Record<string, unknown>> };
+      const keys = configs.map((config) => config.key);
+      expect(keys).toContain("TEST_HTTP_API_OVERRIDE");
+      expect(keys).not.toContain("SLACK_SIGNING_SECRET");
+    }
   });
 
   test("list reads return exposure and effectiveExposure on every row", async () => {
