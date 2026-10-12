@@ -621,6 +621,8 @@ describe("script connections", () => {
       markMigrationApplied(database, "205_favorites_per_dashboard_user.sql");
       // 209 alters workflow_runs, which this migration-112-only fixture does not create.
       markMigrationApplied(database, "209_workflow_run_lead_principal.sql");
+      // 210 adds a trigger on workflows, which this fixture does not create either.
+      markMigrationApplied(database, "210_workflow_edit_revokes_lead_principal.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();

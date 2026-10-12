@@ -159,6 +159,16 @@ export async function startWorkflowExecution(
     parentStepId: options.parentStepId,
     leadPrincipalEligible: await isPristineSeededLeadWorkflow(workflow),
   });
+  // Edits revoke eligibility in the workflows UPDATE trigger (migration 210),
+  // which only reaches runs that already exist. `workflow` may have been read
+  // before an edit that committed ahead of this insert, so re-read the stored
+  // row now: any later edit fires the trigger on this run.
+  if (await isWorkflowRunLeadPrincipalEligible(runId)) {
+    const stored = await getWorkflow(workflow.id);
+    if (!stored || !(await isPristineSeededLeadWorkflow(stored))) {
+      await revokeWorkflowRunLeadPrincipal(runId);
+    }
+  }
   telemetry.workflow("started", {
     workflowId: workflow.id,
     nodeCount: workflow.definition.nodes.length,
@@ -317,24 +327,6 @@ export async function walkGraph(
   }
 }
 
-/**
- * Seeded `runAs: "lead"` scripts run as the Lead only while every walk of the
- * run executed the shipped definition. Resume, retry and recovery walk the
- * stored row, which may have been edited and restored since an earlier walk,
- * so the verdict is kept on the run: the first walk of an edited definition
- * revokes it before any node executes, and no later walk restores it.
- */
-async function revokeLeadPrincipalIfEdited(
-  runId: string,
-  def: WorkflowDefinition,
-  workflowId: string | undefined,
-): Promise<void> {
-  if (!(await isWorkflowRunLeadPrincipalEligible(runId))) return;
-  const workflow = workflowId ? await getWorkflow(workflowId) : null;
-  if (workflow && (await isPristineSeededLeadWorkflow({ ...workflow, definition: def }))) return;
-  await revokeWorkflowRunLeadPrincipal(runId);
-}
-
 async function walkGraphOwned(
   def: WorkflowDefinition,
   runId: string,
@@ -353,7 +345,6 @@ async function walkGraphOwned(
       requestedByUserId: (await getWorkflowRun(runId))?.createdBy,
     };
   }
-  await revokeLeadPrincipalIfEdited(runId, def, workflowId);
   let nodeExecutionCount = 0;
   // `run.id` is a context builtin (like `trigger` / `input`) so nodes can reference
   // their own run — e.g. an audit/receipt node correlating its output with the run

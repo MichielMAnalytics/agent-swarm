@@ -105,6 +105,7 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
             dryRun: false,
             requestedByUserId: run.createdBy,
             inputCtx,
+            definition: workflow.definition,
           };
 
           try {

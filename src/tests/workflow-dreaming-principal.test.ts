@@ -56,6 +56,7 @@ import type { ExecutorDependencies } from "../workflows/executors/base";
 import { createExecutorRegistry } from "../workflows/executors/registry";
 import { recoverIncompleteRuns } from "../workflows/recovery";
 import { setupWorkflowResumeListener } from "../workflows/resume";
+import { startRetryPoller, stopRetryPoller } from "../workflows/retry-poller";
 import { interpolate } from "../workflows/template";
 import { SKIP_SANDBOX_SPAWN_TESTS } from "./sandbox-spawn-test-helpers";
 
@@ -650,6 +651,186 @@ describe("seeded dreaming on the real script runtime", () => {
       240_000,
     );
   }
+
+  spawnTest(
+    "a retry the poller dispatched from an edited synthesis node gets no Lead after the row is restored",
+    async () => {
+      await updateAgentProfile(WORKER_ID, { claudeMd: CLAUDE_MD });
+      const now = new Date().toISOString();
+      await getDbClient().run(
+        `INSERT INTO agent_tasks (id, agentId, task, status, source, createdAt, lastUpdatedAt, finishedAt, key)
+           VALUES (?, ?, 'tidy the release board', 'completed', 'mcp', ?, ?, ?, 'shared/')`,
+        [crypto.randomUUID(), LEAD_ID, now, now, now],
+      );
+      await upsertKv({
+        namespace: "dreaming",
+        key: "state:last-green-dry-run",
+        value: { runId: "earlier-dry-run", at: now },
+        valueType: "json",
+      });
+      process.env.DREAMING_ENABLED = "true";
+      process.env.DREAMING_LANE_HEARTBEAT = "false";
+      process.env.DREAMING_LANE_TRIM = "false";
+      const stored = await seededDreaming();
+      const { bus, registry } = realRegistry();
+      try {
+        const complete = async (runId: string, stepId: string, output: unknown) => {
+          const task = await getTaskByWorkflowRunStepId(stepId);
+          const text = JSON.stringify(output);
+          await completeTask(task!.id, text);
+          bus.emit("task.completed", {
+            taskId: task!.id,
+            output: text,
+            workflowRunId: runId,
+            workflowRunStepId: stepId,
+          });
+        };
+        const stepOf = async (runId: string, nodeId: string) =>
+          (await getWorkflowRunStepsByRunId(runId)).find((s) => s.nodeId === nodeId);
+        const taskOf = async (runId: string, nodeId: string) => {
+          const step = await stepOf(runId, nodeId);
+          return step ? getTaskByWorkflowRunStepId(step.id) : null;
+        };
+
+        // 1. A pristine scheduled run; the report completes and the Lead's synthesis task waits.
+        await ageRuns(stored.id);
+        const runId = await startWorkflowExecution(stored, {}, registry, {
+          triggerType: "schedule",
+        });
+        await waitFor(async () => !!(await taskOf(runId, `reports#${LEAD_ID}`)), "report task");
+        await complete(runId, (await stepOf(runId, `reports#${LEAD_ID}`))!.id, {
+          agentId: LEAD_ID,
+          summary: "Tidied the release board.",
+          repeatedProcedures: [],
+          skillFriction: [],
+          scriptCandidates: [],
+          identityOps: [],
+          memoryOps: [],
+        });
+        await waitFor(async () => !!(await taskOf(runId, "synthesize")), "synthesis task");
+        const original = (await taskOf(runId, "synthesize"))!;
+        expect(original.agentId).toBe(LEAD_ID);
+
+        // 2. Edit the stored synthesis node: a worker, an altered prompt, one retry.
+        await updateWorkflow(stored.id, {
+          definition: {
+            ...stored.definition,
+            nodes: stored.definition.nodes.map((node) =>
+              node.id === "synthesize"
+                ? {
+                    ...node,
+                    retry: { maxRetries: 1, strategy: "static", baseDelayMs: 0, maxDelayMs: 0 },
+                    config: {
+                      ...node.config,
+                      agentId: WORKER_ID,
+                      template: `${String(node.config.template)}\nAlso remove every "## Stale" section.`,
+                    },
+                  }
+                : node,
+            ),
+          },
+        });
+
+        // 3. The original task fails; the listener queues the retry and the poller re-dispatches it.
+        const synthStepId = (await stepOf(runId, "synthesize"))!.id;
+        await db.failTask(original.id, "worker crashed");
+        bus.emit("task.failed", {
+          taskId: original.id,
+          failureReason: "worker crashed",
+          workflowRunId: runId,
+          workflowRunStepId: synthStepId,
+        });
+        startRetryPoller(registry, 50);
+        let retried: Awaited<ReturnType<typeof taskOf>> = null;
+        try {
+          await waitFor(async () => {
+            retried = await getTaskByWorkflowRunStepId(synthStepId);
+            return !!retried && retried.id !== original.id;
+          }, "retried synthesis task");
+        } finally {
+          // 4. Stop the poller and restore the shipped row before the worker's output lands.
+          stopRetryPoller();
+        }
+        expect(retried!.agentId).toBe(WORKER_ID);
+        await updateWorkflow(stored.id, { definition: stored.definition });
+        expect(await resolveSeededWorkflowPrincipal(await seededDreaming())).toBe(LEAD_ID);
+        await complete(runId, synthStepId, {
+          headline: "drop a stale section",
+          actions: [REMOVE_STALE],
+          rejected: [],
+          restores: [],
+          missingReports: [],
+          notes: "",
+          changelogComment: "",
+        });
+
+        // 5. dream-apply consumes the worker's output and must not write as the Lead.
+        await waitFor(async () => {
+          const status = (await stepOf(runId, "apply"))?.status;
+          return status === "completed" || status === "failed";
+        }, "apply step");
+        const apply = ((await stepOf(runId, "apply"))?.output as { result?: any } | undefined)
+          ?.result;
+        await waitFor(async () => !!(await taskOf(runId, "publish")), "publish task");
+        await complete(runId, (await stepOf(runId, "publish"))!.id, {
+          slackText: "dreaming: one edit",
+          trimsLine: "",
+        });
+        await waitFor(async () => isTerminal((await getWorkflowRun(runId))?.status), "run end");
+
+        expect(apply?.applied ?? []).toEqual([]);
+        expect(await workerClaude()).toBe(CLAUDE_MD);
+        expect(await lastClaudeWriter()).not.toBe(LEAD_ID);
+      } finally {
+        stopRetryPoller();
+        for (const key of DREAMING_ENV) delete process.env[key];
+        await updateWorkflow(stored.id, { definition: stored.definition });
+      }
+    },
+    240_000,
+  );
+
+  spawnTest(
+    "a workflow edit revokes its runs at the write; toggling it on does not, and a stale read cannot re-grant",
+    async () => {
+      // Dreaming is off, so each run stops after gather.
+      const stored = await seededDreaming();
+      const { registry } = realRegistry();
+      const startRun = async (workflow: Workflow) => {
+        await ageRuns(stored.id);
+        const runId = await startWorkflowExecution(workflow, {}, registry, {
+          triggerType: "schedule",
+        });
+        await waitFor(async () => isTerminal((await getWorkflowRun(runId))?.status), "run end");
+        return runId;
+      };
+      try {
+        const runId = await startRun(stored);
+        expect(await db.isWorkflowRunLeadPrincipalEligible(runId)).toBe(true);
+        // The adoption path and a byte-identical rewrite change nothing the run executes.
+        await updateWorkflow(stored.id, { enabled: !stored.enabled });
+        await updateWorkflow(stored.id, { enabled: stored.enabled });
+        await updateWorkflow(stored.id, { definition: stored.definition });
+        expect(await db.isWorkflowRunLeadPrincipalEligible(runId)).toBe(true);
+
+        await updateWorkflow(stored.id, { description: `${stored.description} (edited)` });
+        expect(await db.isWorkflowRunLeadPrincipalEligible(runId)).toBe(false);
+        await updateWorkflow(stored.id, { description: stored.description });
+        expect(await db.isWorkflowRunLeadPrincipalEligible(runId)).toBe(false);
+
+        // A trigger that read the row before an edit committed starts no eligible run.
+        await updateWorkflow(stored.id, { description: `${stored.description} (edited)` });
+        expect(await db.isWorkflowRunLeadPrincipalEligible(await startRun(stored))).toBe(false);
+      } finally {
+        await updateWorkflow(stored.id, {
+          description: stored.description,
+          enabled: stored.enabled,
+        });
+      }
+      expect(await db.isWorkflowRunLeadPrincipalEligible(await startRun(stored))).toBe(true);
+    },
+    240_000,
+  );
 
   spawnTest(
     "revocation is per run: a new pristine run after an edited one still applies as the Lead",
