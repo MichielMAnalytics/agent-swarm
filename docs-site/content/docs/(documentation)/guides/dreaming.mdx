@@ -113,6 +113,8 @@ Dreaming may create a skill or a script that nobody needs. The adoption gate ret
 
 **Records.** When `verify` confirms that a night created a skill or built a script, it writes one record per artifact: `artifact:skill:<name>` or `artifact:script:<name>` in the `dreaming` KV namespace. A script record also stores the script source, so a deleted script can be restored. Records have no expiry.
 
+**Provenance.** Any agent can write to the `dreaming` KV namespace, so `adoption` and `dream-rollback` act on a record only when the workflow engine's own output backs it. The record's `runId` must be a run of the seeded `dreaming` workflow, and that run's `verify` step must have run the global `dream-verify`. The step's output must also list the record's key as written and confirm the same skill id, or the same script name, scope and contentHash. A record that fails this check is skipped with a reason. It is never retired, marked adopted or restored. An artifact's age counts from no earlier than its run's start.
+
 **Counts.** Each night, `adoption` counts the uses of every `active` record since it was created:
 
 | Artifact | A use is |

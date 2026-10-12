@@ -12,6 +12,7 @@ import { z } from "zod";
 // A use is a skill_invocations row, a script_runs row more than an hour after the build (the build-time controls
 // run within minutes of it), or a swarm-script workflow step whose node names the script. Dreaming's own workflow
 // runs never count. `gateDays` 0 counts but never retires. dryRun reports `wouldRetire` and writes nothing.
+// A record is acted on only with provenance (see `provenance`): the KV namespace is writable by any agent.
 // Never throws: errors go to `errors[]`.
 
 const scalar = z.union([z.string(), z.number(), z.boolean()]).nullable().optional();
@@ -180,6 +181,45 @@ export default async function (args: unknown, ctx: ScriptContext) {
       [name, ...wf, name, name, name, name],
     )) ?? null;
 
+  // Provenance. Any agent can kv_set a dreaming/artifact:* record, so its fields prove nothing on their own. A record
+  // is trusted only when its runId is a run of the seeded dreaming workflow (named dreaming, no creating agent) whose
+  // `verify` step ran the global dream-verify (a contentHash in that script's history; global writes are Lead-only)
+  // and whose output lists this key as written and confirms the same skill id, or script name, scope and contentHash.
+  // Step outputs are written by the workflow engine, not by a KV write. Returns the run's start, or why it failed.
+  const provenance = async (key: string, kind: string, name: string, rec: any) => {
+    const runOf = typeof rec.runId === "string" ? rec.runId : "";
+    if (!runOf) return { reason: "record has no runId" };
+    const scope = rec.scope === "global" ? "global" : "agent";
+    const r = await q(
+      `provenance ${key}`,
+      `SELECT r.startedAt,
+         (json_extract(s.output, '$.scriptName') = 'dream-verify' AND json_extract(s.output, '$.contentHash') IN (
+           SELECT g.contentHash FROM scripts g WHERE g.name = 'dream-verify' AND g.scope = 'global'
+           UNION SELECT v.contentHash FROM script_versions v JOIN scripts g ON g.id = v.scriptId
+             WHERE g.name = 'dream-verify' AND g.scope = 'global')) verifier,
+         EXISTS (SELECT 1 FROM json_each(s.output, '$.result.artifacts.written') j WHERE j.value = ?) written,
+         EXISTS (SELECT 1 FROM json_each(s.output, '$.result.confirmed') c WHERE CASE ?
+           WHEN 'skill' THEN json_extract(c.value, '$.lane') = 'skills' AND json_extract(c.value, '$.skillId') = ?
+           ELSE json_extract(c.value, '$.lane') = 'scriptify' AND json_extract(c.value, '$.name') = ?
+             AND (CASE WHEN json_extract(c.value, '$.scope') = 'global' THEN 'global' ELSE 'agent' END) = ?
+             AND json_extract(c.value, '$.contentHash') = ? END) confirmed
+       FROM workflow_runs r
+       JOIN workflows w ON w.id = r.workflowId
+       JOIN workflow_run_steps s ON s.runId = r.id AND s.nodeId = 'verify'
+       WHERE r.id = ? AND w.name = 'dreaming' AND w.createdByAgentId IS NULL AND json_valid(s.output)
+       ORDER BY verifier + written + confirmed DESC LIMIT 1`,
+      [key, kind, String(rec.id ?? ""), name, scope, String(rec.contentHash ?? ""), runOf],
+    );
+    if (!r) return { reason: "provenance read failed" };
+    const p = r[0];
+    if (!p) return { reason: `run ${runOf} is not a seeded dreaming run with a verify step` };
+    if (!Number(p.verifier)) return { reason: `run ${runOf} verify step did not run the global dream-verify` };
+    if (!Number(p.written)) return { reason: `run ${runOf} verify step did not write ${key}` };
+    if (!Number(p.confirmed))
+      return { reason: `run ${runOf} verify step confirmed no ${kind} with this record's ${kind === "skill" ? "id" : "scope and contentHash"}` };
+    return { startedAt: String(p.startedAt ?? "") };
+  };
+
   // Artifact records, stored bytes (hex) so the script source survives the scrubber.
   const records: Array<{ key: string; rec: any }> = [];
   const kv = await q(
@@ -210,17 +250,33 @@ export default async function (args: unknown, ctx: ScriptContext) {
 
   let checked = 0;
   for (const { key, rec } of records) {
+    // Kind and name come from the key, which is what verify's output lists; a record that disagrees is not one.
     const parts = key.slice(PREFIX.length).split(":");
-    const kind = String(rec.kind ?? parts[0] ?? "");
-    const name = String(rec.name ?? parts.slice(1).join(":"));
+    const kind = String(parts[0] ?? "");
+    const name = parts.slice(1).join(":");
     const status = String(rec.status ?? "active");
     if (status !== "active") continue; // adopted, retired, restored: the gate is done with it
     checked++;
-    const createdMs = Date.parse(String(rec.createdAt ?? ""));
-    if (!Number.isFinite(createdMs) || (kind !== "skill" && kind !== "script") || !name) {
+    let createdMs = Date.parse(String(rec.createdAt ?? ""));
+    if (
+      !Number.isFinite(createdMs) ||
+      (kind !== "skill" && kind !== "script") ||
+      !name ||
+      String(rec.kind ?? kind) !== kind ||
+      String(rec.name ?? name) !== name
+    ) {
       skipped.push({ key, reason: "record has no valid kind, name or createdAt" });
       continue;
     }
+    // Never retired, never marked adopted without provenance.
+    const prov: any = await provenance(key, kind, name, rec);
+    if (prov.reason) {
+      skipped.push({ key, kind, name, id: rec.id ?? null, reason: `no provenance: ${prov.reason}` });
+      continue;
+    }
+    // The artifact cannot predate the run that built it: a backdated createdAt does not age it.
+    const runMs = Date.parse(prov.startedAt);
+    if (Number.isFinite(runMs) && runMs > createdMs) createdMs = runMs;
     const ageDays = round1((now - createdMs) / DAY_MS);
     const item: any = { kind, name, id: rec.id ?? null, ageDays, key };
     try {

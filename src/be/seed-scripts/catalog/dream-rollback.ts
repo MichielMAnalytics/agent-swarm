@@ -295,6 +295,41 @@ export default async function (args: unknown, ctx: ScriptContext) {
   return done();
 }
 
+// Provenance, the same rule as dream-adoption: any agent can kv_set a dreaming/artifact:* record, and a restore
+// re-enables its skill id or upserts its `source`. The record's run must be a seeded dreaming run whose `verify` step
+// ran the global dream-verify and lists this key as written, confirming the same skill id, or script name, scope and
+// contentHash. Returns why provenance fails, or "" when it holds.
+async function provenanceFailure(q: (sql: string, params?: unknown[]) => Promise<any[]>, key: string, kind: string, name: string, rec: any): Promise<string> {
+  const runOf = typeof rec.runId === "string" ? rec.runId : "";
+  if (!runOf) return "record has no runId";
+  if (String(rec.kind ?? kind) !== kind || String(rec.name ?? name) !== name) return "record kind or name differs from its key";
+  const r = await q(
+    `SELECT
+       (json_extract(s.output, '$.scriptName') = 'dream-verify' AND json_extract(s.output, '$.contentHash') IN (
+         SELECT g.contentHash FROM scripts g WHERE g.name = 'dream-verify' AND g.scope = 'global'
+         UNION SELECT v.contentHash FROM script_versions v JOIN scripts g ON g.id = v.scriptId
+           WHERE g.name = 'dream-verify' AND g.scope = 'global')) verifier,
+       EXISTS (SELECT 1 FROM json_each(s.output, '$.result.artifacts.written') j WHERE j.value = ?) written,
+       EXISTS (SELECT 1 FROM json_each(s.output, '$.result.confirmed') c WHERE CASE ?
+         WHEN 'skill' THEN json_extract(c.value, '$.lane') = 'skills' AND json_extract(c.value, '$.skillId') = ?
+         ELSE json_extract(c.value, '$.lane') = 'scriptify' AND json_extract(c.value, '$.name') = ?
+           AND (CASE WHEN json_extract(c.value, '$.scope') = 'global' THEN 'global' ELSE 'agent' END) = ?
+           AND json_extract(c.value, '$.contentHash') = ? END) confirmed
+     FROM workflow_runs r
+     JOIN workflows w ON w.id = r.workflowId
+     JOIN workflow_run_steps s ON s.runId = r.id AND s.nodeId = 'verify'
+     WHERE r.id = ? AND w.name = 'dreaming' AND w.createdByAgentId IS NULL AND json_valid(s.output)
+     ORDER BY verifier + written + confirmed DESC LIMIT 1`,
+    [key, kind, String(rec.id ?? ""), name, rec.scope === "global" ? "global" : "agent", String(rec.contentHash ?? ""), runOf],
+  );
+  const p = r[0];
+  if (!p) return `run ${runOf} is not a seeded dreaming run with a verify step`;
+  if (!Number(p.verifier)) return `run ${runOf} verify step did not run the global dream-verify`;
+  if (!Number(p.written)) return `run ${runOf} verify step did not write ${key}`;
+  if (!Number(p.confirmed)) return `run ${runOf} verify step confirmed no ${kind} with this record's ${kind === "skill" ? "id" : "scope and contentHash"}`;
+  return "";
+}
+
 /** mode "artifact": bring back one skill or script the adoption gate retired. Never throws. */
 async function rollbackArtifact(a: any, ctx: ScriptContext, dry: boolean) {
   const restored: any[] = [];
@@ -315,6 +350,8 @@ async function rollbackArtifact(a: any, ctx: ScriptContext, dry: boolean) {
     let rec: any = null;
     try { rec = kv.length ? JSON.parse(decodeHex(kv[0].hx)) : null; } catch {}
     if (!rec || typeof rec !== "object") { failed.push({ key, reason: "no artifact record" }); return done(); }
+    const why = await provenanceFailure(q, key, kind, name, rec);
+    if (why) { failed.push({ key, reason: `no provenance: ${why}` }); return done(); }
     const mark = async (extra: Record<string, unknown>) =>
       ctx.swarm.kv_set({ namespace: NS, key, value: { ...rec, ...extra, status: "restored", restoredAt: new Date().toISOString() } as any });
 

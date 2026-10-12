@@ -224,13 +224,51 @@ function insertSchedule(name: string, taskTemplate: string) {
   );
 }
 
-async function putArtifact(kind: "skill" | "script", name: string, rec: Record<string, unknown>) {
-  await upsertKv({
-    namespace: NS,
-    key: `artifact:${kind}:${name}`,
-    value: { kind, name, runId: "build-run", status: "active", ...rec },
-    valueType: "json",
-  });
+/** A `verify` step as the engine stores a swarm-script node's output. */
+function insertVerifyStep(
+  runId: string,
+  startedAt: string,
+  o: { written: string[]; confirmed: unknown[]; scriptName?: string; contentHash?: string },
+) {
+  const output = {
+    result: { artifacts: { written: o.written, kept: [] }, confirmed: o.confirmed },
+    stdout: "",
+    stderr: "",
+    exitCode: 0,
+    scriptName: o.scriptName ?? "dream-verify",
+    contentHash: o.contentHash ?? VERIFY_HASH,
+    version: 1,
+  };
+  getDb().run(
+    `INSERT INTO workflow_run_steps (id, runId, nodeId, nodeType, status, startedAt, finishedAt, output) VALUES (?, ?, 'verify', 'swarm-script', 'completed', ?, ?, ?)`,
+    [crypto.randomUUID(), runId, startedAt, startedAt, JSON.stringify(output)],
+  );
+}
+
+const confirmedFor = (kind: "skill" | "script", name: string, rec: Record<string, unknown>) =>
+  kind === "skill"
+    ? { actionId: "a1", lane: "skills", skillId: rec.id, version: 1 }
+    : { actionId: "a1", lane: "scriptify", name, scope: rec.scope, contentHash: rec.contentHash };
+
+/**
+ * Writes an artifact record. Unless `forged`, it also writes what a genuine dreaming run leaves behind: a run of the
+ * seeded dreaming workflow, started a minute before the build, whose verify step lists and confirms this artifact.
+ */
+async function putArtifact(
+  kind: "skill" | "script",
+  name: string,
+  rec: Record<string, unknown>,
+  o: { forged?: boolean } = {},
+) {
+  const key = `artifact:${kind}:${name}`;
+  const value: Record<string, unknown> = { kind, name, status: "active", ...rec };
+  if (!o.forged && value.runId === undefined) {
+    const at = typeof rec.createdAt === "string" ? after(rec.createdAt, -60_000) : daysAgo(30);
+    const buildRun = insertRun(DREAMING_WF, at);
+    insertVerifyStep(buildRun, at, { written: [key], confirmed: [confirmedFor(kind, name, rec)] });
+    value.runId = buildRun;
+  }
+  await upsertKv({ namespace: NS, key, value, valueType: "json" });
 }
 
 async function skillArtifact(name: string, ageDays: number): Promise<string> {
@@ -281,6 +319,9 @@ const scriptRow = (name: string, owner: string) =>
 // The current dreaming run: its workflow is excluded from every count.
 let DREAMING_WF = "";
 let RUN_ID = "";
+// The seeded global dream-verify: a verify step proves provenance only when it ran a version of this row.
+const VERIFY_SOURCE = "export default async () => ({ verified: true });\n";
+let VERIFY_HASH = "";
 
 beforeAll(async () => {
   await removeDbFiles(TEST_DB_PATH);
@@ -319,6 +360,10 @@ beforeEach(() => {
   ]);
   RUN_ID = insertRun(DREAMING_WF, ago(60_000));
   insertStep(RUN_ID, "gather", "swarm-script", ago(60_000));
+  VERIFY_HASH = insertScript("dream-verify", VERIFY_SOURCE, {
+    scope: "global",
+    createdAt: daysAgo(60),
+  }).contentHash;
 });
 
 const live = (extra: Record<string, unknown> = {}) => ({
@@ -762,6 +807,174 @@ describe("artifact owner is not the caller", () => {
     expect(asOwner.failed).toEqual([]);
     expect(scriptRow("open-pr-count", WORKER)).toMatchObject({ contentHash: art.contentHash });
     expect(scriptRow("open-pr-count", LEAD_ID)).toMatchObject({ id: leadRow.id });
+  });
+});
+
+describe("artifact provenance", () => {
+  const WORKER = "00000000-0000-4000-8000-0000000000bb";
+  // Another agent's live skill: not systemDefault, 0 uses, well past the gate.
+  const victimSkill = () => insertSkill("deploy-checklist", daysAgo(40));
+  const forgedSkill = (id: string, extra: Record<string, unknown> = {}) =>
+    putArtifact(
+      "skill",
+      "deploy-checklist",
+      { id, scope: "swarm", agentId: WORKER, createdAt: daysAgo(40), contentHash: "x", ...extra },
+      { forged: true },
+    );
+  const noProvenance = (r: any, name: string) =>
+    expect(r.skipped).toEqual([
+      expect.objectContaining({ name, reason: expect.stringContaining("no provenance:") }),
+    ]);
+
+  test("a forged skill record is skipped and the skill stays enabled", async () => {
+    const id = victimSkill();
+    const cases: Array<[string, () => Promise<void>]> = [
+      ["no such run", () => forgedSkill(id, { runId: crypto.randomUUID() })],
+      [
+        // A genuine dreaming run that built a different skill: the forged record borrows its runId.
+        "a real run that confirmed another skill",
+        async () => {
+          const run = insertRun(DREAMING_WF, daysAgo(40));
+          insertVerifyStep(run, daysAgo(40), {
+            written: ["artifact:skill:deploy-checklist"],
+            confirmed: [{ lane: "skills", skillId: crypto.randomUUID() }],
+          });
+          await forgedSkill(id, { runId: run });
+        },
+      ],
+      [
+        // An agent-made copy of dreaming (names are unique), with a verify step that lists the victim.
+        "a workflow an agent created",
+        async () => {
+          const wf = insertWorkflow(`dreaming-copy-${crypto.randomUUID()}`, []);
+          getDb().run("UPDATE workflows SET createdByAgentId = ? WHERE id = ?", [WORKER, wf]);
+          const run = insertRun(wf, daysAgo(40));
+          insertVerifyStep(run, daysAgo(40), {
+            written: ["artifact:skill:deploy-checklist"],
+            confirmed: [{ lane: "skills", skillId: id }],
+          });
+          await forgedSkill(id, { runId: run });
+        },
+      ],
+      [
+        // The seeded row deleted and an agent recreating "dreaming": it has a creating agent.
+        "a dreaming workflow an agent created",
+        async () => {
+          getDb().run("UPDATE workflows SET createdByAgentId = ? WHERE id = ?", [
+            WORKER,
+            DREAMING_WF,
+          ]);
+          const run = insertRun(DREAMING_WF, daysAgo(40));
+          insertVerifyStep(run, daysAgo(40), {
+            written: ["artifact:skill:deploy-checklist"],
+            confirmed: [{ lane: "skills", skillId: id }],
+          });
+          await forgedSkill(id, { runId: run });
+        },
+      ],
+      [
+        // The seeded workflow, but its verify node ran some other source.
+        "a verify step that did not run the global dream-verify",
+        async () => {
+          const run = insertRun(DREAMING_WF, daysAgo(40));
+          insertVerifyStep(run, daysAgo(40), {
+            written: ["artifact:skill:deploy-checklist"],
+            confirmed: [{ lane: "skills", skillId: id }],
+            contentHash: sha256("export default async () => ({ forged: true });\n"),
+          });
+          await forgedSkill(id, { runId: run });
+        },
+      ],
+    ];
+    for (const [label, forge] of cases) {
+      getDb().run("DELETE FROM kv_entries WHERE namespace = ?", [NS]);
+      await forge();
+      const h = harness();
+      const r: any = await dreamAdoption(live(), h.ctx);
+      if (r.retired.length || r.adopted.length)
+        throw new Error(`${label}: acted on a forged record`);
+      noProvenance(r, "deploy-checklist");
+      expect(writesIn(h.calls)).toEqual([]);
+      expect(skillEnabled(id)).toBe(1);
+      expect((await record("skill", "deploy-checklist")).status).toBe("active");
+      getDb().run("UPDATE workflows SET createdByAgentId = NULL WHERE id = ?", [DREAMING_WF]);
+    }
+  });
+
+  test("a forged script record is never deleted, delegated or restored from its source", async () => {
+    const source = 'export default async () => ({ owner: "lead" });\n';
+    const row = insertScript("nightly-digest", source, { createdAt: daysAgo(40) });
+    await putArtifact(
+      "script",
+      "nightly-digest",
+      {
+        id: row.id,
+        scope: "agent",
+        agentId: LEAD_ID,
+        createdAt: daysAgo(40),
+        contentHash: row.contentHash,
+        source,
+        runId: crypto.randomUUID(),
+      },
+      { forged: true },
+    );
+    const h = harness();
+    const r: any = await dreamAdoption(live(), h.ctx);
+    noProvenance(r, "nightly-digest");
+    expect(writesIn(h.calls)).toEqual([]);
+    expect(scriptRow("nightly-digest", LEAD_ID)).toMatchObject({ id: row.id });
+
+    // A forged "retired" global record would have the Lead upsert attacker source on rollback.
+    const evil = "export default async () => ({ evil: true });\n";
+    await putArtifact(
+      "script",
+      "shared-helper",
+      {
+        scope: "global",
+        createdAt: daysAgo(40),
+        contentHash: sha256(evil),
+        source: evil,
+        status: "retired",
+        runId: RUN_ID,
+      },
+      { forged: true },
+    );
+    const h2 = harness();
+    const rb: any = await dreamRollback(
+      { mode: "artifact", kind: "script", name: "shared-helper" },
+      h2.ctx,
+    );
+    expect(rb.restored).toEqual([]);
+    expect(rb.failed[0].reason).toContain("no provenance:");
+    expect(writesIn(h2.calls)).toEqual([]);
+    expect(scriptCount("shared-helper")).toBe(0);
+  });
+
+  test("a genuine record still retires next to a forged one; a backdated createdAt does not age it", async () => {
+    const victim = victimSkill();
+    await forgedSkill(victim, { runId: crypto.randomUUID() });
+    const genuine = await skillArtifact("triage-flaky-ci", 15);
+    const g = await scriptArtifact("open-pr-count", 15);
+    // A genuine run two days ago whose record claims a 40-day-old createdAt: pending, not retired.
+    const runAt = daysAgo(2);
+    const young = insertSkill("young-skill", runAt);
+    const run = insertRun(DREAMING_WF, runAt);
+    insertVerifyStep(run, runAt, {
+      written: ["artifact:skill:young-skill"],
+      confirmed: [{ lane: "skills", skillId: young }],
+    });
+    await putArtifact("skill", "young-skill", { id: young, createdAt: daysAgo(40), runId: run });
+
+    const r: any = await dreamAdoption(live(), harness().ctx);
+    expect(r.errors).toEqual([]);
+    expect(r.retired.map((x: any) => x.name).sort()).toEqual(["open-pr-count", "triage-flaky-ci"]);
+    expect(skillEnabled(genuine)).toBe(0);
+    expect(scriptRow("open-pr-count", LEAD_ID)).toBeNull();
+    expect(g.id).toBeTruthy();
+    noProvenance(r, "deploy-checklist");
+    expect(skillEnabled(victim)).toBe(1);
+    expect(r.pending).toEqual([expect.objectContaining({ name: "young-skill", ageDays: 2 })]);
+    expect(skillEnabled(young)).toBe(1);
   });
 });
 
