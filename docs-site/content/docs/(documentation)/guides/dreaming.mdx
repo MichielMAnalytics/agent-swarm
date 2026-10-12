@@ -51,7 +51,7 @@ flowchart TD
 4. **reports** asks each active agent for a report on its day. `reports-check` and `reports-retry` chase missing reports once.
 5. **synthesize** is a lead task. It reads the merged reports and proposes actions, only for lanes that are on.
 6. **apply** runs the identity and memory actions. **trim** shortens agent profiles. The **hb-** steps prune the lead's heartbeat checklist. See [Heartbeat prune](/docs/guides/dreaming-heartbeat-prune).
-7. **skills** is a lead task that creates and updates skills. **scriptify** is a worker task that builds new scripts at agent scope and proves each one with a positive and a negative control run. Each runs only when its lane is on and `synthesize` approved work for it.
+7. **skills** is a lead task that creates and updates skills. **scriptify** is a worker task that builds new scripts at agent scope and proves each one with a positive and a negative control run. Each runs only when its lane is on and `synthesize` approved auto-tier work for it. A propose-tier action is never built; it goes to its owner.
 8. **verify** re-reads every change and compares it with what each step claimed. **learn** scores past cuts: a cut that was reverted or added back gets pinned so dreaming does not cut it again. **owners** sends follow-up tasks for items that need a human or an agent decision.
 9. **publish** writes the nightly report. **slack** posts a short summary when a channel is set and the night was live.
 

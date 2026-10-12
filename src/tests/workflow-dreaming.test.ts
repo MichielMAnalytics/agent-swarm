@@ -451,9 +451,13 @@ describe("dreaming template", () => {
     expect(skillsGate({ g: g(), s: { actions: [{ ...autoSkill, lane: "memory" }] } })).toBe("skip");
     expect(skillsGate({ g: g(), s: "" })).toBe("skip");
 
-    const scriptAction = { id: "A2", lane: "scriptify", tier: "propose", op: "script-build" };
+    const scriptAction = { id: "A2", lane: "scriptify", tier: "auto", op: "script-build" };
     const scriptifyGate = gate("scriptify-gate");
     expect(scriptifyGate({ g: g(), s: { actions: [scriptAction] } })).toBe("run");
+    // A propose-tier build needs an owner's decision: the gate skips, so nothing builds it.
+    const proposeScript = { ...scriptAction, tier: "propose" };
+    expect(scriptifyGate({ g: g(), s: { actions: [proposeScript] } })).toBe("skip");
+    expect(scriptifyGate({ g: g(), s: { actions: [proposeScript, scriptAction] } })).toBe("run");
     expect(
       scriptifyGate({
         g: g({ lanes: { ...LANES_ON, scriptify: false } }),
@@ -752,7 +756,19 @@ describe("dreaming engine runs", () => {
       const synth = await waitStep(runId, "synthesize");
       await complete(runId, synth.id, {
         headline: "quiet night",
-        actions: [],
+        // A propose-tier build waits for its owner: the scriptify lane must not build it.
+        actions: [
+          {
+            id: "A1",
+            lane: "scriptify",
+            tier: "propose",
+            op: "script-build",
+            owner: lead.id,
+            target: {},
+            reason: "repeated release-notes lookup",
+            evidence: ["task"],
+          },
+        ],
         rejected: [],
         restores: [],
         missingReports: [],
