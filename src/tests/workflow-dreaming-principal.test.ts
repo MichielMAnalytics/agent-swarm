@@ -32,6 +32,7 @@ import {
   updateWorkflow,
   upsertKv,
 } from "../be/db";
+import { deleteScript, getScript, upsertScriptByName } from "../be/scripts/db";
 import { setScriptEmbeddingProviderForTests } from "../be/scripts/embeddings";
 import { runAllSeeders } from "../be/seed/registry";
 import { recordSeedState } from "../be/seed/state-db";
@@ -39,6 +40,7 @@ import {
   resolveSeededWorkflowPrincipal,
   seededLeadPrincipalWorkflowNames,
 } from "../be/seed/workflows-seeder";
+import { SEED_SCRIPTS } from "../be/seed-scripts";
 import { resolveHttpRequestAuth } from "../http/auth";
 import { handleDbQuery } from "../http/db-query";
 import { handleKv } from "../http/kv";
@@ -286,101 +288,191 @@ describe("seeded dreaming on the real script runtime", () => {
     180_000,
   );
 
+  /**
+   * One enabled live dreaming run on a scheduled trigger (no creator, no trigger agent),
+   * with the agent steps completed by hand. Returns the gather and apply results.
+   */
+  async function runLiveDreaming(): Promise<{ gather: any; apply: any }> {
+    await updateAgentProfile(WORKER_ID, { claudeMd: CLAUDE_MD });
+    const now = new Date().toISOString();
+    await getDbClient().run(
+      `INSERT INTO agent_tasks (id, agentId, task, status, source, createdAt, lastUpdatedAt, finishedAt, key)
+         VALUES (?, ?, 'tidy the release board', 'completed', 'mcp', ?, ?, ?, 'shared/')`,
+      [crypto.randomUUID(), LEAD_ID, now, now, now],
+    );
+    // A prior green dry run admits live mode.
+    await upsertKv({
+      namespace: "dreaming",
+      key: "state:last-green-dry-run",
+      value: { runId: "earlier-dry-run", at: now },
+      valueType: "json",
+    });
+    process.env.DREAMING_ENABLED = "true";
+    process.env.DREAMING_LANE_HEARTBEAT = "false";
+    process.env.DREAMING_LANE_TRIM = "false";
+    try {
+      const { bus, registry } = realRegistry();
+      const complete = async (runId: string, stepId: string, output: unknown) => {
+        const task = await getTaskByWorkflowRunStepId(stepId);
+        const text = JSON.stringify(output);
+        await completeTask(task!.id, text);
+        bus.emit("task.completed", {
+          taskId: task!.id,
+          output: text,
+          workflowRunId: runId,
+          workflowRunStepId: stepId,
+        });
+      };
+      const waitStep = async (runId: string, nodeId: string) => {
+        const stepOf = async () =>
+          (await getWorkflowRunStepsByRunId(runId)).find((s) => s.nodeId === nodeId);
+        await waitFor(async () => {
+          const step = await stepOf();
+          return !!step && (await getTaskByWorkflowRunStepId(step.id)) !== null;
+        }, `task for ${nodeId}`);
+        return (await stepOf())!;
+      };
+
+      // Earlier runs in this file would trip the 60-minute cooldown; age them out.
+      const workflow = await seededDreaming();
+      const aged = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+      await getDbClient().run(
+        `UPDATE workflow_runs SET startedAt = ?, finishedAt = CASE WHEN finishedAt IS NULL THEN NULL ELSE ? END
+         WHERE workflowId = ?`,
+        [aged, aged, workflow.id],
+      );
+      // Scheduled-trigger shape: no agentId in the trigger, no creator on the row.
+      const runId = await startWorkflowExecution(workflow, {}, registry, {
+        triggerType: "schedule",
+      });
+      const report = await waitStep(runId, `reports#${LEAD_ID}`);
+      await complete(runId, report.id, {
+        agentId: LEAD_ID,
+        summary: "Tidied the release board.",
+        repeatedProcedures: [],
+        skillFriction: [],
+        scriptCandidates: [],
+        identityOps: [],
+        memoryOps: [],
+      });
+      const synth = await waitStep(runId, "synthesize");
+      await complete(runId, synth.id, {
+        headline: "drop a stale section",
+        actions: [REMOVE_STALE],
+        rejected: [],
+        restores: [],
+        missingReports: [],
+        notes: "",
+        changelogComment: "",
+      });
+      const publish = await waitStep(runId, "publish");
+      await complete(runId, publish.id, { slackText: "dreaming: one edit", trimsLine: "" });
+      await waitFor(async () => isTerminal((await getWorkflowRun(runId))?.status), "run end");
+
+      const steps = await getWorkflowRunStepsByRunId(runId);
+      const out = (id: string) =>
+        (steps.find((s) => s.nodeId === id)?.output as { result: any } | undefined)?.result;
+      return { gather: out("gather"), apply: out("apply") };
+    } finally {
+      for (const key of DREAMING_ENV) delete process.env[key];
+    }
+  }
+
+  /** Who wrote the latest claudeMd version of the worker. */
+  async function lastClaudeWriter(): Promise<string | null | undefined> {
+    const version = await getDbClient().get<{ changedByAgentId: string | null }>(
+      `SELECT changedByAgentId FROM context_versions WHERE agentId = ? AND field = 'claudeMd'
+       ORDER BY version DESC LIMIT 1`,
+      [WORKER_ID],
+    );
+    return version?.changedByAgentId;
+  }
+
+  async function writeGlobalDreamApply(source: string) {
+    const current = await getScript({ name: "dream-apply", scope: "global" });
+    const shipped = SEED_SCRIPTS.find((s) => s.name === "dream-apply")!;
+    return upsertScriptByName({
+      name: "dream-apply",
+      scope: "global",
+      scopeId: null,
+      source,
+      description: shipped.description,
+      intent: shipped.intent,
+      signatureJson: current?.signatureJson ?? "{}",
+      argsJsonSchema: current?.argsJsonSchema ?? null,
+      typeChecked: true,
+      embeddingMode: "skip",
+    });
+  }
+
+  const pristineDreamApply = () => SEED_SCRIPTS.find((s) => s.name === "dream-apply")!.source;
+
+  /** An auto identity edit the shipped dream-apply makes as Lead; any other principal is refused. */
+  async function expectNotLead(run: { gather: any; apply: any }) {
+    // The other dreaming nodes are pristine and still run as the Lead.
+    expect(run.gather).toMatchObject({ mode: "live", dryRun: false, leadId: LEAD_ID });
+    expect(run.apply?.applied ?? []).toEqual([]);
+    expect(await workerClaude()).toBe(CLAUDE_MD);
+    expect(await lastClaudeWriter()).not.toBe(LEAD_ID);
+  }
+
   spawnTest(
     "enabled live run on a scheduled trigger applies the identity edit as the Lead",
     async () => {
-      await updateAgentProfile(WORKER_ID, { claudeMd: CLAUDE_MD });
-      const now = new Date().toISOString();
-      await getDbClient().run(
-        `INSERT INTO agent_tasks (id, agentId, task, status, source, createdAt, lastUpdatedAt, finishedAt, key)
-         VALUES (?, ?, 'tidy the release board', 'completed', 'mcp', ?, ?, ?, 'shared/')`,
-        [crypto.randomUUID(), LEAD_ID, now, now, now],
-      );
-      // A prior green dry run admits live mode.
-      await upsertKv({
-        namespace: "dreaming",
-        key: "state:last-green-dry-run",
-        value: { runId: "earlier-dry-run", at: now },
-        valueType: "json",
+      const { gather, apply } = await runLiveDreaming();
+      expect(gather).toMatchObject({ mode: "live", dryRun: false, leadId: LEAD_ID });
+      expect({ refused: apply?.refused, silently: apply?.refusedSilently }).toEqual({
+        refused: [],
+        silently: [],
       });
-      process.env.DREAMING_ENABLED = "true";
-      process.env.DREAMING_LANE_HEARTBEAT = "false";
-      process.env.DREAMING_LANE_TRIM = "false";
+      expect(apply?.applied?.map((a: any) => a.actionId)).toEqual(["A1"]);
+
+      // Re-read: the section is gone, and the version row names the Lead as the writer.
+      const claude = await workerClaude();
+      expect(claude).toContain("## Rules");
+      expect(claude).not.toContain("## Stale");
+      expect(await lastClaudeWriter()).toBe(LEAD_ID);
+    },
+    240_000,
+  );
+
+  spawnTest(
+    "an edited global dream-apply runs as a non-Lead principal and the write is refused",
+    async () => {
+      const pristine = await getScript({ name: "dream-apply", scope: "global" });
+      const edited = await writeGlobalDreamApply(
+        `${pristineDreamApply()}\nexport const userEdited = true;\n`,
+      );
+      expect(edited.script.id).toBe(pristine!.id);
+      expect(edited.script.contentHash).not.toBe(pristine!.contentHash);
       try {
-        const { bus, registry } = realRegistry();
-        const complete = async (runId: string, stepId: string, output: unknown) => {
-          const task = await getTaskByWorkflowRunStepId(stepId);
-          const text = JSON.stringify(output);
-          await completeTask(task!.id, text);
-          bus.emit("task.completed", {
-            taskId: task!.id,
-            output: text,
-            workflowRunId: runId,
-            workflowRunStepId: stepId,
-          });
-        };
-        const waitStep = async (runId: string, nodeId: string) => {
-          const stepOf = async () =>
-            (await getWorkflowRunStepsByRunId(runId)).find((s) => s.nodeId === nodeId);
-          await waitFor(async () => {
-            const step = await stepOf();
-            return !!step && (await getTaskByWorkflowRunStepId(step.id)) !== null;
-          }, `task for ${nodeId}`);
-          return (await stepOf())!;
-        };
-
-        // Scheduled-trigger shape: no agentId in the trigger, no creator on the row.
-        const runId = await startWorkflowExecution(await seededDreaming(), {}, registry, {
-          triggerType: "schedule",
-        });
-        const report = await waitStep(runId, `reports#${LEAD_ID}`);
-        await complete(runId, report.id, {
-          agentId: LEAD_ID,
-          summary: "Tidied the release board.",
-          repeatedProcedures: [],
-          skillFriction: [],
-          scriptCandidates: [],
-          identityOps: [],
-          memoryOps: [],
-        });
-        const synth = await waitStep(runId, "synthesize");
-        await complete(runId, synth.id, {
-          headline: "drop a stale section",
-          actions: [REMOVE_STALE],
-          rejected: [],
-          restores: [],
-          missingReports: [],
-          notes: "",
-          changelogComment: "",
-        });
-        const publish = await waitStep(runId, "publish");
-        await complete(runId, publish.id, { slackText: "dreaming: one edit", trimsLine: "" });
-        await waitFor(async () => isTerminal((await getWorkflowRun(runId))?.status), "run end");
-
-        const steps = await getWorkflowRunStepsByRunId(runId);
-        const out = (id: string) =>
-          (steps.find((s) => s.nodeId === id)?.output as { result: any } | undefined)?.result;
-        expect(out("gather")).toMatchObject({ mode: "live", dryRun: false, leadId: LEAD_ID });
-        const apply = out("apply");
-        expect({ refused: apply?.refused, silently: apply?.refusedSilently }).toEqual({
-          refused: [],
-          silently: [],
-        });
-        expect(apply?.applied?.map((a: any) => a.actionId)).toEqual(["A1"]);
-
-        // Re-read: the section is gone, and the version row names the Lead as the writer.
-        const claude = await workerClaude();
-        expect(claude).toContain("## Rules");
-        expect(claude).not.toContain("## Stale");
-        const version = await getDbClient().get<{ changedByAgentId: string | null }>(
-          `SELECT changedByAgentId FROM context_versions WHERE agentId = ? AND field = 'claudeMd'
-           ORDER BY version DESC LIMIT 1`,
-          [WORKER_ID],
-        );
-        expect(version?.changedByAgentId).toBe(LEAD_ID);
+        await expectNotLead(await runLiveDreaming());
       } finally {
-        for (const key of DREAMING_ENV) delete process.env[key];
+        await writeGlobalDreamApply(pristineDreamApply());
       }
+    },
+    240_000,
+  );
+
+  spawnTest(
+    "a same-name replacement of dream-apply runs as a non-Lead principal and the write is refused",
+    async () => {
+      const pristine = await getScript({ name: "dream-apply", scope: "global" });
+      expect(await deleteScript({ name: "dream-apply", scope: "global" })).toBe(true);
+      const replaced = await writeGlobalDreamApply(
+        `${pristineDreamApply()}\n// replaced under the same name\n`,
+      );
+      expect(replaced.isNew).toBe(true);
+      expect(replaced.script.id).not.toBe(pristine!.id);
+      try {
+        await expectNotLead(await runLiveDreaming());
+      } finally {
+        await deleteScript({ name: "dream-apply", scope: "global" });
+        await writeGlobalDreamApply(pristineDreamApply());
+      }
+      // The restored row is the shipped source again, for the tests after this one.
+      const restored = await getScript({ name: "dream-apply", scope: "global" });
+      expect(restored?.contentHash).toBe(pristine!.contentHash);
     },
     240_000,
   );

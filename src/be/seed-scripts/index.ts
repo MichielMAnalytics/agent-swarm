@@ -371,6 +371,19 @@ export const SEED_SCRIPTS: SeedScript[] = [
   },
 ];
 
+let shippedHashes: Map<string, string> | undefined;
+
+/**
+ * True when `source` hashes to the catalog source this build ships for `name`.
+ * The catalog is compiled into the binary, so after a release only the new
+ * shipped source matches; an edited or replaced row never does.
+ */
+export function isShippedSeedScriptSource(name: string, source: string): boolean {
+  shippedHashes ??= new Map(SEED_SCRIPTS.map((s) => [s.name, computeContentHash(s.source)]));
+  const shipped = shippedHashes.get(name);
+  return shipped !== undefined && shipped === computeContentHash(source);
+}
+
 /** A catalog entry resolved into a generic {@link SeedItem}. */
 type ScriptSeedItem = SeedItem & { script: SeedScript };
 

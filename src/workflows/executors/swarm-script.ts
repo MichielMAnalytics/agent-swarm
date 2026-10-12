@@ -11,6 +11,7 @@ import {
   touchScratchScriptLastUsed,
 } from "../../be/scripts/db";
 import { resolveSeededWorkflowPrincipal } from "../../be/seed/workflows-seeder";
+import { isShippedSeedScriptSource } from "../../be/seed-scripts";
 import {
   DEFAULT_SCRIPT_RESOURCES,
   MAX_SCRIPT_WALL_CLOCK_MS,
@@ -92,11 +93,26 @@ export class SwarmScriptExecutor extends BaseExecutor<
     const workflow = await this.deps.db.getWorkflow(meta.workflowId);
     // A seeded workflow has no creator and a scheduled trigger no agent; a template
     // that opts in (runAs: "lead") runs its scripts as the current Lead instead.
-    const agentId =
-      workflow?.createdByAgentId ??
-      (workflow ? await resolveSeededWorkflowPrincipal(workflow) : undefined) ??
-      agentIdFromContext(context);
-    const resolved = await resolveScriptSource(config, agentId);
+    const seededPrincipal =
+      workflow && !workflow.createdByAgentId
+        ? await resolveSeededWorkflowPrincipal(workflow)
+        : undefined;
+    let agentId = workflow?.createdByAgentId ?? seededPrincipal ?? agentIdFromContext(context);
+    let resolved = await resolveScriptSource(config, agentId);
+    // Lead only runs the shipped catalog source. Any agent can edit or replace a
+    // global script under the same name, so anything else drops back to the
+    // non-Lead principal before credentials are built.
+    if (
+      seededPrincipal &&
+      resolved.ok &&
+      !(
+        resolved.script.scope === "global" &&
+        isShippedSeedScriptSource(resolved.script.name, resolved.source)
+      )
+    ) {
+      agentId = agentIdFromContext(context);
+      resolved = await resolveScriptSource(config, agentId);
+    }
 
     if (!resolved.ok) {
       return { status: "failed", error: resolved.error };

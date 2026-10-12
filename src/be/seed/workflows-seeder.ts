@@ -259,7 +259,9 @@ export function seededLeadPrincipalWorkflowNames(
  * record exists), and a live definition that still hashes to the shipped
  * template. Any agent can edit a workflow, so an edited copy must not inherit
  * Lead. Returns undefined otherwise, or when no Lead is registered, so the
- * caller fails closed to its existing fallback.
+ * caller fails closed to its existing fallback. This checks the workflow only:
+ * the swarm-script executor also requires each script to be the shipped
+ * catalog source before it runs as this principal.
  */
 export async function resolveSeededWorkflowPrincipal(
   workflow: Workflow,
