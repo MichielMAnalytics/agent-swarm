@@ -21,6 +21,9 @@ import {
 import { setScriptEmbeddingProviderForTests } from "../be/scripts/embeddings";
 import { runAllSeeders } from "../be/seed/registry";
 import { loadSeedWorkflows } from "../be/seed/workflows-seeder";
+import dreamAdoption, {
+  argsSchema as adoptionArgs,
+} from "../be/seed-scripts/catalog/dream-adoption";
 import dreamApply, { argsSchema as applyArgs } from "../be/seed-scripts/catalog/dream-apply";
 import dreamGather, { argsSchema as gatherArgs } from "../be/seed-scripts/catalog/dream-gather";
 import dreamHeartbeat, {
@@ -59,7 +62,7 @@ const TEST_DB_PATH = "./test-workflow-dreaming.sqlite";
 const API_KEY = "example-test-workflow-dreaming-key-1234567890";
 const BUILTIN_ROOTS = new Set(["trigger", "input", "workflow", "swarm", "run"]);
 
-// Every key of the PR-2 Dreaming config group. The drift test proves the template,
+// Every key of the Dreaming config group. The drift test proves the template,
 // the dashboard catalog and the config validators agree on this list.
 const DREAMING_KEYS = [
   "DREAMING_ENABLED",
@@ -67,6 +70,9 @@ const DREAMING_KEYS = [
   "DREAMING_LANE_TRIM",
   "DREAMING_LANE_IDENTITY",
   "DREAMING_LANE_MEMORY",
+  "DREAMING_LANE_SKILLIFY",
+  "DREAMING_LANE_SCRIPTIFY",
+  "DREAMING_ADOPTION_GATE_DAYS",
   "DREAMING_SLACK_CHANNEL",
   "DREAMING_REPORT_TARGET",
   "DREAMING_WORKER_AGENT_ID",
@@ -77,6 +83,9 @@ const DREAMING_KEYS = [
   "DREAMING_CAP_MEMORY_STORE",
   "DREAMING_CAP_MEMORY_EDIT",
   "DREAMING_CAP_MEMORY_DELETE",
+  "DREAMING_CAP_SKILL_CREATE",
+  "DREAMING_CAP_SKILL_UPDATE",
+  "DREAMING_CAP_SCRIPT_BUILDS",
 ];
 // A free-form value (a Slack channel id or name) has nothing to validate.
 const UNVALIDATED_KEYS = new Set(["DREAMING_SLACK_CHANNEL"]);
@@ -87,6 +96,7 @@ type ScriptModule = {
 };
 const SCRIPTS: Record<string, ScriptModule> = {
   "dream-gather": { run: dreamGather, args: gatherArgs },
+  "dream-adoption": { run: dreamAdoption, args: adoptionArgs },
   "dream-reports-check": { run: dreamReportsCheck, args: reportsCheckArgs },
   "dream-apply": { run: dreamApply, args: applyArgs },
   "dream-trim": { run: dreamTrim, args: trimArgs },
@@ -228,18 +238,34 @@ describe("dreaming template", () => {
     expect(wf.requiredParams).toEqual([]);
 
     const ids = new Set(wf.definition.nodes.map((n) => n.id));
-    for (const gone of [
-      "seed-gate",
-      "seed-pr",
+    for (const gone of ["seed-gate", "seed-pr", "memtax-plan", "memtax-create-apply"]) {
+      expect(ids.has(gone)).toBe(false);
+    }
+    for (const present of [
+      "adoption-gate",
+      "adoption",
       "skills-gate",
       "skills",
       "scriptify-gate",
       "scriptify",
-      "memtax-plan",
-      "memtax-create-apply",
     ]) {
-      expect(ids.has(gone)).toBe(false);
+      expect(ids.has(present)).toBe(true);
     }
+    // The adoption gate sits between gather and proceed; the two optional lanes fan out of
+    // hb-apply and rejoin at verify.
+    expect(nodeById("gather").next).toBe("adoption-gate");
+    expect(nodeById("adoption-gate").next).toEqual({ run: "adoption", skip: "proceed" });
+    expect(nodeById("adoption").next).toBe("proceed");
+    expect(nodeById("hb-apply").next).toEqual(["skills-gate", "scriptify-gate"]);
+    expect(nodeById("skills-gate").next).toEqual({ run: "skills", skip: "verify" });
+    expect(nodeById("scriptify-gate").next).toEqual({ run: "scriptify", skip: "verify" });
+    expect(nodeById("skills").next).toBe("verify");
+    expect(nodeById("scriptify").next).toBe("verify");
+    expect(nodeById("verify").inputs).toMatchObject({
+      sk: "skills.taskOutput",
+      sc: "scriptify.taskOutput",
+    });
+    expect(nodeById("publish").inputs).toMatchObject({ ad: "adoption.result" });
 
     for (const node of wf.definition.nodes) {
       const aliases = node.inputs ?? {};
@@ -274,6 +300,8 @@ describe("dreaming template", () => {
       "reports#body": ["{{item.id}}", "regular"],
       "reports-retry#body": ["{{item.id}}", "regular"],
       synthesize: ["{{g.leadId}}", "smart"],
+      skills: ["{{g.leadId}}", "smart"],
+      scriptify: ["{{g.workerId}}", "regular"],
       "trim#body": ["{{g.workerId}}", "regular"],
       "hb-draft": ["{{g.workerId}}", "regular"],
       "lead-disk": ["{{g.leadId}}", "regular"],
@@ -348,13 +376,22 @@ describe("dreaming template", () => {
   });
 
   test("gate truth table", () => {
+    const LANES_ON = {
+      heartbeat: true,
+      trim: true,
+      identity: true,
+      memory: true,
+      skillify: true,
+      scriptify: true,
+    };
     const g = (over: Record<string, unknown> = {}) => ({
       ok: true,
       mode: "live",
       dryRun: false,
       agents: [{ id: "a" }],
-      lanes: { heartbeat: true, trim: true, identity: true, memory: true },
-      cfg: { slackChannel: "dreaming-reports", reportTarget: "page", budgetUsd: 25 },
+      lanes: LANES_ON,
+      caps: { skillCreate: 1, skillUpdate: 3, scriptBuilds: 1 },
+      cfg: { slackChannel: "dreaming-reports", reportTarget: "page", budgetUsd: 25, gateDays: 14 },
       budget: { overBudget: false },
       ...over,
     });
@@ -366,6 +403,71 @@ describe("dreaming template", () => {
     expect(proceed({ g: g({ agents: [] }) })).toBe("skip");
     expect(proceed({ g: g({ ok: false, reason: "no lead" }) })).toBe("skip");
     expect(proceed({})).toBe("skip");
+
+    // The adoption gate runs whenever dreaming is on with a Lead, quiet nights included.
+    const adoptionGate = gate("adoption-gate");
+    expect(adoptionGate({ g: g() })).toBe("run");
+    expect(adoptionGate({ g: g({ agents: [] }) })).toBe("run");
+    expect(adoptionGate({ g: g({ mode: "dry-run", dryRun: true }) })).toBe("run");
+    expect(adoptionGate({ g: g({ mode: "off" }) })).toBe("skip");
+    expect(adoptionGate({ g: g({ ok: false, reason: "no lead" }) })).toBe("skip");
+    expect(adoptionGate({})).toBe("skip");
+
+    const autoSkill = { id: "A1", lane: "skillify", tier: "auto", op: "skill-create" };
+    const skillsGate = gate("skills-gate");
+    expect(skillsGate({ g: g(), s: { actions: [autoSkill] } })).toBe("run");
+    expect(
+      skillsGate({
+        g: g(),
+        s: { actions: [{ ...autoSkill, lane: "skill-refactor", op: "skill-update" }] },
+      }),
+    ).toBe("run");
+    // Lane off: skip even with auto actions.
+    expect(
+      skillsGate({
+        g: g({ lanes: { ...LANES_ON, skillify: false } }),
+        s: { actions: [autoSkill] },
+      }),
+    ).toBe("skip");
+    expect(
+      skillsGate({
+        g: g({ lanes: { ...LANES_ON, skillify: undefined } }),
+        s: { actions: [autoSkill] },
+      }),
+    ).toBe("skip");
+    // Both skill caps at 0 is propose-only.
+    expect(
+      skillsGate({
+        g: g({ caps: { skillCreate: 0, skillUpdate: 0, scriptBuilds: 1 } }),
+        s: { actions: [autoSkill] },
+      }),
+    ).toBe("skip");
+    expect(skillsGate({ g: g(), s: { actions: [{ ...autoSkill, tier: "propose" }] } })).toBe(
+      "skip",
+    );
+    expect(skillsGate({ g: g(), s: { actions: [{ ...autoSkill, op: "skill-disable" }] } })).toBe(
+      "skip",
+    );
+    expect(skillsGate({ g: g(), s: { actions: [{ ...autoSkill, lane: "memory" }] } })).toBe("skip");
+    expect(skillsGate({ g: g(), s: "" })).toBe("skip");
+
+    const scriptAction = { id: "A2", lane: "scriptify", tier: "propose", op: "script-build" };
+    const scriptifyGate = gate("scriptify-gate");
+    expect(scriptifyGate({ g: g(), s: { actions: [scriptAction] } })).toBe("run");
+    expect(
+      scriptifyGate({
+        g: g({ lanes: { ...LANES_ON, scriptify: false } }),
+        s: { actions: [scriptAction] },
+      }),
+    ).toBe("skip");
+    expect(
+      scriptifyGate({
+        g: g({ caps: { skillCreate: 1, skillUpdate: 3, scriptBuilds: 0 } }),
+        s: { actions: [scriptAction] },
+      }),
+    ).toBe("skip");
+    expect(scriptifyGate({ g: g(), s: { actions: [autoSkill] } })).toBe("skip");
+    expect(scriptifyGate({ g: g(), s: "" })).toBe("skip");
 
     const slack = gate("slack-gate");
     const p = { slackText: ":crescent_moon: Dreaming" };
@@ -400,7 +502,7 @@ describe("dreaming template", () => {
     expect(hbDraft({ g: g({ budget: { overBudget: true } }), hp })).toBe("skip");
     expect(
       hbDraft({
-        g: g({ lanes: { heartbeat: false, trim: true, identity: true, memory: true } }),
+        g: g({ lanes: { ...LANES_ON, heartbeat: false } }),
         hp,
       }),
     ).toBe("skip");
@@ -411,7 +513,7 @@ describe("dreaming template", () => {
     expect(hbGate({ g: g(), c: { ready: false } })).toBe("skip");
     expect(
       hbGate({
-        g: g({ lanes: { heartbeat: false, trim: true, identity: true, memory: true } }),
+        g: g({ lanes: { ...LANES_ON, heartbeat: false } }),
         c: { ready: true },
       }),
     ).toBe("skip");
@@ -463,7 +565,7 @@ describe("dreaming template", () => {
 
 describe("dreaming engine runs", () => {
   test.skipIf(SKIP_SANDBOX_SPAWN_TESTS)(
-    "DREAMING_ENABLED unset: gather, proceed, done and no agent tasks",
+    "DREAMING_ENABLED unset: gather, adoption-gate, proceed, done and no agent tasks",
     async () => {
       delete process.env.DREAMING_ENABLED;
       const bus = new InProcessEventBus();
@@ -487,7 +589,16 @@ describe("dreaming engine runs", () => {
         error: undefined,
         gather: undefined,
       });
-      expect(steps.map((s) => s.nodeId).sort()).toEqual(["done", "gather", "proceed"]);
+      // The off path is only code-match gates after gather: adoption never runs.
+      expect(steps.map((s) => s.nodeId).sort()).toEqual([
+        "adoption-gate",
+        "done",
+        "gather",
+        "proceed",
+      ]);
+      expect(
+        (steps.find((s) => s.nodeId === "adoption-gate")?.output as { port: string }).port,
+      ).toBe("skip");
       expect((gatherStep?.output as { result: { mode: string } }).result.mode).toBe("off");
       expect(await runAgentTaskCount(runId)).toBe(0);
     },
@@ -668,12 +779,46 @@ describe("dreaming engine runs", () => {
         dryRun: true,
         leadId: lead.id,
         workerId: lead.id,
-        lanes: { heartbeat: false, trim: false, identity: true, memory: true },
+        lanes: {
+          heartbeat: false,
+          trim: false,
+          identity: true,
+          memory: true,
+          skillify: true,
+          scriptify: true,
+        },
       });
+      // The adoption gate runs on a dry run with no artifacts: it reports "no artifacts" and writes nothing.
+      expect(result("adoption")).toMatchObject({
+        ok: true,
+        mode: "dry-run",
+        artifacts: 0,
+        retired: [],
+        wouldRetire: [],
+        controls: { ok: false, reason: "no artifacts" },
+      });
+      expect(result("adoption").controls.negative.ok).toBe(true);
+      for (const id of ["skills-gate", "scriptify-gate"]) {
+        expect({
+          id,
+          port: (steps.find((s) => s.nodeId === id)?.output as { port: string })?.port,
+        }).toEqual({
+          id,
+          port: "skip",
+        });
+      }
       expect(result("trim-plan")).toMatchObject({ targets: [], skipReason: "lane off" });
       expect(result("hb-plan")).toMatchObject({ skipReason: "lane off" });
       expect(nodeIds.filter((id) => id.startsWith("trim#"))).toEqual([]);
-      for (const absent of ["hb-draft", "hb-check", "hb-gate", "lead-disk", "slack"]) {
+      for (const absent of [
+        "hb-draft",
+        "hb-check",
+        "hb-gate",
+        "lead-disk",
+        "skills",
+        "scriptify",
+        "slack",
+      ]) {
         expect({ absent, ran: nodeIds.includes(absent) }).toEqual({ absent, ran: false });
       }
       expect(steps.find((s) => s.nodeId === "verify")?.status).toBe("completed");

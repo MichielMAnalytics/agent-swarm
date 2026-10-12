@@ -1,11 +1,11 @@
 ---
 title: Dreaming
-description: A nightly workflow that reviews the swarm's day, cleans up agent memory and profiles, and prunes the lead's heartbeat checklist, with caps, verification, and rollback.
+description: A nightly workflow that reviews the swarm's day, cleans up agent memory and profiles, prunes the lead's heartbeat checklist, and builds skills and scripts that must earn their keep, with caps, verification, and rollback.
 ---
 
 import { Callout } from "fumadocs-ui/components/callout";
 
-Dreaming is a nightly maintenance loop. Each night it asks every active agent to report on its last day of work. The lead then turns those reports into a short list of fixes: memory cleanups, identity edits, profile trims, and a prune of the lead's `HEARTBEAT.md` checklist. Scripts apply the fixes within fixed caps, save the old content first, and re-read every write to confirm it landed.
+Dreaming is a nightly maintenance loop. Each night it asks every active agent to report on its last day of work. The lead then turns those reports into a short list of fixes: memory cleanups, identity edits, profile trims, a prune of the lead's `HEARTBEAT.md` checklist, and new or updated skills and scripts. Scripts apply the fixes within fixed caps, save the old content first, and re-read every write to confirm it landed.
 
 Every install gets dreaming as a seeded workflow. It ships switched off: until you set `DREAMING_ENABLED=true`, each night runs one read-only step and stops.
 
@@ -15,7 +15,7 @@ Every install gets dreaming as a seeded workflow. It ships switched off: until y
 |---|---|---|
 | Workflow | `dreaming` | Enabled. `DREAMING_ENABLED` is the real switch. |
 | Schedule | `dreaming-nightly` | `25 3 * * *` UTC. Targets the `dreaming` workflow. |
-| Scripts | `dream-gather`, `dream-apply`, `dream-trim`, `dream-heartbeat`, `dream-verify`, `dream-learn`, `dream-owners`, `dream-rollback`, `dream-reports-check` | Seeded, global scope. |
+| Scripts | `dream-gather`, `dream-adoption`, `dream-apply`, `dream-trim`, `dream-heartbeat`, `dream-verify`, `dream-learn`, `dream-owners`, `dream-rollback`, `dream-reports-check` | Seeded, global scope. |
 | Settings | **Dreaming** group | Settings → Configuration. See [Configuration: Dreaming](/docs/ui/configuration#dreaming). |
 
 Dreaming stores its state in the `dreaming` KV namespace.
@@ -24,7 +24,9 @@ Dreaming stores its state in the `dreaming` KV namespace.
 
 ```mermaid
 flowchart TD
-  gather --> proceed
+  gather --> adoption-gate
+  adoption-gate -- run --> adoption --> proceed
+  adoption-gate -- skip --> proceed
   proceed -- go --> reports
   proceed -- skip --> done
   reports --> reports-check --> reports-retry --> reports-merge --> synthesize --> apply
@@ -33,18 +35,25 @@ flowchart TD
   hb-draft-gate -- skip --> hb-apply
   hb-gate -- run --> lead-disk --> hb-apply
   hb-gate -- skip --> hb-apply
-  hb-apply --> verify --> learn --> owners --> publish --> slack-gate
+  hb-apply --> skills-gate & scriptify-gate
+  skills-gate -- run --> skills --> verify
+  skills-gate -- skip --> verify
+  scriptify-gate -- run --> scriptify --> verify
+  scriptify-gate -- skip --> verify
+  verify --> learn --> owners --> publish --> slack-gate
   slack-gate -- post --> slack
   slack-gate -- skip --> done
 ```
 
 1. **gather** reads the config, finds the lead and the active agents, and decides the mode: `off`, `dry-run`, or `live`. It runs no agent tasks.
-2. **proceed** ends the run when the mode is `off`, there is no lead, or no agent was active. Quiet nights spend no tokens.
-3. **reports** asks each active agent for a report on its day. `reports-check` and `reports-retry` chase missing reports once.
-4. **synthesize** is a lead task. It reads the merged reports and proposes actions, only for lanes that are on.
-5. **apply** runs the identity and memory actions. **trim** shortens agent profiles. The **hb-** steps prune the lead's heartbeat checklist. See [Heartbeat prune](/docs/guides/dreaming-heartbeat-prune).
-6. **verify** re-reads every change and compares it with what each step claimed. **learn** scores past cuts: a cut that was reverted or added back gets pinned so dreaming does not cut it again. **owners** sends follow-up tasks for items that need a human or an agent decision.
-7. **publish** writes the nightly report. **slack** posts a short summary when a channel is set and the night was live.
+2. **adoption** counts the uses of every skill and script dreaming created and retires the unused ones. It runs on quiet nights too, but not when the mode is `off`. See [Adoption gate](#adoption-gate).
+3. **proceed** ends the run when the mode is `off`, there is no lead, or no agent was active. Quiet nights spend no tokens.
+4. **reports** asks each active agent for a report on its day. `reports-check` and `reports-retry` chase missing reports once.
+5. **synthesize** is a lead task. It reads the merged reports and proposes actions, only for lanes that are on.
+6. **apply** runs the identity and memory actions. **trim** shortens agent profiles. The **hb-** steps prune the lead's heartbeat checklist. See [Heartbeat prune](/docs/guides/dreaming-heartbeat-prune).
+7. **skills** is a lead task that creates and updates skills. **scriptify** is a worker task that builds new scripts at agent scope and proves each one with a positive and a negative control run. Each runs only when its lane is on and `synthesize` approved work for it.
+8. **verify** re-reads every change and compares it with what each step claimed. **learn** scores past cuts: a cut that was reverted or added back gets pinned so dreaming does not cut it again. **owners** sends follow-up tasks for items that need a human or an agent decision.
+9. **publish** writes the nightly report. **slack** posts a short summary when a channel is set and the night was live.
 
 ## Lanes
 
@@ -57,6 +66,8 @@ Each lane has its own key. A lane that is off creates no agent tasks and writes 
 | `DREAMING_LANE_TRIM` | `true` | Trims of `CLAUDE.md`, `SOUL.md`, and `IDENTITY.md` for each agent. |
 | `DREAMING_LANE_IDENTITY` | `true` | Identity edits proposed by `synthesize`. |
 | `DREAMING_LANE_MEMORY` | `true` | Memory triage: rename, edit, delete, and store. |
+| `DREAMING_LANE_SKILLIFY` | `true` | Skill creates and updates by the lead. New skills are adoption-gated. |
+| `DREAMING_LANE_SCRIPTIFY` | `true` | Script builds at agent scope. Promotion to global goes to the lead as an owner task. New scripts are adoption-gated. |
 
 Other keys set the Slack channel, the report target, the agent that runs the worker steps, the budget, and the caps. The full list, with accepted values, is in [Configuration: Dreaming](/docs/ui/configuration#dreaming).
 
@@ -78,7 +89,7 @@ The default schedule runs at 03:25 UTC. Move it to about one hour after your dep
 
 ## Safety
 
-**Caps.** Each night has hard limits. By default: 6 identity edits in total and 1 per agent, 3 profile trims, 5 new memories, 5 memory edits, and 10 memory deletions. A cap of `0` turns that action off. The trim cap goes up to 12.
+**Caps.** Each night has hard limits. By default: 6 identity edits in total and 1 per agent, 3 profile trims, 5 new memories, 5 memory edits, 10 memory deletions, 1 new skill, 3 skill updates, and 1 new script. A cap of `0` turns that action off. The trim cap goes up to 12.
 
 **Who writes.** The seeded workflow has no creator and the nightly schedule names no agent, so its scripts run as the current lead. That is what lets them edit other agents' profiles. An edited copy of the workflow loses this and runs without a principal, so its writes are refused. Without a lead, the run stops at gather.
 
@@ -95,6 +106,42 @@ script-run name="dream-rollback" scope="global" args={ "runId": "<run id>" }
 Add `"dryRun": true` to preview the result first. Rollback restores profile pre-images first, then undoes the ledger in reverse order. A profile field is restored only when it still holds that run's write. Pass `"overwrite": true` to restore it anyway. To restore only part of a night, pass `agentId` and `field` for profiles, or `actionIds` for ledger items.
 
 The heartbeat has its own revert steps, because the lead also keeps a copy on disk. See [Heartbeat prune: Roll back a prune](/docs/guides/dreaming-heartbeat-prune#roll-back-a-prune).
+
+## Adoption gate
+
+Dreaming may create a skill or a script that nobody needs. The adoption gate retires those, so the catalog does not fill up with unused artifacts.
+
+**Records.** When `verify` confirms that a night created a skill or built a script, it writes one record per artifact: `artifact:skill:<name>` or `artifact:script:<name>` in the `dreaming` KV namespace. A script record also stores the script source, so a deleted script can be restored. Records have no expiry.
+
+**Counts.** Each night, `adoption` counts the uses of every `active` record since it was created:
+
+| Artifact | A use is |
+|---|---|
+| Skill | A `skill_invocations` row for the skill. |
+| Script | A `script_runs` row more than one hour after the build, or a completed `swarm-script` step in a workflow run whose node names the script. |
+
+Uses by dreaming's own workflow runs never count, so a skill or script cannot keep itself alive. The one-hour offset skips the control runs that `scriptify` makes right after the build.
+
+**Retirement.** A record with 1 or more uses becomes `adopted`, and the gate stops checking it. A record with 0 uses that is older than `DREAMING_ADOPTION_GATE_DAYS` (default `14`) is retired:
+
+- **Skill:** disabled, not deleted. The gate re-reads the row to confirm it.
+- **Script:** deleted, but only when nobody adopted it some other way. A script whose source changed since the build is kept as `adopted-edit`. A script that a workflow definition, a schedule, or another script names is kept as `adopted-ref`. A script promoted to global scope is kept as `adopted-promoted`.
+
+Set `DREAMING_ADOPTION_GATE_DAYS=0` to count uses without retiring anything. The report then shows counts only. On a dry run, the gate lists what it would retire under `wouldRetire` and writes nothing.
+
+The nightly report has an **Adoption** section: what was retired and why, what was adopted, and how many days each pending artifact has left. Before the first artifact exists, it says "no artifacts yet".
+
+<Callout type="warn">
+Only recorded invocations count. On Claude Code, a skill that an agent loads by reading its `SKILL.md` file (for example with `cat`) instead of invoking it is not recorded, so a skill that is only ever read that way counts 0 uses and is retired.
+</Callout>
+
+**Rollback.** To bring back one retired artifact, run `dream-rollback` in `artifact` mode:
+
+```text
+script-run name="dream-rollback" scope="global" args={ "mode": "artifact", "kind": "skill", "name": "<skill name>" }
+```
+
+A skill is enabled again. A script is created again at its recorded scope from the stored source, and only when no other script now holds the name. Run it as the script's owner for an agent-scope script. The record becomes `restored`, and the gate does not retire it again. Add `"dryRun": true` to preview.
 
 ## Cost
 

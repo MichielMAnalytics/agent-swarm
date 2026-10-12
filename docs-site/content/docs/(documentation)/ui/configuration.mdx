@@ -279,9 +279,12 @@ next run without a restart, and an unset key uses the default below.
 | `DREAMING_LANE_TRIM` | `true` | boolean | Trim agent profiles (CLAUDE.md, SOUL.md, IDENTITY.md). |
 | `DREAMING_LANE_IDENTITY` | `true` | boolean | Apply identity edits. |
 | `DREAMING_LANE_MEMORY` | `true` | boolean | Memory triage: rename, edit, delete, store. |
+| `DREAMING_LANE_SKILLIFY` | `true` | boolean | Create and update skills. New skills are adoption-gated. |
+| `DREAMING_LANE_SCRIPTIFY` | `true` | boolean | Build agent-scope scripts. New scripts are adoption-gated. |
+| `DREAMING_ADOPTION_GATE_DAYS` | `14` | integer ≥ 0 | Days a dreaming-created skill or script may go unused before it is retired. `0` counts uses but never retires. |
 | `DREAMING_SLACK_CHANNEL` | empty | any string | Channel for the nightly summary. Empty skips the Slack post. |
 | `DREAMING_REPORT_TARGET` | `page` | `page`, `agent-fs`, `none` | Where the nightly report is written. |
-| `DREAMING_WORKER_AGENT_ID` | empty | UUID or empty | Agent that runs the trim, heartbeat draft, and publish steps. Empty means the lead. |
+| `DREAMING_WORKER_AGENT_ID` | empty | UUID or empty | Agent that runs the trim, heartbeat draft, scriptify, and publish steps. Empty means the lead. |
 | `DREAMING_BUDGET_USD` | `25` | integer 1–1000 | Over budget, the heartbeat draft is skipped and the report raises an alert. |
 | `DREAMING_CAP_IDENTITY_TOTAL` | `6` | integer ≥ 0 | Identity edits per night, across all agents. |
 | `DREAMING_CAP_IDENTITY_PER_AGENT` | `1` | integer ≥ 0 | Identity edits per agent per night. |
@@ -289,6 +292,9 @@ next run without a restart, and an unset key uses the default below.
 | `DREAMING_CAP_MEMORY_STORE` | `5` | integer ≥ 0 | New memories per night. |
 | `DREAMING_CAP_MEMORY_EDIT` | `5` | integer ≥ 0 | Memory edits per night. |
 | `DREAMING_CAP_MEMORY_DELETE` | `10` | integer ≥ 0 | Memory deletions per night. |
+| `DREAMING_CAP_SKILL_CREATE` | `1` | integer ≥ 0 | New skills per night. |
+| `DREAMING_CAP_SKILL_UPDATE` | `3` | integer ≥ 0 | Skill updates per night. |
+| `DREAMING_CAP_SCRIPT_BUILDS` | `1` | integer ≥ 0 | New scripts per night. |
 
 A lane that is off takes no actions and spends no tokens. A cap of `0` turns that action off for the
 night. The server rejects values outside the **Accepts** column, for example `DREAMING_CAP_TRIMS=-1`.

@@ -1,14 +1,15 @@
 # Dreaming
 
-Dreaming is a nightly self-improvement loop for the whole swarm. Each active agent reports on its own last 24 hours. Lead reviews the reports against deterministic swarm data and approves a capped action list. Scripts then apply identity and memory actions, trim over-long profile fields, and prune Lead's HEARTBEAT. Every write is verified by re-reading the row, and every change keeps a pre-image so it can be rolled back.
+Dreaming is a nightly self-improvement loop for the whole swarm. Each active agent reports on its own last 24 hours. Lead reviews the reports against deterministic swarm data and approves a capped action list. Scripts then apply identity and memory actions, trim over-long profile fields, and prune Lead's HEARTBEAT. Lead writes approved skill changes and a worker builds approved scripts. Every write is verified by re-reading the row, and every change keeps a pre-image so it can be rolled back.
 
 It ships off. Turn it on in Settings → Configuration (Dreaming group) with `DREAMING_ENABLED=true`. The `dreaming-nightly` schedule triggers it; while dreaming is off, a run stops after `gather` and spends no tokens.
 
 - **Dry run first.** Runs stay dry (no writes, no Slack post) until one dry run verifies green. Trigger with `{"dryRun": true}` to force a dry run at any time.
-- **Lanes.** `DREAMING_LANE_HEARTBEAT`, `_TRIM`, `_IDENTITY` and `_MEMORY` switch each lane. A lane that is off spends no tokens.
+- **Lanes.** `DREAMING_LANE_HEARTBEAT`, `_TRIM`, `_IDENTITY`, `_MEMORY`, `_SKILLIFY` and `_SCRIPTIFY` switch each lane. A lane that is off spends no tokens.
+- **Adoption gate.** Every skill or script dreaming creates is recorded. One nobody uses within `DREAMING_ADOPTION_GATE_DAYS` (14) is retired: the skill is disabled, the script deleted. `0` counts uses but never retires. `dream-rollback` with `mode: "artifact"` brings one back.
 - **Caps and budget.** `DREAMING_CAP_*` bound the actions per night. Over `DREAMING_BUDGET_USD`, the heartbeat draft is skipped and the report says so.
 - **Report.** `DREAMING_REPORT_TARGET` is `page` (default), `agent-fs` or `none`. `DREAMING_SLACK_CHANNEL` adds a short Slack receipt on live runs.
-- **Worker.** `DREAMING_WORKER_AGENT_ID` runs the trim, heartbeat draft and publish tasks. Empty means Lead.
+- **Worker.** `DREAMING_WORKER_AGENT_ID` runs the trim, heartbeat draft, scriptify and publish tasks. Empty means Lead.
 
 Docs: https://docs.agent-swarm.dev/docs/guides/dreaming
 
@@ -17,7 +18,7 @@ The values live in config; the `input` map below only names them and their defau
 ```json
 {
   "name": "dreaming",
-  "description": "Nightly self-improvement loop. gather -> per-agent self-reports -> Lead synthesis -> apply identity and memory actions -> profile trims -> Lead HEARTBEAT prune -> verify -> learn -> owners -> report -> Slack. Off unless DREAMING_ENABLED is true; dry runs until one dry run verifies green.",
+  "description": "Nightly self-improvement loop. gather -> adoption gate -> per-agent self-reports -> Lead synthesis -> apply identity and memory actions -> profile trims -> Lead HEARTBEAT prune -> skills and scriptify lanes -> verify -> learn -> owners -> report -> Slack. Off unless DREAMING_ENABLED is true; dry runs until one dry run verifies green.",
   "onNodeFailure": "continue",
   "cooldown": {
     "minutes": 60
@@ -29,6 +30,9 @@ The values live in config; the `input` map below only names them and their defau
     "laneTrim": "${DREAMING_LANE_TRIM:-true}",
     "laneIdentity": "${DREAMING_LANE_IDENTITY:-true}",
     "laneMemory": "${DREAMING_LANE_MEMORY:-true}",
+    "laneSkillify": "${DREAMING_LANE_SKILLIFY:-true}",
+    "laneScriptify": "${DREAMING_LANE_SCRIPTIFY:-true}",
+    "gateDays": "${DREAMING_ADOPTION_GATE_DAYS:-14}",
     "slackChannel": "${DREAMING_SLACK_CHANNEL:-}",
     "reportTarget": "${DREAMING_REPORT_TARGET:-page}",
     "workerAgentId": "${DREAMING_WORKER_AGENT_ID:-}",
@@ -38,7 +42,10 @@ The values live in config; the `input` map below only names them and their defau
     "capTrims": "${DREAMING_CAP_TRIMS:-3}",
     "capMemoryStore": "${DREAMING_CAP_MEMORY_STORE:-5}",
     "capMemoryEdit": "${DREAMING_CAP_MEMORY_EDIT:-5}",
-    "capMemoryDelete": "${DREAMING_CAP_MEMORY_DELETE:-10}"
+    "capMemoryDelete": "${DREAMING_CAP_MEMORY_DELETE:-10}",
+    "capSkillCreate": "${DREAMING_CAP_SKILL_CREATE:-1}",
+    "capSkillUpdate": "${DREAMING_CAP_SKILL_UPDATE:-3}",
+    "capScriptBuilds": "${DREAMING_CAP_SCRIPT_BUILDS:-1}"
   },
   "nodes": [
     {
@@ -63,6 +70,9 @@ The values live in config; the `input` map below only names them and their defau
           "laneTrim": "{{input.laneTrim}}",
           "laneIdentity": "{{input.laneIdentity}}",
           "laneMemory": "{{input.laneMemory}}",
+          "laneSkillify": "{{input.laneSkillify}}",
+          "laneScriptify": "{{input.laneScriptify}}",
+          "gateDays": "{{input.gateDays}}",
           "slackChannel": "{{input.slackChannel}}",
           "reportTarget": "{{input.reportTarget}}",
           "workerAgentId": "{{input.workerAgentId}}",
@@ -72,10 +82,52 @@ The values live in config; the `input` map below only names them and their defau
           "capTrims": "{{input.capTrims}}",
           "capMemoryStore": "{{input.capMemoryStore}}",
           "capMemoryEdit": "{{input.capMemoryEdit}}",
-          "capMemoryDelete": "{{input.capMemoryDelete}}"
+          "capMemoryDelete": "{{input.capMemoryDelete}}",
+          "capSkillCreate": "{{input.capSkillCreate}}",
+          "capSkillUpdate": "{{input.capSkillUpdate}}",
+          "capScriptBuilds": "{{input.capScriptBuilds}}"
         }
       },
-      "next": "proceed"
+      "next": "adoption-gate"
+    },
+    {
+      "id": "adoption-gate",
+      "type": "code-match",
+      "label": "1b. Dreaming on and a Lead? Then run the adoption gate",
+      "config": {
+        "code": "(input) => { const g = input.g; return (g && g.ok === true && g.mode !== 'off') ? 'run' : 'skip'; }",
+        "outputPorts": [
+          "run",
+          "skip"
+        ]
+      },
+      "next": {
+        "run": "adoption",
+        "skip": "proceed"
+      },
+      "inputs": {
+        "g": "gather.result"
+      }
+    },
+    {
+      "id": "adoption",
+      "type": "swarm-script",
+      "label": "1c. Adoption gate: count uses of dreaming-made skills and scripts, retire the unused ones",
+      "config": {
+        "scriptName": "dream-adoption",
+        "scope": "global",
+        "timeoutMs": 120000,
+        "args": {
+          "runId": "{{runId}}",
+          "gateDays": "{{g.cfg.gateDays}}",
+          "dryRun": "{{g.dryRun}}"
+        }
+      },
+      "next": "proceed",
+      "inputs": {
+        "runId": "run.id",
+        "g": "gather.result"
+      }
     },
     {
       "id": "proceed",
@@ -598,7 +650,8 @@ The values live in config; the `input` map below only names them and their defau
         "reports": "reports-merge.result.reports",
         "missing": "reports-merge.result.missing",
         "rejectedReports": "reports-merge.result.rejected",
-        "runId": "run.id"
+        "runId": "run.id",
+        "ad": "adoption.result"
       },
       "config": {
         "agentId": "{{g.leadId}}",
@@ -608,7 +661,7 @@ The values live in config; the `input` map below only names them and their defau
           "dreaming-synthesis"
         ],
         "priority": 50,
-        "template": "dreaming run {{runId}}: synthesis and critique. DRY RUN = {{g.dryRun}}.\n\nYou are the reviewer, not the writer. Turn tonight's per-agent reports and the deterministic swarm data into an approved, capped action list, and record every rejection with a reason. Do NOT call write tools; approved actions are applied by later nodes (the apply script, the trim lane, the heartbeat lane) and verified by re-reading the rows.\n\nLanes switched on tonight (from config): {{g.lanes}}\nA lane set to false is OFF. Propose nothing for it, neither auto nor propose; list any item you drop for that reason in `rejected` with reason \"lane off\". identity = profile ops (identityOps on CLAUDE, IDENTITY, SOUL, TOOLS); heartbeat = Lead HEARTBEAT ops; memory = memory ops; trim = the profile-trim lane that runs after you (a net-positive identity op can only be auto when trim is on, see rule 2).\n\nPer-agent reports (foreach results; a child with status \"failed\" or a taskOutput starting \"[FAILED\" means that agent's report is missing, so note it and move on):\n{{reports}}\n\nReports rejected by the slot/schema guard (retried once): {{rejectedReports}}\nStill missing after the retry: {{missing}}\n\nDeterministic swarm data (audit results, skill usage, memory candidates):\n{{g.swarm}}\nAgents skipped for inactivity: {{g.skippedAgents}}\nGather errors (instrument gaps, NOT findings): {{g.errors}}\nCaps for tonight: {{g.caps}}\n\nLanes for actions:\n a skillify: a new skill, only for a procedure evidenced in 2+ tasks (or 2+ agents) and not covered by an existing skill. Check skill-search first.\n b skill-refactor: fix a stale/wrong skill body or description (from skillFriction or an audit), merge near-duplicates, or propose disabling a skill with 0 invocations in 14 days that a named skill supersedes.\n c scriptify: a deterministic process done by hand (scriptCandidates, repeated tool loops). Check script-search / the scripts catalog for an existing script first; if one exists, the action is \"wire it into skill X\", not \"write a new one\".\n d identity: the agents' own identityOps, plus at most 2 of your own for profiles the swarm data shows are clearly over-long (largest overage first). Lead HEARTBEAT ops are remove-only and belong to the heartbeat lane.\n e memory: the agents' memoryOps plus swarm.memory candidates: exact duplicates (keep the oldest row, delete the rest), unhelpful rows (edit or delete with a reason), badKeys (memory-rename, target.memoryIds + target.name kebab <= 90), and at most 3 new lessons from tonight's evidence.\n Skills and scripts have no writer in this workflow: skillify, skill-refactor and scriptify actions are always tier \"propose\", and the owners node sends each one to its owner.\n Profile trims are a separate lane (after apply): do not propose big rewrites here.\n\nRules for every action:\n1. Keep only evidence-backed items. Re-verify anything with an absence or state claim yourself (one db-query or gh call) before approving; say what you checked in `verified`.\n2. Tier \"auto\" only if it is inside the apply policy and its lane is on: identity ops that are net-negative, or CLAUDE appends <= 400 chars; a net-positive identity op may be auto too when the trim lane is on, because apply hands it to the trim lane, which writes it only inside a rewrite that leaves that file net-smaller tonight; memory store/edit/delete/rename within caps (a multi-chunk `manual` memory is deleted or renamed as a whole document; never task_completion/session_summary). Everything else is \"propose\".\n2b. Nothing stays parked: every action has `owner` (agent id). Auto actions are owned by their lane; for a propose action name who must decide it (the target agent for its own file, Lead for memory, skills and promotions, the agent that owns the code for code changes). The owners node sends each owner one task.\n3. Respect the caps; overflow goes to `rejected` with reason \"cap\".\n4. For H2 ops, copy the anchor verbatim from that agent's h2Anchors. For replace-exact, `find` must be text the agent quoted from its own file; you may shorten `content` but never invent an anchor.\n5. Dedup across agents: two agents proposing the same skill or memory become one action with both in sourceAgents.\n6. Every action gets an id \"A1\", \"A2\", ... that stays stable across all nodes.\n7. memory-edit: `content` is written verbatim as the memory's ENTIRE new body (default `mode: \"replace\"`), so a replace carries the full rewritten text. To add to a memory, set `mode: \"append\"` and put ONLY the new text in `content`; apply writes existing.trimEnd() + \"\\n\" + content. Never put instructions to the writer in `content` (\"APPEND to the end...\", \"keep everything above\", \"REPLACE the existing section...\"): apply refuses them. A replace that leaves under 50% of the old body is refused unless the action sets `allowShrink: \"<reason>\"`.\n\nLearning loop: {{g.learning}}\n- `recent` = the last 7 learn rows; `candidates` = cuts whose probe showed up in a failed task or a coaching reason in the last 24h; `pins` = text a lane must never cut again.\n- Emit up to 5 `restores: [{cutId, reason, evidence[]}]`, only for a candidate whose evidence shows the cut text was still needed (quote the evidence ids). Apply restores it and pins it.\n- Never propose removing pinned text.\nBudget: {{g.budget}}. If `overBudget` is true, propose no optional work beyond the caps.\n\nReturn ONLY JSON: {headline, actions[], rejected[], restores[], missingReports[], notes, changelogComment}. The headline is the single change tonight that will still matter next week, <= 140 chars, or \"quiet night\" if nothing qualifies. changelogComment: at most 2 sentences for the changelog: what changed tonight and what to watch tomorrow.",
+        "template": "dreaming run {{runId}}: synthesis and critique. DRY RUN = {{g.dryRun}}.\n\nYou are the reviewer, not the writer. Turn tonight's per-agent reports and the deterministic swarm data into an approved, capped action list, and record every rejection with a reason. Do NOT call write tools; approved actions are applied by later nodes (the apply script, the trim lane, the heartbeat lane) and verified by re-reading the rows.\n\nLanes switched on tonight (from config): {{g.lanes}}\nA lane set to false is OFF. Propose nothing for it, neither auto nor propose; list any item you drop for that reason in `rejected` with reason \"lane off\". identity = profile ops (identityOps on CLAUDE, IDENTITY, SOUL, TOOLS); heartbeat = Lead HEARTBEAT ops; memory = memory ops; skillify = skill creates and updates (lanes a and b); scriptify = script builds (lane c); trim = the profile-trim lane that runs after you (a net-positive identity op can only be auto when trim is on, see rule 2).\n\nPer-agent reports (foreach results; a child with status \"failed\" or a taskOutput starting \"[FAILED\" means that agent's report is missing, so note it and move on):\n{{reports}}\n\nReports rejected by the slot/schema guard (retried once): {{rejectedReports}}\nStill missing after the retry: {{missing}}\n\nDeterministic swarm data (audit results, skill usage, memory candidates):\n{{g.swarm}}\nAgents skipped for inactivity: {{g.skippedAgents}}\nGather errors (instrument gaps, NOT findings): {{g.errors}}\nCaps for tonight: {{g.caps}}\nAdoption gate tonight (retired, adopted, pending; empty when it did not run): {{ad}}\n\nLanes for actions:\n a skillify: a new skill, only for a procedure evidenced in 2+ tasks (or 2+ agents) and not covered by an existing skill. Check skill-search first.\n b skill-refactor: fix a stale/wrong skill body or description (from skillFriction or an audit), merge near-duplicates, or propose disabling a skill with 0 invocations in 14 days that a named skill supersedes.\n c scriptify: a deterministic process done by hand (scriptCandidates, repeated tool loops). Check script-search / the scripts catalog for an existing script first; if one exists, the action is \"wire it into skill X\", not \"write a new one\".\n d identity: the agents' own identityOps, plus at most 2 of your own for profiles the swarm data shows are clearly over-long (largest overage first). Lead HEARTBEAT ops are remove-only and belong to the heartbeat lane.\n e memory: the agents' memoryOps plus swarm.memory candidates: exact duplicates (keep the oldest row, delete the rest), unhelpful rows (edit or delete with a reason), badKeys (memory-rename, target.memoryIds + target.name kebab <= 90), and at most 3 new lessons from tonight's evidence.\n Skills: with the skillify lane on, a skillify or skill-refactor action may be tier \"auto\" (op skill-create or skill-update); the skills node writes it as Lead, at most caps.skillCreate creates and caps.skillUpdate updates. skill-disable and anything touching a systemDefault skill stay \"propose\".\n Scripts: with the scriptify lane on, the scriptify node builds up to caps.scriptBuilds new scripts at agent scope, with a positive and a negative control. Global promotion stays Lead's: the owners node asks for it.\n Adoption: a skill or script dreaming creates is retired (skill disabled, script deleted) when nobody uses it within the gate window. Do not propose re-creating anything the adoption gate retired or still holds as pending; extend what is in use instead.\n Profile trims are a separate lane (after apply): do not propose big rewrites here.\n\nRules for every action:\n1. Keep only evidence-backed items. Re-verify anything with an absence or state claim yourself (one db-query or gh call) before approving; say what you checked in `verified`.\n2. Tier \"auto\" only if it is inside the apply policy and its lane is on: identity ops that are net-negative, or CLAUDE appends <= 400 chars; a net-positive identity op may be auto too when the trim lane is on, because apply hands it to the trim lane, which writes it only inside a rewrite that leaves that file net-smaller tonight; memory store/edit/delete/rename within caps (a multi-chunk `manual` memory is deleted or renamed as a whole document; never task_completion/session_summary); skill-create and skill-update within the skill caps when the skillify lane is on. Everything else is \"propose\".\n2b. Nothing stays parked: every action has `owner` (agent id). Auto actions are owned by their lane; for a propose action name who must decide it (the target agent for its own file, Lead for memory, skills and promotions, the agent that owns the code for code changes). The owners node sends each owner one task.\n3. Respect the caps; overflow goes to `rejected` with reason \"cap\".\n4. For H2 ops, copy the anchor verbatim from that agent's h2Anchors. For replace-exact, `find` must be text the agent quoted from its own file; you may shorten `content` but never invent an anchor.\n5. Dedup across agents: two agents proposing the same skill or memory become one action with both in sourceAgents.\n6. Every action gets an id \"A1\", \"A2\", ... that stays stable across all nodes.\n7. memory-edit: `content` is written verbatim as the memory's ENTIRE new body (default `mode: \"replace\"`), so a replace carries the full rewritten text. To add to a memory, set `mode: \"append\"` and put ONLY the new text in `content`; apply writes existing.trimEnd() + \"\\n\" + content. Never put instructions to the writer in `content` (\"APPEND to the end...\", \"keep everything above\", \"REPLACE the existing section...\"): apply refuses them. A replace that leaves under 50% of the old body is refused unless the action sets `allowShrink: \"<reason>\"`.\n\nLearning loop: {{g.learning}}\n- `recent` = the last 7 learn rows; `candidates` = cuts whose probe showed up in a failed task or a coaching reason in the last 24h; `pins` = text a lane must never cut again.\n- Emit up to 5 `restores: [{cutId, reason, evidence[]}]`, only for a candidate whose evidence shows the cut text was still needed (quote the evidence ids). Apply restores it and pins it.\n- Never propose removing pinned text.\nBudget: {{g.budget}}. If `overBudget` is true, propose no optional work beyond the caps.\n\nReturn ONLY JSON: {headline, actions[], rejected[], restores[], missingReports[], notes, changelogComment}. The headline is the single change tonight that will still matter next week, <= 140 chars, or \"quiet night\" if nothing qualifies. changelogComment: at most 2 sentences for the changelog: what changed tonight and what to watch tomorrow.",
         "outputSchema": {
           "type": "object",
           "required": [
@@ -1192,7 +1245,218 @@ The values live in config; the `input` map below only names them and their defau
           "disk": "{{ld}}"
         }
       },
-      "next": "verify"
+      "next": [
+        "skills-gate",
+        "scriptify-gate"
+      ]
+    },
+    {
+      "id": "skills-gate",
+      "type": "code-match",
+      "label": "7h. Skillify lane: any auto skill actions?",
+      "config": {
+        "code": "(input) => { const g = input.g; const s = input.s; if (!g || !g.lanes || g.lanes.skillify !== true) return 'skip'; const c = g.caps || {}; if (!((c.skillCreate || 0) > 0 || (c.skillUpdate || 0) > 0)) return 'skip'; if (!s || typeof s !== 'object' || !Array.isArray(s.actions)) return 'skip'; return s.actions.some(a => a && (a.lane === 'skillify' || a.lane === 'skill-refactor') && a.tier === 'auto' && (a.op === 'skill-create' || a.op === 'skill-update')) ? 'run' : 'skip'; }",
+        "outputPorts": [
+          "run",
+          "skip"
+        ]
+      },
+      "next": {
+        "run": "skills",
+        "skip": "verify"
+      },
+      "inputs": {
+        "s": "synthesize.taskOutput",
+        "g": "gather.result"
+      }
+    },
+    {
+      "id": "skills",
+      "type": "agent-task",
+      "label": "7i. Skillify lane: create and update skills (Lead)",
+      "config": {
+        "agentId": "{{g.leadId}}",
+        "modelTier": "smart",
+        "tags": [
+          "dreaming",
+          "dreaming-skills"
+        ],
+        "priority": 50,
+        "template": "dreaming run {{runId}}: skills lane (a skillify + b skill-refactor). DRY RUN = {{g.dryRun}}.\n\nApproved actions (use ONLY lane \"skillify\"/\"skill-refactor\" with tier \"auto\" and op \"skill-create\" or \"skill-update\"; ignore everything else): {{s}}\n\nCaps: at most caps.skillCreate = {{g.caps.skillCreate}} creates and caps.skillUpdate = {{g.caps.skillUpdate}} updates tonight, in id order. Every action over a cap goes back as status \"held\", note \"cap\".\n\nFor each action, in id order:\n0. Idempotency: if kv-get namespace \"dreaming\" key \"preimage:{{runId}}:<actionId>\" already exists, an earlier dispatch of this node handled the action. Re-read the skill and report it; do not write again.\n1. skill-update: skill-get the CURRENT full SKILL.md. If systemDefault is true, STOP for this action: status \"refused\", note \"systemDefault locked\". Write the complete revised document (frontmatter + body, not a partial), <= 500 lines, description <= 1024 chars. Before writing, kv-set namespace \"dreaming\" key \"preimage:{{runId}}:<actionId>\" to {skillId, version, content} of the current row.\n2. skill-create: skill-search first; if a skill already covers >= 70% of it, convert to an update of that skill (note it, and count it against the update cap). Otherwise skill-create scope \"swarm\" and skill-install ONLY for the agents in target.installFor. Add the line \"created by dreaming run {{runId}}, action <id>\" at the end of the body so provenance survives. A new skill is adoption-gated: if nobody invokes it within {{g.cfg.gateDays}} days, it is disabled.\n3. After every write, re-read with skill-get and record the version before and after and the sha256 of the re-read content. success:true is NOT proof: a write is \"applied\" only if the version increased (update) or the row exists (create) AND the re-read content contains your change.\nIf DRY RUN is true: do all reads, draft the full content, call NO write tool (including kv-set), and return status \"dry-run\" with the draft's sha256.\n\nReturn ONLY JSON {results:[{actionId, op: \"create\"|\"update\", status: \"applied\"|\"refused\"|\"held\"|\"dry-run\", skillId, name, versionBefore, versionAfter, contentSha256, installedFor, preimageKey, note}]}.",
+        "outputSchema": {
+          "type": "object",
+          "required": [
+            "results"
+          ],
+          "properties": {
+            "results": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "actionId",
+                  "status"
+                ],
+                "properties": {
+                  "actionId": {
+                    "type": "string"
+                  },
+                  "op": {
+                    "type": "string",
+                    "enum": [
+                      "create",
+                      "update"
+                    ]
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "applied",
+                      "refused",
+                      "held",
+                      "dry-run"
+                    ]
+                  },
+                  "skillId": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "versionBefore": {
+                    "type": "number"
+                  },
+                  "versionAfter": {
+                    "type": "number"
+                  },
+                  "contentSha256": {
+                    "type": "string"
+                  },
+                  "installedFor": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "preimageKey": {
+                    "type": "string"
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "next": "verify",
+      "inputs": {
+        "s": "synthesize.taskOutput",
+        "runId": "run.id",
+        "g": "gather.result"
+      }
+    },
+    {
+      "id": "scriptify-gate",
+      "type": "code-match",
+      "label": "7j. Scriptify lane: any scriptify actions?",
+      "config": {
+        "code": "(input) => { const g = input.g; const s = input.s; if (!g || !g.lanes || g.lanes.scriptify !== true) return 'skip'; if (!g.caps || !((g.caps.scriptBuilds || 0) > 0)) return 'skip'; if (!s || typeof s !== 'object' || !Array.isArray(s.actions)) return 'skip'; return s.actions.some(a => a && a.lane === 'scriptify') ? 'run' : 'skip'; }",
+        "outputPorts": [
+          "run",
+          "skip"
+        ]
+      },
+      "next": {
+        "run": "scriptify",
+        "skip": "verify"
+      },
+      "inputs": {
+        "s": "synthesize.taskOutput",
+        "g": "gather.result"
+      }
+    },
+    {
+      "id": "scriptify",
+      "type": "agent-task",
+      "label": "7k. Scriptify lane: build agent-scope scripts with controls",
+      "config": {
+        "agentId": "{{g.workerId}}",
+        "modelTier": "regular",
+        "tags": [
+          "dreaming",
+          "dreaming-scriptify"
+        ],
+        "priority": 40,
+        "template": "dreaming run {{runId}}: scriptify lane. DRY RUN = {{g.dryRun}}. You BUILD scripts now; specs alone do not count.\n\nActions (use ONLY lane \"scriptify\"; at most caps.scriptBuilds = {{g.caps.scriptBuilds}} builds, the rest go back as status \"held\"): {{s}}\n\nUse the swarm-scripts skill. For each action, in id order:\n1. Check the catalog first (script-search, and db-query `SELECT name, scope, contentHash FROM scripts WHERE name GLOB '*<noun>*'`). If a script already covers it, status \"exists\": name it and the exact wiring edit; build nothing.\n2. Otherwise write it: kebab name, `export const argsSchema` (zod), `const a = args ?? {}`, never throws, returns a `controls` object. Save with script-upsert scope \"agent\" under a NEW name (never a bare name that exists globally). Global promotion is Lead's; the owners node asks for it.\n3. Prove it: run it twice with script-run scope \"agent\": a positive control that must find a known real row, and a negative control that must return empty or refuse. Record both run ids and whether each behaved as expected. A build whose controls did not both pass is status \"failed\", not \"built\".\nA new script is adoption-gated: if nothing runs it (script runs or workflow swarm-script steps, from one hour after the build) within {{g.cfg.gateDays}} days, and no workflow, schedule or other script names it, it is deleted. Wire it where it saves work.\nIf DRY RUN is true: do step 1 and the draft only; call no script-upsert or script-run; status \"dry-run\".\n\nReturn ONLY JSON {built:[{actionId, status: \"built\"|\"exists\"|\"failed\"|\"held\"|\"dry-run\", name, scope, contentHash, positiveRunId, negativeRunId, controlsOk, wireInto, savesPerWeek, note}]}.",
+        "outputSchema": {
+          "type": "object",
+          "required": [
+            "built"
+          ],
+          "properties": {
+            "built": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "actionId",
+                  "status"
+                ],
+                "properties": {
+                  "actionId": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "built",
+                      "exists",
+                      "failed",
+                      "held",
+                      "dry-run"
+                    ]
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "type": "string"
+                  },
+                  "contentHash": {
+                    "type": "string"
+                  },
+                  "positiveRunId": {
+                    "type": "string"
+                  },
+                  "negativeRunId": {
+                    "type": "string"
+                  },
+                  "controlsOk": {
+                    "type": "boolean"
+                  },
+                  "wireInto": {
+                    "type": "string"
+                  },
+                  "savesPerWeek": {
+                    "type": "number"
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "next": "verify",
+      "inputs": {
+        "s": "synthesize.taskOutput",
+        "runId": "run.id",
+        "g": "gather.result"
+      }
     },
     {
       "id": "verify",
@@ -1204,7 +1468,9 @@ The values live in config; the `input` map below only names them and their defau
         "s": "synthesize.taskOutput",
         "ap": "apply.result",
         "tr": "trim-apply.result",
-        "hba": "hb-apply.result"
+        "hba": "hb-apply.result",
+        "sk": "skills.taskOutput",
+        "sc": "scriptify.taskOutput"
       },
       "config": {
         "scriptName": "dream-verify",
@@ -1217,6 +1483,8 @@ The values live in config; the `input` map below only names them and their defau
           "since": "{{g.generatedAt}}",
           "synth": "{{s}}",
           "apply": "{{ap}}",
+          "skills": "{{sk}}",
+          "scriptify": "{{sc}}",
           "trim": "{{tr}}",
           "wfSnapshot": "{{g.workflowSnapshot}}",
           "hb": "{{hba}}"
@@ -1258,7 +1526,9 @@ The values live in config; the `input` map below only names them and their defau
         "g": "gather.result",
         "s": "synthesize.taskOutput",
         "ap": "apply.result",
-        "tr": "trim-apply.result"
+        "tr": "trim-apply.result",
+        "sk": "skills.taskOutput",
+        "sc": "scriptify.taskOutput"
       },
       "config": {
         "scriptName": "dream-owners",
@@ -1271,6 +1541,8 @@ The values live in config; the `input` map below only names them and their defau
           "dryRun": "{{g.dryRun}}",
           "synth": "{{s}}",
           "apply": "{{ap}}",
+          "skills": "{{sk}}",
+          "scriptify": "{{sc}}",
           "trim": "{{tr}}"
         }
       },
@@ -1294,7 +1566,10 @@ The values live in config; the `input` map below only names them and their defau
         "ap": "apply.result",
         "hbc": "hb-check.result",
         "hba": "hb-apply.result",
-        "ld": "lead-disk.taskOutput"
+        "ld": "lead-disk.taskOutput",
+        "ad": "adoption.result",
+        "sk": "skills.taskOutput",
+        "sc": "scriptify.taskOutput"
       },
       "config": {
         "agentId": "{{g.workerId}}",
@@ -1304,7 +1579,7 @@ The values live in config; the `input` map below only names them and their defau
           "dreaming-publish"
         ],
         "priority": 50,
-        "template": "dreaming run {{runId}}: publish the nightly report. Mode {{g.mode}}, DRY RUN = {{g.dryRun}}, report target `{{g.cfg.reportTarget}}`.\n\nInputs: gather {{g}} | synthesis {{s}} | verify {{v}} | trim plan {{tp}} | trim apply {{tr}} | owners {{ow}} | report guard {{rm}} | reports {{reports}} | learn {{lr}} | apply (restores/wouldRestore/restoreRefused in) {{ap}} | heartbeat check {{hbc}} | lead-disk {{ld}} | heartbeat apply {{hba}}\n(Empty strings mean a failed or skipped node, or a lane that is off: say which, from gather.lanes.)\n\nUNITS: state every size (file, field, profile, heartbeat, draft, prompt, or a size delta) in tokens: tokens = ceil(chars / 4 * ratio), ratio = 1 (uncalibrated). A signed char delta d becomes sign(d) * ceil(|d| / 4 * ratio). Inputs arrive in chars (beforeChars, afterChars, chars, liveChars, draftChars, trimmedChars, netChars, profileChars, heartbeatChars, backlog sizes, identity/memory op deltas): convert when you print and write `<n> tok`. Compute every converted value with one python3 -c or bun -e call over the input numbers, never by hand. Keep a char value only where the limit itself counts chars, in parentheses after the tokens. Counts that are not sizes stay as they are (pins, tracked items, cuts, memories, actions, USD, seconds, minutes). The 450-char slackText limit below is a Slack length limit, not a size you report.\n\n1. Report (Markdown). On a dry run, open with: \"Dry run: nothing below was written; it is what a live run would do.\"\n   If gather.overlap is non-empty, add right after that: \"Overlap: <names> also edits memories and profiles every day. Disable it, so the two loops do not edit the same rows and verify does not count its writes as unclaimed.\"\n   Sections: Headline; Silent refusals / claim mismatches / unclaimed writes / reverted trims (verify, trim survival) FIRST if non-empty; Applied (verify-confirmed only) per lane with target, one-line why, action id; Trims: one row per field (agent, field, before -> after tokens, pre-image key, and its one-line revert command from trim apply `revert`), plus refused trims with reasons and the backlog; Owned items (owners: owner, action ids, task id; say so when owners is `degraded`); Rejected (count + top reasons); Report guard (rejected/retried/missing); Lanes (one line: each lane from gather.lanes, on or off); Instrument gaps (gather errors and the line `Sizes in tokens = ceil(chars / 4 * 1), ratio 1 uncalibrated.`); Cost and runtime per node (verify.metrics).\n   **Learning**: paste `learn.table` (tonight, delta, 7-night mean) verbatim except its char rows: `profileChars` and `heartbeatChars` become `profileTokens` and `heartbeatTokens` with every number converted, then reverted / reintroduced / referenced cuts and new pins (learn.scored, learn.newPins), then restores (apply restores, wouldRestore, restoreRefused). **Heartbeat**: hb-check ready + reasons + stats (tokens before -> after, pins before = after, removed), lead-disk mode and shas, hb-apply status (wouldApply on a dry run). **Profiles**: learn.metrics.laneA totals, sizes in tokens.\n   A lane's claim without verify confirmation goes under \"Unverified\".\n2. Where the report goes, by report target (dry runs publish too: that is how an operator reviews a dry run before the first live night):\n   - `page`: create_page with title `dreaming/<UTC date>`, slug `dreaming-<UTC date>`, contentType `text/html`, authMode `authed` (never public), the report rendered as one plain HTML document. Return its URL in `reportUrl`. If create_page is not available to you, return the report in `markdown` and say so in `notes`.\n   - `agent-fs`: in your default org and drive, write `dreaming/runs/<UTC date>.md`, then append ONE entry to `dreaming/changelog.md` with `agent-fs append` (never write or overwrite that file; people comment in it). Dry runs skip the changelog append and return the entry in `changelogEntry`. Return the report path in `reportPath`.\n   - `none`: publish nothing; return the report in `markdown` only.\n   Changelog entry format, exactly:\n   ## <YYYY-MM-DD>: night <gather.night.number>\n   - Run <runId>, <mode>, <status: green | degraded (why)>, cost so far $<verify.metrics.totalCostSoFarUsd>; previous run full cost $<gather.budget.prevRunUsd> vs budget $<gather.cfg.budgetUsd>\n   - Learning: profiles <tokens of learn.trend.profileChars.tonight> tok (Δ <delta in tok>), heartbeat <tokens of learn.trend.heartbeatChars.tonight> tok (Δ <delta in tok>), restores <n applied or would-restore>\n   - <n> applied, <n> proposed, <n> rejected: <synthesis headline>\n   - Trims: <trimsLine, without the 'Trims:' prefix>\n   - Workflow changes since last run: <gather.workflowChanges: added/removed/config-changed node ids, with its base; \"none\" if all three are empty>\n   - **Lead:** <synthesis changelogComment>\n3. slackText: at most 3 lines, no headers. The Slack node appends `trimsLine` as line 4, so the receipt is at most 4 lines:\n   line 1 \":crescent_moon: Dreaming <date><' (dry run)' on a dry run>: <headline> · <n> applied (<per-lane counts, only non-zero>), <n> proposed, <n> rejected\"\n   line 2 only if verify found a silent refusal, claim mismatch, unclaimed write, survival.reverted item or reverted trim, or gather.overlap is non-empty: \":warning: <one line>\". survival.trimmed and survival.drifted are expected later rewrites: never warn on them.\n   last line: the report link (`reportUrl` or `reportPath`), or \"no report (target none)\".\n   Never put a newline inside a line. The trims line is added by the Slack node; do not repeat it. Keep slackText under 450 chars.\n4. trimsLine: trim apply `slackLine` with each `<before>→<after>` char pair rewritten in tokens and ` tok` after it, wording and order otherwise unchanged, e.g. `Lead claudeMd 17263→15903` -> `Lead claudeMd 4316→3976 tok`. Build it with code (regex over slackLine, values from trim apply wouldApply/applied beforeChars/afterChars). One line, no newline; empty string when trim apply is empty.\n\nReturn ONLY JSON {reportTarget, reportPath, reportUrl, slackText, trimsLine, markdown, changelogEntry, changelogAppended, notes}.",
+        "template": "dreaming run {{runId}}: publish the nightly report. Mode {{g.mode}}, DRY RUN = {{g.dryRun}}, report target `{{g.cfg.reportTarget}}`.\n\nInputs: gather {{g}} | synthesis {{s}} | verify {{v}} | trim plan {{tp}} | trim apply {{tr}} | owners {{ow}} | report guard {{rm}} | reports {{reports}} | learn {{lr}} | apply (restores/wouldRestore/restoreRefused in) {{ap}} | heartbeat check {{hbc}} | lead-disk {{ld}} | heartbeat apply {{hba}} | adoption gate {{ad}} | skills {{sk}} | scriptify {{sc}}\n(Empty strings mean a failed or skipped node, or a lane that is off: say which, from gather.lanes.)\n\nUNITS: state every size (file, field, profile, heartbeat, draft, prompt, or a size delta) in tokens: tokens = ceil(chars / 4 * ratio), ratio = 1 (uncalibrated). A signed char delta d becomes sign(d) * ceil(|d| / 4 * ratio). Inputs arrive in chars (beforeChars, afterChars, chars, liveChars, draftChars, trimmedChars, netChars, profileChars, heartbeatChars, backlog sizes, identity/memory op deltas): convert when you print and write `<n> tok`. Compute every converted value with one python3 -c or bun -e call over the input numbers, never by hand. Keep a char value only where the limit itself counts chars, in parentheses after the tokens. Counts that are not sizes stay as they are (pins, tracked items, cuts, memories, actions, USD, seconds, minutes). The 450-char slackText limit below is a Slack length limit, not a size you report.\n\n1. Report (Markdown). On a dry run, open with: \"Dry run: nothing below was written; it is what a live run would do.\"\n   If gather.overlap is non-empty, add right after that: \"Overlap: <names> also edits memories and profiles every day. Disable it, so the two loops do not edit the same rows and verify does not count its writes as unclaimed.\"\n   Sections: Headline; Silent refusals / claim mismatches / unclaimed writes / reverted trims (verify, trim survival) FIRST if non-empty; Applied (verify-confirmed only) per lane with target, one-line why, action id; Trims: one row per field (agent, field, before -> after tokens, pre-image key, and its one-line revert command from trim apply `revert`), plus refused trims with reasons and the backlog; Owned items (owners: owner, action ids, task id; say so when owners is `degraded`); Rejected (count + top reasons); Report guard (rejected/retried/missing); Lanes (one line: each lane from gather.lanes, on or off); Instrument gaps (gather errors and the line `Sizes in tokens = ceil(chars / 4 * 1), ratio 1 uncalibrated.`); Cost and runtime per node (verify.metrics).\n   **Learning**: paste `learn.table` (tonight, delta, 7-night mean) verbatim except its char rows: `profileChars` and `heartbeatChars` become `profileTokens` and `heartbeatTokens` with every number converted, then reverted / reintroduced / referenced cuts and new pins (learn.scored, learn.newPins), then restores (apply restores, wouldRestore, restoreRefused). **Heartbeat**: hb-check ready + reasons + stats (tokens before -> after, pins before = after, removed), lead-disk mode and shas, hb-apply status (wouldApply on a dry run). **Profiles**: learn.metrics.laneA totals, sizes in tokens. **Skills and scripts**: skills results and scriptify `built` (name, scope, controls), verify-confirmed only under Applied. **Adoption**: from the adoption gate: retired (kind, name, reason, and the rollback call `dream-rollback {mode: \"artifact\", kind, name}`), adopted (status adopted, adopted-edit, adopted-ref or adopted-promoted, uses, last use), pending (days left), and `wouldRetire` on a dry run. When `controls.reason` is \"no artifacts\", write \"no artifacts yet\", never \"0 adopted\". When gather.cfg.gateDays is 0, write \"gate off: counts only\".\n   A lane's claim without verify confirmation goes under \"Unverified\".\n2. Where the report goes, by report target (dry runs publish too: that is how an operator reviews a dry run before the first live night):\n   - `page`: create_page with title `dreaming/<UTC date>`, slug `dreaming-<UTC date>`, contentType `text/html`, authMode `authed` (never public), the report rendered as one plain HTML document. Return its URL in `reportUrl`. If create_page is not available to you, return the report in `markdown` and say so in `notes`.\n   - `agent-fs`: in your default org and drive, write `dreaming/runs/<UTC date>.md`, then append ONE entry to `dreaming/changelog.md` with `agent-fs append` (never write or overwrite that file; people comment in it). Dry runs skip the changelog append and return the entry in `changelogEntry`. Return the report path in `reportPath`.\n   - `none`: publish nothing; return the report in `markdown` only.\n   Changelog entry format, exactly:\n   ## <YYYY-MM-DD>: night <gather.night.number>\n   - Run <runId>, <mode>, <status: green | degraded (why)>, cost so far $<verify.metrics.totalCostSoFarUsd>; previous run full cost $<gather.budget.prevRunUsd> vs budget $<gather.cfg.budgetUsd>\n   - Learning: profiles <tokens of learn.trend.profileChars.tonight> tok (Δ <delta in tok>), heartbeat <tokens of learn.trend.heartbeatChars.tonight> tok (Δ <delta in tok>), restores <n applied or would-restore>\n   - <n> applied, <n> proposed, <n> rejected: <synthesis headline>\n   - Trims: <trimsLine, without the 'Trims:' prefix>\n   - Workflow changes since last run: <gather.workflowChanges: added/removed/config-changed node ids, with its base; \"none\" if all three are empty>\n   - **Lead:** <synthesis changelogComment>\n3. slackText: at most 3 lines, no headers. The Slack node appends `trimsLine` as line 4, so the receipt is at most 4 lines:\n   line 1 \":crescent_moon: Dreaming <date><' (dry run)' on a dry run>: <headline> · <n> applied (<per-lane counts, only non-zero>), <n> proposed, <n> rejected<', <n> retired' when the adoption gate retired anything>\"\n   line 2 only if verify found a silent refusal, claim mismatch, unclaimed write, survival.reverted item or reverted trim, or gather.overlap is non-empty: \":warning: <one line>\". survival.trimmed and survival.drifted are expected later rewrites: never warn on them.\n   last line: the report link (`reportUrl` or `reportPath`), or \"no report (target none)\".\n   Never put a newline inside a line. The trims line is added by the Slack node; do not repeat it. Keep slackText under 450 chars.\n4. trimsLine: trim apply `slackLine` with each `<before>→<after>` char pair rewritten in tokens and ` tok` after it, wording and order otherwise unchanged, e.g. `Lead claudeMd 17263→15903` -> `Lead claudeMd 4316→3976 tok`. Build it with code (regex over slackLine, values from trim apply wouldApply/applied beforeChars/afterChars). One line, no newline; empty string when trim apply is empty.\n\nReturn ONLY JSON {reportTarget, reportPath, reportUrl, slackText, trimsLine, markdown, changelogEntry, changelogAppended, notes}.",
         "outputSchema": {
           "type": "object",
           "required": [
