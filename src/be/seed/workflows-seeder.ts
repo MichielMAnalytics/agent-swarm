@@ -96,7 +96,8 @@ type AutomationTemplateConfig = {
    * Principal for the seeded workflow's script nodes. A seeded row has no
    * `createdByAgentId` and scheduled triggers carry no agent, so without this
    * scripts run as the literal `workflow`, which privileged writes refuse.
-   * `"lead"` resolves the current Lead at run time. See {@link resolveSeededWorkflowPrincipal}.
+   * `"lead"` resolves the current Lead at run time, for an unedited row only.
+   * See {@link resolveSeededWorkflowPrincipal}.
    */
   runAs?: "lead";
 };
@@ -254,15 +255,21 @@ export function seededLeadPrincipalWorkflowNames(
 /**
  * The agent a seeded workflow's script nodes run as when the row has no
  * `createdByAgentId`: the current Lead, but only for a template that opts in
- * with `runAs: "lead"` and a row the seeder created or adopted (a `seed_state`
- * record exists). Returns undefined otherwise, or when no Lead is registered,
- * so the caller fails closed to its existing fallback.
+ * with `runAs: "lead"`, a row the seeder created or adopted (a `seed_state`
+ * record exists), and a live definition that still hashes to the shipped
+ * template. Any agent can edit a workflow, so an edited copy must not inherit
+ * Lead. Returns undefined otherwise, or when no Lead is registered, so the
+ * caller fails closed to its existing fallback.
  */
 export async function resolveSeededWorkflowPrincipal(
-  workflow: Pick<Workflow, "name">,
+  workflow: Workflow,
   sources: readonly WorkflowTemplateSource[] = BUILT_IN_WORKFLOW_SOURCES,
 ): Promise<string | undefined> {
   if (!seededLeadPrincipalWorkflowNames(sources).has(workflow.name)) return undefined;
+  const template = loadSeedWorkflows(sources).find((w) => w.name === workflow.name);
+  if (!template) return undefined;
+  if (workflowSeedHash(workflowFromRow(workflow)) !== workflowSeedHash(hashedWorkflow(template)))
+    return undefined;
   if (!(await getSeedState("workflow", workflow.name))) return undefined;
   return (await getLeadAgent())?.id ?? undefined;
 }

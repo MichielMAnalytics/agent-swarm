@@ -80,7 +80,7 @@ The default schedule runs at 03:25 UTC. Move it to about one hour after your dep
 
 **Caps.** Each night has hard limits. By default: 6 identity edits in total and 1 per agent, 3 profile trims, 5 new memories, 5 memory edits, and 10 memory deletions. A cap of `0` turns that action off. The trim cap goes up to 12.
 
-**Who writes.** The seeded workflow has no creator and the nightly schedule names no agent, so its scripts run as the current lead. That is what lets them edit other agents' profiles. Without a lead, the run stops at gather.
+**Who writes.** The seeded workflow has no creator and the nightly schedule names no agent, so its scripts run as the current lead. That is what lets them edit other agents' profiles. An edited copy of the workflow loses this and runs without a principal, so its writes are refused. Without a lead, the run stops at gather.
 
 **Pre-images.** Before a write, dreaming saves the old content. Memory and identity changes go to a per-run ledger. Profile and heartbeat changes go to a per-run pre-image keyed by agent and field. A trim is refused when the live profile no longer matches its pre-image.
 

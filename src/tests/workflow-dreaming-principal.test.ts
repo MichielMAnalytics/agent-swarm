@@ -29,6 +29,7 @@ import {
   initDb,
   listWorkflows,
   updateAgentProfile,
+  updateWorkflow,
   upsertKv,
 } from "../be/db";
 import { setScriptEmbeddingProviderForTests } from "../be/scripts/embeddings";
@@ -198,29 +199,47 @@ describe("resolveSeededWorkflowPrincipal", () => {
     config: JSON.stringify({ name, description: name, runAllSeedersCandidate: true, runAs }),
     content: '```json\n{"nodes": []}\n```',
   });
+  /** A workflow row with exactly the template's content, as the seeder writes it. */
+  const rowFor = async (name: string) =>
+    createWorkflow({ name, description: name, definition: { nodes: [], onNodeFailure: "fail" } });
 
-  test("only an opted-in template with a seed_state row resolves to the Lead", async () => {
+  test("only an opted-in, seeder-recorded, unedited row resolves to the Lead", async () => {
     const sources = [source("principal-optin", "lead"), source("principal-plain")];
     expect([...seededLeadPrincipalWorkflowNames(sources)]).toEqual(["principal-optin"]);
     expect(seededLeadPrincipalWorkflowNames().has("dreaming")).toBe(true);
+    const optin = await rowFor("principal-optin");
+    const plain = await rowFor("principal-plain");
 
     // No seed_state row: a same-name workflow the seeder never wrote gets no principal.
-    expect(await resolveSeededWorkflowPrincipal({ name: "principal-optin" }, sources)).toBe(
-      undefined,
-    );
+    expect(await resolveSeededWorkflowPrincipal(optin, sources)).toBe(undefined);
     await recordSeedState("workflow", "principal-optin", "h");
     await recordSeedState("workflow", "principal-plain", "h");
-    expect(await resolveSeededWorkflowPrincipal({ name: "principal-optin" }, sources)).toBe(
-      LEAD_ID,
-    );
+    expect(await resolveSeededWorkflowPrincipal(optin, sources)).toBe(LEAD_ID);
     // Seeded but not opted in: unchanged behaviour.
-    expect(await resolveSeededWorkflowPrincipal({ name: "principal-plain" }, sources)).toBe(
-      undefined,
-    );
-    // The seeded dreaming row has no creator, is opted in and recorded.
+    expect(await resolveSeededWorkflowPrincipal(plain, sources)).toBe(undefined);
+    // Edited after seeding: an extra node means the row no longer is the shipped template.
+    const edited = await updateWorkflow(optin.id, {
+      definition: {
+        nodes: [{ id: "x", type: "swarm-script", config: { scriptName: "dream-apply" } }],
+        onNodeFailure: "fail",
+      },
+    });
+    expect(await resolveSeededWorkflowPrincipal(edited!, sources)).toBe(undefined);
+  });
+
+  test("the seeded dreaming row resolves to the Lead until someone edits it", async () => {
     const wf = await seededDreaming();
     expect(wf.createdByAgentId ?? null).toBeNull();
     expect(await resolveSeededWorkflowPrincipal(wf)).toBe(LEAD_ID);
+    const edited = await updateWorkflow(wf.id, {
+      definition: { ...wf.definition, nodes: [...wf.definition.nodes].slice(0, -1) },
+    });
+    try {
+      expect(await resolveSeededWorkflowPrincipal(edited!)).toBe(undefined);
+    } finally {
+      await updateWorkflow(wf.id, { definition: wf.definition });
+    }
+    expect(await resolveSeededWorkflowPrincipal(await seededDreaming())).toBe(LEAD_ID);
   });
 });
 
