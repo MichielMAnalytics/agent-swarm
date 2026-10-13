@@ -1,4 +1,5 @@
 import type { ExecutorInput, ExecutorOutput } from "./executors/types";
+import type { SeccompPolicy } from "./sandbox-seccomp";
 
 /**
  * Native script sandbox level, measured once per API process by running one
@@ -82,3 +83,23 @@ export function interpretSandboxProbe(
 export function requireNativeIsolation(): boolean {
   return process.env.SCRIPT_NATIVE_REQUIRE_ISOLATION === "true";
 }
+
+/** Operator switch for the exec-deny filter. Default on; only `"false"` turns it off. */
+export function nativeExecDenyEnabled(): boolean {
+  return process.env.SCRIPT_NATIVE_EXEC_DENY !== "false";
+}
+
+/**
+ * The `SWARM_SCRIPT_SECCOMP` policy the native executor passes to the harness:
+ * `off` when the operator disabled the exec-deny filter, `required` when
+ * isolation is required, `best-effort` otherwise. With the filter off the
+ * level can never be `hardened`, so `SCRIPT_NATIVE_REQUIRE_ISOLATION=true`
+ * then refuses every native run.
+ */
+export function nativeSeccompPolicy(): SeccompPolicy {
+  if (!nativeExecDenyEnabled()) return "off";
+  return requireNativeIsolation() ? "required" : "best-effort";
+}
+
+/** Which script entrypoint `scriptSandbox` on /health measures. */
+export const SCRIPT_SANDBOX_SCOPE = "native-executor";

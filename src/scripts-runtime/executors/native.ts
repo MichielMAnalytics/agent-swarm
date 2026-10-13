@@ -13,10 +13,12 @@ import {
 } from "../../utils/sandboxed-process";
 import {
   interpretSandboxProbe,
+  nativeSeccompPolicy,
   requireNativeIsolation,
   type ScriptSandboxStatus,
   sandboxProbeInput,
 } from "../sandbox-probe";
+import type { SeccompPolicy } from "../sandbox-seccomp";
 import type { ExecutorInput, ExecutorOutput, ScriptExecutor, ScriptExecutorError } from "./types";
 
 function makeUnsupportedOutput(stderr: string): ExecutorOutput {
@@ -161,13 +163,19 @@ function harnessCommand(
 
 let sandboxStatus: ScriptSandboxStatus | undefined;
 let sandboxStatusPromise: Promise<ScriptSandboxStatus> | undefined;
+let probedPolicy: SeccompPolicy | undefined;
 
 /**
- * Run the sandbox probe once per process (see `sandbox-probe.ts`). The API
- * starts it at boot; `SCRIPT_NATIVE_REQUIRE_ISOLATION` runs await it.
+ * Run the sandbox probe once per process and exec-deny policy (see
+ * `sandbox-probe.ts`). The API starts it at boot; `SCRIPT_NATIVE_REQUIRE_ISOLATION`
+ * runs await it. Changing `SCRIPT_NATIVE_EXEC_DENY` at runtime re-runs it.
  */
 export function getNativeSandboxStatus(): Promise<ScriptSandboxStatus> {
-  sandboxStatusPromise ??= new NativeScriptExecutor()
+  const policy = nativeSeccompPolicy();
+  if (sandboxStatusPromise && probedPolicy === policy) return sandboxStatusPromise;
+  probedPolicy = policy;
+  sandboxStatus = undefined;
+  const probe: Promise<ScriptSandboxStatus> = new NativeScriptExecutor()
     .runUnchecked(sandboxProbeInput())
     .then((output) => interpretSandboxProbe(output, process.getuid?.()))
     .catch((error: unknown) => ({
@@ -177,14 +185,22 @@ export function getNativeSandboxStatus(): Promise<ScriptSandboxStatus> {
       error: error instanceof Error ? error.message : String(error),
     }))
     .then((status) => {
-      sandboxStatus = status;
+      // A newer probe for another policy owns the cache now.
+      if (sandboxStatusPromise === probe) sandboxStatus = status;
       return status;
     });
-  return sandboxStatusPromise;
+  sandboxStatusPromise = probe;
+  return probe;
 }
 
-/** The probe result, or `undefined` while it has not finished. */
+/**
+ * The probe result for the current exec-deny policy, or `undefined` while it
+ * has not finished. A policy change since the last probe starts a new one.
+ */
 export function peekNativeSandboxStatus(): ScriptSandboxStatus | undefined {
+  if (probedPolicy !== undefined && probedPolicy !== nativeSeccompPolicy()) {
+    void getNativeSandboxStatus();
+  }
   return sandboxStatus;
 }
 
@@ -196,7 +212,7 @@ export class NativeScriptExecutor implements ScriptExecutor {
       const status = await getNativeSandboxStatus();
       if (status.level !== "hardened") {
         return makeUnsupportedOutput(
-          `SCRIPT_NATIVE_REQUIRE_ISOLATION is set, but the native script sandbox is "${status.level}", not "hardened". The API must run as root with the CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID and SETUID capabilities, and the seccomp filter must install.`,
+          `SCRIPT_NATIVE_REQUIRE_ISOLATION is set, but the native script sandbox is "${status.level}", not "hardened". The API must run as root with the CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID and SETUID capabilities, and the seccomp filter must install${nativeSeccompPolicy() === "off" ? ", but SCRIPT_NATIVE_EXEC_DENY=false turns it off; to run scripts without the filter, turn SCRIPT_NATIVE_REQUIRE_ISOLATION off too" : ""}.`,
         );
       }
     }
@@ -253,8 +269,14 @@ export class NativeScriptExecutor implements ScriptExecutor {
       input.signal?.addEventListener("abort", onExternalAbort, { once: true });
       removeAbortListener = () => input.signal?.removeEventListener("abort", onExternalAbort);
 
+      // An abort before the listener existed fires no event; check it here.
+      if (input.signal?.aborted) killed = true;
+      if (killed) throw new Error("script run aborted before start");
       uidLease = await leaseSandboxUid(input.signal);
       if (uidLease) await chownForSandbox(tmpdir, uidLease.user);
+      // Lease and chown are async: the listener may have fired with no child
+      // to terminate. Never spawn after an abort; `finally` releases the lease.
+      if (killed) throw new Error("script run aborted before start");
 
       const timeout = setTimeout(() => {
         timedOut = true;
@@ -268,7 +290,7 @@ export class NativeScriptExecutor implements ScriptExecutor {
         LANG: process.env.LANG ?? "C.UTF-8",
         LC_ALL: process.env.LC_ALL ?? "C.UTF-8",
         TMPDIR: tmpdir,
-        SWARM_SCRIPT_SECCOMP: requireNativeIsolation() ? "required" : "best-effort",
+        SWARM_SCRIPT_SECCOMP: nativeSeccompPolicy(),
         SWARM_SCRIPT_TMPDIR: tmpdir,
         SWARM_SCRIPT_ARGS_FILE: argsFile,
         SWARM_SCRIPT_SOURCE_FILE: sourceFile,

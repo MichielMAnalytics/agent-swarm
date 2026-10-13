@@ -57,6 +57,7 @@ import { closeRooms, removeNamespaceRooms, sweepRooms } from "../realtime/rooms"
 import { attachRealtimeTransport } from "../realtime/transport";
 import { startScriptRunSupervisor, stopScriptRunSupervisor } from "../script-workflows/supervisor";
 import { getNativeSandboxStatus } from "../scripts-runtime/executors/native";
+import { nativeSeccompPolicy } from "../scripts-runtime/sandbox-probe";
 import { getServerSessionsProcessed } from "../server-runtime-counters";
 import { startSlackApp, stopSlackApp } from "../slack";
 import { telemetry } from "../telemetry";
@@ -722,7 +723,7 @@ httpServer
     // Measure the native script sandbox once; /health reports the level.
     void getNativeSandboxStatus().then((status) => {
       console.log(
-        `[Scripts] Native script sandbox: ${status.level} (uid drop ${status.uidDropped ? "on" : "off"}, seccomp ${status.seccomp ? "on" : "off"})${status.error ? `; probe error: ${status.error}` : ""}`,
+        `[Scripts] Native script sandbox: ${status.level} (uid drop ${status.uidDropped ? "on" : "off"}, seccomp ${status.seccomp ? "on" : "off"}, exec-deny policy ${nativeSeccompPolicy()})${status.error ? `; probe error: ${status.error}` : ""}`,
       );
     });
 

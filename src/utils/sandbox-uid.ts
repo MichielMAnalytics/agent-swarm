@@ -60,15 +60,41 @@ async function exitCode(argv: string[]): Promise<number> {
   }
 }
 
-/** `kill -KILL -1` as `user` signals every process of that uid except itself. */
-async function reapUid(user: SandboxUser): Promise<void> {
-  await exitCode([...setprivPrefix(user), "bash", "-c", "kill -KILL -1 2>/dev/null; exit 0"]);
+/**
+ * `reaped`: leftover processes were killed. `empty`: none were left.
+ * `failed`: the reaper did not run as the uid (spawn or drop failed), so
+ * processes may survive and the uid must not be reused.
+ */
+export type ReapOutcome = "reaped" | "empty" | "failed";
+
+const REAP_EMPTY_EXIT = 3;
+
+/**
+ * `kill -KILL -1` as `user` signals every process of that uid except itself.
+ * It fails only with ESRCH (nothing to signal) under its own uid, which the
+ * script reports as exit 3. Any other exit means the reaper itself failed.
+ */
+export async function reapUid(user: SandboxUser): Promise<ReapOutcome> {
+  const code = await exitCode([
+    ...setprivPrefix(user),
+    "bash",
+    "-c",
+    `kill -KILL -1 2>/dev/null && exit 0; exit ${REAP_EMPTY_EXIT}`,
+  ]);
+  if (code === 0) return "reaped";
+  if (code === REAP_EMPTY_EXIT) return "empty";
+  return "failed";
 }
 
 export type SandboxUidPool = {
   lease(signal?: AbortSignal): Promise<SandboxUidLease>;
   inUse(): number;
+  /** Slots held back because their reap failed. */
+  quarantined(): number;
 };
+
+/** Delay before a quarantined slot's reap is retried. */
+export const SANDBOX_UID_REAP_RETRY_MS = 30_000;
 
 /**
  * A fixed pool of `size` uids starting at `base`. When every slot is taken,
@@ -80,12 +106,49 @@ export type SandboxUidPool = {
 export function createSandboxUidPool(opts: {
   base: number;
   size: number;
-  reap?: (user: SandboxUser) => Promise<void>;
+  reap?: (user: SandboxUser) => Promise<ReapOutcome>;
+  reapRetryMs?: number;
 }): SandboxUidPool {
   const reap = opts.reap ?? reapUid;
+  const reapRetryMs = opts.reapRetryMs ?? SANDBOX_UID_REAP_RETRY_MS;
   const used = new Set<number>();
+  const quarantine = new Set<number>();
   const waiters: Array<() => void> = [];
   let cursor = 0;
+
+  function wakeNext(): void {
+    waiters.shift()?.();
+  }
+
+  async function tryReap(user: SandboxUser): Promise<boolean> {
+    try {
+      return (await reap(user)) !== "failed";
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Reap `slot`'s uid and free it only on success. On failure the slot stays
+   * taken (quarantined) and the reap is retried later, so a uid that may
+   * still run a process is never handed to another run.
+   */
+  async function reclaim(slot: number, user: SandboxUser): Promise<void> {
+    if (await tryReap(user)) {
+      quarantine.delete(slot);
+      used.delete(slot);
+      wakeNext();
+      return;
+    }
+    if (!quarantine.has(slot)) {
+      quarantine.add(slot);
+      console.warn(
+        `[sandbox-uid] Could not reap uid ${user.uid}; holding it back and retrying in ${reapRetryMs}ms`,
+      );
+    }
+    const retry = setTimeout(() => void reclaim(slot, user), reapRetryMs);
+    retry.unref?.();
+  }
 
   function take(): number | undefined {
     for (let i = 0; i < opts.size; i++) {
@@ -101,9 +164,9 @@ export function createSandboxUidPool(opts: {
   }
 
   async function lease(signal?: AbortSignal): Promise<SandboxUidLease> {
+    signal?.throwIfAborted();
     let slot = take();
     while (slot === undefined) {
-      signal?.throwIfAborted();
       await new Promise<void>((resolve, reject) => {
         const onAbort = () => {
           const index = waiters.indexOf(wake);
@@ -117,27 +180,29 @@ export function createSandboxUidPool(opts: {
         waiters.push(wake);
         signal?.addEventListener("abort", onAbort, { once: true });
       });
+      if (signal?.aborted) {
+        // Woken for a freed slot after cancelling: pass the wake-up on.
+        wakeNext();
+        signal.throwIfAborted();
+      }
       slot = take();
     }
-    const id = opts.base + slot;
+    const taken = slot;
+    const id = opts.base + taken;
     const user = { uid: id, gid: id };
     let released = false;
     return {
       user,
+      // Never rejects: a failed reap quarantines the slot instead.
       async release() {
         if (released) return;
         released = true;
-        try {
-          await reap(user);
-        } finally {
-          used.delete(slot);
-          waiters.shift()?.();
-        }
+        await reclaim(taken, user);
       },
     };
   }
 
-  return { lease, inUse: () => used.size };
+  return { lease, inUse: () => used.size, quarantined: () => quarantine.size };
 }
 
 let defaultPool: SandboxUidPool | undefined;

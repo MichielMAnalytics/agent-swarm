@@ -1407,9 +1407,18 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "SCRIPT_NATIVE_REQUIRE_ISOLATION",
         label: "Require native script isolation",
         description:
-          "Refuse native script runs unless the sandbox is hardened: a separate sandbox user plus the exec-deny filter. /health reports the level as scriptSandbox.",
+          "Refuse native script runs unless the sandbox is hardened: a separate sandbox user plus the exec-deny filter. With the exec-deny filter off, every native run is refused. /health reports the level as scriptSandbox; it covers native script runs only, not durable runs or workflow script nodes.",
         kind: "boolean",
         defaultValue: "false",
+        docsUrl: `${DOCS}ui/configuration#native-script-sandbox`,
+      },
+      {
+        key: "SCRIPT_NATIVE_EXEC_DENY",
+        label: "Native script exec-deny filter",
+        description:
+          "Stop native scripts from starting other programs (Bun.spawn, Bun.$, stdlib.grep). Turn off only to recover a script that needs it; the sandbox level then drops below hardened. /health reports the policy as scriptSandboxExecDeny.",
+        kind: "boolean",
+        defaultValue: "true",
         docsUrl: `${DOCS}ui/configuration#native-script-sandbox`,
       },
       {

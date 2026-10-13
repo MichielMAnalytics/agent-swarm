@@ -3,6 +3,8 @@ import {
   createSandboxUidPool,
   DEFAULT_SANDBOX_UID_BASE,
   hasSandboxUidDropCaps,
+  type ReapOutcome,
+  reapUid,
   SANDBOX_UID_DROP_CAPS,
   type SandboxUser,
   sandboxUidBase,
@@ -10,8 +12,9 @@ import {
 } from "../utils/sandbox-uid";
 
 const reaped: SandboxUser[] = [];
-const reap = async (user: SandboxUser) => {
+const reap = async (user: SandboxUser): Promise<ReapOutcome> => {
   reaped.push(user);
+  return "reaped";
 };
 
 afterEach(() => {
@@ -74,6 +77,103 @@ describe("sandbox uid pool", () => {
     expect(pool.inUse()).toBe(0);
     const again = await pool.lease();
     expect(again.user.uid).toBe(61000);
+  });
+});
+
+describe("sandbox uid reap failures", () => {
+  test("an already-empty uid frees the slot", async () => {
+    const pool = createSandboxUidPool({ base: 61000, size: 1, reap: async () => "empty" });
+    const lease = await pool.lease();
+    await lease.release();
+    expect(pool.inUse()).toBe(0);
+    expect(pool.quarantined()).toBe(0);
+    expect((await pool.lease()).user.uid).toBe(61000);
+  });
+
+  test("a failed reap holds the uid back and wakes no waiter until a retry succeeds", async () => {
+    const outcomes: ReapOutcome[] = ["failed", "empty"];
+    const pool = createSandboxUidPool({
+      base: 61000,
+      size: 1,
+      reap: async () => outcomes.shift() ?? "empty",
+      reapRetryMs: 30,
+    });
+    const held = await pool.lease();
+    let granted: number | undefined;
+    const waiting = pool.lease().then((lease) => {
+      granted = lease.user.uid;
+      return lease;
+    });
+    await held.release();
+    expect(pool.inUse()).toBe(1);
+    expect(pool.quarantined()).toBe(1);
+    await Bun.sleep(5);
+    expect(granted).toBeUndefined();
+    const next = await waiting;
+    expect(next.user.uid).toBe(61000);
+    expect(pool.quarantined()).toBe(0);
+  });
+
+  test("a reaper that throws counts as failed and release still resolves", async () => {
+    const pool = createSandboxUidPool({
+      base: 61000,
+      size: 2,
+      reap: async () => {
+        throw new Error("spawn failed");
+      },
+      reapRetryMs: 60_000,
+    });
+    const lease = await pool.lease();
+    await lease.release();
+    expect(pool.inUse()).toBe(1);
+    expect(pool.quarantined()).toBe(1);
+    // The held-back uid is never handed out again.
+    expect((await pool.lease()).user.uid).not.toBe(lease.user.uid);
+  });
+
+  test.skipIf(process.getuid?.() === 0)(
+    "the real reaper reports failed when it cannot drop to the uid",
+    async () => {
+      expect(await reapUid({ uid: 61999, gid: 61999 })).toBe("failed");
+    },
+  );
+
+  test.skipIf(process.platform !== "linux" || process.getuid?.() !== 0)(
+    "the real reaper reports an unused uid as empty",
+    async () => {
+      expect(await reapUid({ uid: 61999, gid: 61999 })).toBe("empty");
+    },
+  );
+});
+
+describe("sandbox uid lease cancellation", () => {
+  test("an already-aborted signal gets no lease, even with free slots", async () => {
+    const pool = createSandboxUidPool({ base: 61000, size: 2, reap });
+    const controller = new AbortController();
+    controller.abort(new Error("cancelled"));
+    await expect(pool.lease(controller.signal)).rejects.toThrow("cancelled");
+    expect(pool.inUse()).toBe(0);
+  });
+
+  test("a waiter cancelled as it wakes passes the slot to the next waiter", async () => {
+    const pool = createSandboxUidPool({ base: 61000, size: 1, reap });
+    const held = await pool.lease();
+    const controller = new AbortController();
+    const { signal } = controller;
+    // Abort lands between the wake-up and the waiter resuming: the pool
+    // removes the abort listener on wake, so abort right after that.
+    const removeListener = signal.removeEventListener.bind(signal);
+    signal.removeEventListener = ((...args: Parameters<AbortSignal["removeEventListener"]>) => {
+      removeListener(...args);
+      controller.abort(new Error("cancelled"));
+    }) as AbortSignal["removeEventListener"];
+    const cancelled = pool.lease(signal);
+    const next = pool.lease();
+    await held.release();
+    await expect(cancelled).rejects.toThrow("cancelled");
+    const lease = await Promise.race([next, Bun.sleep(500).then(() => undefined)]);
+    expect(lease?.user.uid).toBe(61000);
+    expect(pool.inUse()).toBe(1);
   });
 });
 

@@ -422,6 +422,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
     "MODEL_AUTO_UPGRADE",
     "COMB_ENABLED",
     "SCRIPT_NATIVE_REQUIRE_ISOLATION",
+    "SCRIPT_NATIVE_EXEC_DENY",
   ]),
   ...enumValidator("SLACK_MODE", ["socket", "http"]),
   ...enumValidator("SLACK_THREAD_STEERING", ["off", "lead", "all"]),
