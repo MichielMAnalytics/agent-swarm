@@ -40,7 +40,7 @@ import {
 } from "../be/scripts/typecheck";
 import { can } from "../rbac";
 import { extractScriptSignature, type ScriptSignature } from "../scripts-runtime/extract-signature";
-import { runScript } from "../scripts-runtime/loader";
+import { type RunScriptOutput, runScriptAfterSetup } from "../scripts-runtime/loader";
 import {
   ScriptApiAuthModeSchema,
   ScriptApiRecordSchema,
@@ -767,21 +767,53 @@ export async function handleScripts(
     const runId = crypto.randomUUID();
     const scriptName = parsed.body.name ?? "(inline source)";
 
-    const credentials = await buildScriptCredentialBindingsWithFailures({ agentId: agent.id });
-    const output = await runScript({
-      source: source as string,
-      entrypoint: "agent",
-      ...(parentExecutor ? { parentExecutor } : {}),
-      correlation: { runId, scriptId: namedScript?.id, scriptName },
-      args: parsed.body.args,
-      fsMode,
-      agentId: agent.id,
-      runtimeInstanceId,
-      egressSecrets: credentials.egressSecrets,
-      failedBindings: credentials.failedBindings,
-      apiConnections: getScriptApiConnectionDescriptors({ agentId: agent.id }),
-      mcpConnections: getScriptMcpConnectionDescriptors({ agentId: agent.id }),
-    });
+    let output: RunScriptOutput;
+    try {
+      output = await runScriptAfterSetup(
+        {
+          entrypoint: "agent",
+          ...(parentExecutor ? { parentExecutor } : {}),
+          correlation: { runId, scriptId: namedScript?.id, scriptName },
+          agentId: agent.id,
+        },
+        async () => {
+          const credentials = await buildScriptCredentialBindingsWithFailures({
+            agentId: agent.id,
+          });
+          return {
+            source: source as string,
+            args: parsed.body.args,
+            fsMode,
+            runtimeInstanceId,
+            egressSecrets: credentials.egressSecrets,
+            failedBindings: credentials.failedBindings,
+            apiConnections: getScriptApiConnectionDescriptors({ agentId: agent.id }),
+            mcpConnections: getScriptMcpConnectionDescriptors({ agentId: agent.id }),
+          };
+        },
+      );
+    } catch (err) {
+      // The run was admitted: record it under its allocated id, then fail the
+      // request as before.
+      try {
+        await recordInlineScriptRun({
+          id: runId,
+          agentId: agent.id,
+          source: source as string,
+          args: scrubObject(parsed.body.args ?? null),
+          scriptName,
+          status: "failed",
+          error: scrubSecrets(
+            `executor_error — ${err instanceof Error ? err.message : String(err)}`,
+          ),
+          startedAt,
+          finishedAt: new Date().toISOString(),
+        });
+      } catch {
+        // swallow — persistence is observability only; the run's error wins.
+      }
+      throw err;
+    }
     const ok = output.exitCode === 0 && !output.error && !output.runtimeError;
 
     if (namedScript?.isScratch && ok) {

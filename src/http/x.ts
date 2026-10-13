@@ -20,7 +20,7 @@ import {
   MIN_SCRIPT_WALL_CLOCK_MS,
 } from "../scripts-runtime/executors/types";
 import type { RunScriptOutput } from "../scripts-runtime/loader";
-import { runScript } from "../scripts-runtime/loader";
+import { runScriptAfterSetup } from "../scripts-runtime/loader";
 import { scrubObject, scrubSecrets } from "../utils/secret-scrubber";
 import { validateJsonSchema } from "../workflows/json-schema-validator";
 import { route } from "./route-def";
@@ -242,27 +242,56 @@ export async function handleX(
   // Allocated up front so the executor log line and the script_runs row share it.
   const runId = crypto.randomUUID();
 
-  const credentials = await buildScriptCredentialBindingsWithFailures({
-    agentId: endpoint.agentId,
-  });
-  const output = await runScript({
-    source: script.source,
-    entrypoint: "script-api",
-    correlation: { runId, scriptId: script.id, scriptName: script.name },
-    args: args ?? null,
-    fsMode: "none",
-    agentId: endpoint.agentId,
-    // timeoutMs only raises the wall-clock limit (network-bound scripts can use
-    // the full window); the CPU ulimit (`ulimit -t`) is intentionally left at
-    // the runtime default rather than scaled with the caller-controlled
-    // timeout, so an external caller can't use a long X-Swarm-Timeout-Ms to
-    // burn proportionally more CPU per request.
-    timeoutMs,
-    egressSecrets: credentials.egressSecrets,
-    failedBindings: credentials.failedBindings,
-    apiConnections: getScriptApiConnectionDescriptors({ agentId: endpoint.agentId }),
-    mcpConnections: getScriptMcpConnectionDescriptors({ agentId: endpoint.agentId }),
-  });
+  let output: RunScriptOutput;
+  try {
+    output = await runScriptAfterSetup(
+      {
+        entrypoint: "script-api",
+        correlation: { runId, scriptId: script.id, scriptName: script.name },
+        agentId: endpoint.agentId,
+      },
+      async () => {
+        const credentials = await buildScriptCredentialBindingsWithFailures({
+          agentId: endpoint.agentId,
+        });
+        return {
+          source: script.source,
+          args: args ?? null,
+          fsMode: "none",
+          // timeoutMs only raises the wall-clock limit (network-bound scripts can use
+          // the full window); the CPU ulimit (`ulimit -t`) is intentionally left at
+          // the runtime default rather than scaled with the caller-controlled
+          // timeout, so an external caller can't use a long X-Swarm-Timeout-Ms to
+          // burn proportionally more CPU per request.
+          timeoutMs,
+          egressSecrets: credentials.egressSecrets,
+          failedBindings: credentials.failedBindings,
+          apiConnections: getScriptApiConnectionDescriptors({ agentId: endpoint.agentId }),
+          mcpConnections: getScriptMcpConnectionDescriptors({ agentId: endpoint.agentId }),
+        };
+      },
+    );
+  } catch (err) {
+    // The run was admitted: record it under its allocated id, then fail the
+    // request as before.
+    try {
+      await recordInlineScriptRun({
+        id: runId,
+        agentId: endpoint.agentId,
+        source: script.source,
+        args: scrubObject(args ?? null),
+        scriptName: script.name,
+        status: "failed",
+        error: scrubSecrets(`executor_error — ${err instanceof Error ? err.message : String(err)}`),
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        apiEndpointId: endpointId,
+      });
+    } catch {
+      // ignore — persistence is observability only; the run's error wins.
+    }
+    throw err;
+  }
 
   const ok = output.exitCode === 0 && !output.error && !output.runtimeError;
   const error = ok ? null : buildExecutionError(output);

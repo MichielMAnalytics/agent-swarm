@@ -131,7 +131,103 @@ async function buildConfigPayload(
   };
 }
 
+/** The fields of a run its executor log line needs. */
+type RunLogInput = Pick<
+  RunScriptInput,
+  "entrypoint" | "parentExecutor" | "correlation" | "agentId"
+>;
+
+/**
+ * The one terminal log line of an admitted run: returned failures and thrown
+ * exceptions log here too. Identity only: never args, bearer or credentials.
+ */
+function logScriptRun(
+  input: RunLogInput,
+  executorName: string | undefined,
+  outcome: { exit: string; error?: string; durationMs: number },
+): void {
+  console.info(
+    `[scripts-runtime] run${formatRunLogFields({
+      entrypoint: input.entrypoint,
+      executor: executorName,
+      parent: input.parentExecutor,
+      ...input.correlation,
+      agentId: input.agentId,
+      exit: outcome.exit,
+      error: outcome.error,
+      durationMs: String(outcome.durationMs),
+    })}`,
+  );
+}
+
+function logThrownScriptRun(
+  input: RunLogInput,
+  executorName: string | undefined,
+  startedAtMs: number,
+): void {
+  logScriptRun(input, executorName, {
+    exit: "thrown",
+    error: "executor_error",
+    durationMs: Math.round(performance.now() - startedAtMs),
+  });
+}
+
+/**
+ * `runScript` behind caller setup (credential bindings, connection
+ * descriptors) that runs once the caller has admitted the run. A setup throw
+ * logs the executor line like a run throw, so every admitted run logs once.
+ */
+export async function runScriptAfterSetup(
+  run: RunLogInput,
+  setup: () => Promise<Omit<RunScriptInput, keyof RunLogInput>>,
+): Promise<RunScriptOutput> {
+  const startedAtMs = performance.now();
+  let input: RunScriptInput;
+  try {
+    input = { ...run, ...(await setup()) };
+  } catch (err) {
+    let executorName: string | undefined;
+    try {
+      executorName = resolveRunExecutor(run);
+    } catch {
+      // Log the run without an executor rather than mask the setup error.
+    }
+    logThrownScriptRun(run, executorName, startedAtMs);
+    throw err;
+  }
+  return runScript(input);
+}
+
 export async function runScript(input: RunScriptInput): Promise<RunScriptOutput> {
+  const startedAtMs = performance.now();
+  let executorName: string | undefined;
+  let output: ExecutorOutput;
+  try {
+    // Resolve once: capacity retries reuse the same executor even if the
+    // config reloads mid-run.
+    executorName = resolveRunExecutor(input);
+    output = await executeRun(input, executorName);
+  } catch (err) {
+    logThrownScriptRun(input, executorName, startedAtMs);
+    throw err;
+  }
+  logScriptRun(input, executorName, {
+    exit: String(output.exitCode),
+    error: output.error,
+    durationMs: output.durationMs,
+  });
+
+  return {
+    ...output,
+    result: scrubObject(output.result),
+    stdout: scrubSecrets(output.stdout),
+    stderr: scrubSecrets(output.stderr),
+    ...(output.runtimeError ? { runtimeError: scrubObject(output.runtimeError) } : {}),
+    executor: executorName,
+  };
+}
+
+async function executeRun(input: RunScriptInput, executorName: string): Promise<ExecutorOutput> {
   if (input.fsMode === "workspace-rw") {
     return {
       result: undefined,
@@ -163,9 +259,6 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
     ...(input.timeoutMs ? { wallClockMs: input.timeoutMs } : {}),
   };
 
-  // Resolve once: capacity retries below reuse the same executor even if the
-  // config reloads mid-run.
-  const executorName = resolveRunExecutor(input);
   const executor = getScriptExecutor(executorName);
   const configPayload = await buildConfigPayload(input, executorName);
   const executorInput = {
@@ -184,25 +277,5 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
     await Bun.sleep(delayMs);
     output = await executor.run(executorInput);
   }
-  console.info(
-    `[scripts-runtime] run${formatRunLogFields({
-      entrypoint: input.entrypoint,
-      executor: executorName,
-      parent: input.parentExecutor,
-      ...input.correlation,
-      agentId: input.agentId,
-      exit: String(output.exitCode),
-      error: output.error,
-      durationMs: String(output.durationMs),
-    })}`,
-  );
-
-  return {
-    ...output,
-    result: scrubObject(output.result),
-    stdout: scrubSecrets(output.stdout),
-    stderr: scrubSecrets(output.stderr),
-    ...(output.runtimeError ? { runtimeError: scrubObject(output.runtimeError) } : {}),
-    executor: executorName,
-  };
+  return output;
 }

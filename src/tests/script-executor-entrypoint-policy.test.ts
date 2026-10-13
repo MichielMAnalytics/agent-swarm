@@ -12,7 +12,7 @@ import { handleScripts } from "../http/scripts";
 import { getPathSegments, parseQueryParams } from "../http/utils";
 import { handleX } from "../http/x";
 import { executorFor, type ScriptEntrypoint } from "../scripts-runtime/executors/registry";
-import { runScript } from "../scripts-runtime/loader";
+import { runScript, runScriptAfterSetup } from "../scripts-runtime/loader";
 import { refreshSecretScrubberCache } from "../utils/secret-scrubber";
 import { SKIP_SANDBOX_SPAWN_TESTS } from "./sandbox-spawn-test-helpers";
 
@@ -423,6 +423,160 @@ describe("executor log correlates with the persisted run", () => {
     // Each record's output is the one its own executor produced.
     expect(JSON.parse(apiRow.output)).toEqual({ bun: "undefined" });
     expect(JSON.parse(inlineRow.output)).toEqual({ bun: "object" });
+  });
+
+  async function runRows() {
+    return getDbClient().query<{
+      id: string;
+      scriptName: string;
+      status: string;
+      error: string | null;
+      apiEndpointId: string | null;
+    }>("SELECT id, scriptName, status, error, apiEndpointId FROM script_runs");
+  }
+
+  test("a rejected import logs one line under the persisted failed run's id", async () => {
+    const secretArg = "arg-value-that-must-not-be-logged";
+    const { value, lines } = await captureRunLogs(() =>
+      agentRun({
+        source: `import { readFileSync } from "node:fs";\nexport default async () => readFileSync;`,
+        args: { secretArg },
+      }),
+    );
+    expect(value.error).toBe("import_violation");
+
+    const rows = await runRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("failed");
+    expect(lines).toEqual([
+      expect.objectContaining({
+        entrypoint: "agent",
+        executor: "native",
+        runId: rows[0]?.id,
+        scriptName: "(inline source)",
+        agentId: workerId,
+        exit: "1",
+        error: "import_violation",
+      }),
+    ]);
+    expect(JSON.stringify(lines)).not.toContain(secretArg);
+    expect(JSON.stringify(lines)).not.toContain(API_KEY);
+  });
+
+  test("a setup throw on the script API persists one failed row and logs its id", async () => {
+    const script = await insertSaved(PROBE_SOURCE);
+    const endpoint = await createScriptApi({
+      scriptId: script.id,
+      agentId: workerId,
+      authMode: "none",
+    });
+    // buildConfigPayload throws without a swarm API key.
+    delete process.env.AGENT_SWARM_API_KEY;
+    let thrown: unknown;
+    const { lines } = await captureRunLogs(async () => {
+      try {
+        await dispatch(`/api/x/script/${endpoint.id}`, {
+          method: "POST",
+          body: JSON.stringify({}),
+          auth: null,
+        });
+      } catch (err) {
+        thrown = err;
+      } finally {
+        process.env.AGENT_SWARM_API_KEY = API_KEY;
+      }
+    });
+    expect(String(thrown)).toContain("Swarm API key is required");
+
+    const rows = await runRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      scriptName: script.name,
+      status: "failed",
+      apiEndpointId: endpoint.id,
+    });
+    expect(rows[0]?.error).toContain("executor_error");
+    expect(lines).toEqual([
+      expect.objectContaining({
+        entrypoint: "script-api",
+        executor: "native",
+        runId: rows[0]?.id,
+        scriptId: script.id,
+        exit: "thrown",
+        error: "executor_error",
+      }),
+    ]);
+  });
+
+  test("an execution throw on the agent API persists one failed row and logs its id", async () => {
+    const savedTmpdir = process.env.TMPDIR;
+    // The native executor's temp-dir mkdir throws before its own catch.
+    process.env.TMPDIR = "/dev/null";
+    let thrown: unknown;
+    const { lines } = await captureRunLogs(async () => {
+      try {
+        await dispatch("/api/scripts/run", {
+          method: "POST",
+          body: JSON.stringify({ source: PROBE_SOURCE }),
+          agentId: workerId,
+        });
+      } catch (err) {
+        thrown = err;
+      } finally {
+        if (savedTmpdir === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = savedTmpdir;
+      }
+    });
+    expect(thrown).toBeDefined();
+
+    const rows = await runRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ scriptName: "(inline source)", status: "failed" });
+    expect(rows[0]?.error).toContain("executor_error");
+    expect(lines).toEqual([
+      expect.objectContaining({
+        entrypoint: "agent",
+        executor: "native",
+        runId: rows[0]?.id,
+        exit: "thrown",
+        error: "executor_error",
+      }),
+    ]);
+  });
+
+  test("a caller-setup throw logs the run before runScript is reached", async () => {
+    const { lines } = await captureRunLogs(async () => {
+      await expect(
+        runScriptAfterSetup(
+          { entrypoint: "schedule", agentId: workerId, correlation: { runId: "run-2" } },
+          async () => {
+            throw new Error("credential store unavailable");
+          },
+        ),
+      ).rejects.toThrow("credential store unavailable");
+    });
+    expect(lines).toEqual([
+      expect.objectContaining({
+        entrypoint: "schedule",
+        executor: "native",
+        runId: "run-2",
+        exit: "thrown",
+        error: "executor_error",
+      }),
+    ]);
+  });
+
+  test("a pre-admission refusal logs no run and persists no row", async () => {
+    const { value, lines } = await captureRunLogs(() =>
+      dispatch("/api/scripts/run", {
+        method: "POST",
+        body: JSON.stringify({ name: "no-such-script" }),
+        agentId: workerId,
+      }),
+    );
+    expect(value.status).toBe(404);
+    expect(lines).toEqual([]);
+    expect(await runRows()).toEqual([]);
   });
 
   test("workflow, schedule and app identities reach the log line", async () => {

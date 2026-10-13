@@ -25,7 +25,7 @@ import {
 } from "@/be/script-connections";
 import { buildScriptCredentialBindings } from "@/be/script-credential-broker";
 import { getScript } from "@/be/scripts/db";
-import { runScript } from "@/scripts-runtime/loader";
+import { type RunScriptOutput, runScriptAfterSetup } from "@/scripts-runtime/loader";
 import { telemetry } from "@/telemetry";
 import type { AgentTask, ScheduledTask } from "@/types";
 import { getExecutorRegistry as getWorkflowExecutorRegistry } from "@/workflows";
@@ -99,25 +99,29 @@ async function executeScheduleScript(schedule: ScheduledTask): Promise<void> {
     startedAt: new Date().toISOString(),
   };
 
-  let output: Awaited<ReturnType<typeof runScript>>;
+  let output: RunScriptOutput;
   try {
-    output = await runScript({
-      source: script.source,
-      entrypoint: "schedule",
-      correlation: {
-        runId: record.id,
-        scriptId: script.id,
-        scriptName: script.name,
-        scheduleId: schedule.id,
+    output = await runScriptAfterSetup(
+      {
+        entrypoint: "schedule",
+        correlation: {
+          runId: record.id,
+          scriptId: script.id,
+          scriptName: script.name,
+          scheduleId: schedule.id,
+        },
+        agentId,
       },
-      args,
-      fsMode: "none",
-      agentId,
-      egressSecrets: await buildScriptCredentialBindings({ agentId }),
-      apiConnections: getScriptApiConnectionDescriptors({ agentId }),
-      mcpConnections: getScriptMcpConnectionDescriptors({ agentId }),
-      timeoutMs: 60_000,
-    });
+      async () => ({
+        source: script.source,
+        args,
+        fsMode: "none",
+        egressSecrets: await buildScriptCredentialBindings({ agentId }),
+        apiConnections: getScriptApiConnectionDescriptors({ agentId }),
+        mcpConnections: getScriptMcpConnectionDescriptors({ agentId }),
+        timeoutMs: 60_000,
+      }),
+    );
   } catch (err) {
     await recordScheduleScriptRun({
       ...record,
