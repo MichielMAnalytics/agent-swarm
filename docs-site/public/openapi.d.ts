@@ -28356,6 +28356,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
+            /** @description Caller lacks script.author */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             /** @description Existing idempotent run returned */
             409: {
                 headers: {
@@ -28771,7 +28780,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description Global write requires lead agent */
+            /** @description Missing script.author, or a global write without a lead agent */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -28856,6 +28865,15 @@ export interface operations {
             };
             /** @description Validation error */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Caller lacks script.author */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -29274,6 +29292,15 @@ export interface operations {
             };
             /** @description Validation error or script has no owning agent */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Caller lacks script.author */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

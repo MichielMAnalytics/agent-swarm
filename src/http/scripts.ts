@@ -55,6 +55,7 @@ import {
 } from "../types";
 import { scrubObject, scrubSecrets } from "../utils/secret-scrubber";
 import { route, runtimeInstanceHeader } from "./route-def";
+import { rejectWithoutScriptAuthor } from "./script-author-gate";
 import { json, jsonError } from "./utils";
 
 const scriptNameSchema = z.string().min(1).max(200);
@@ -239,9 +240,9 @@ const upsertRoute = route({
       }),
     },
     400: { description: "Validation or typecheck failure" },
-    403: { description: "Global write requires lead agent" },
+    403: { description: "Missing script.author, or a global write without a lead agent" },
   },
-  rbac: { permission: "script.global.write" },
+  rbac: { permission: "script.author" },
 });
 
 const runRoute = route({
@@ -258,9 +259,11 @@ const runRoute = route({
   responses: {
     200: { description: "Script run completed", schema: scriptRunResponseSchema },
     400: { description: "Validation error" },
+    403: { description: "Caller lacks script.author" },
     404: { description: "Script not found" },
     501: { description: "workspace-rw scripts are not supported in v1" },
   },
+  rbac: { permission: "script.author" },
 });
 
 const searchRoute = route({
@@ -426,6 +429,7 @@ const createScriptApiRoute = route({
   responses: {
     201: { description: "Endpoint created", schema: scriptApiWithSecretSchema },
     400: { description: "Validation error or script has no owning agent" },
+    403: { description: "Caller lacks script.author" },
     404: { description: "Script not found" },
   },
   rbac: { permission: "script.api.create" },
@@ -632,6 +636,7 @@ export async function handleScripts(
   if (upsertRoute.match(req.method, pathSegments)) {
     const parsed = await upsertRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
+    if (await rejectWithoutScriptAuthor(req, res, agentId)) return true;
     const agent = await requireAgent(res, agentId);
     if (!agent) return true;
 
@@ -713,6 +718,7 @@ export async function handleScripts(
   if (runRoute.match(req.method, pathSegments)) {
     const parsed = await runRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
+    if (await rejectWithoutScriptAuthor(req, res, agentId)) return true;
     const agent = await requireAgent(res, agentId);
     if (!agent) return true;
 
@@ -1072,6 +1078,7 @@ export async function handleScripts(
   if (createScriptApiRoute.match(req.method, pathSegments)) {
     const parsed = await createScriptApiRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
+    if (await rejectWithoutScriptAuthor(req, res, agentId)) return true;
     const script = await getScriptById(parsed.params.id);
     if (!script) {
       jsonError(res, "Script not found", 404);
