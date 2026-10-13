@@ -15,6 +15,7 @@ IMAGE="${1:?usage: smoke-api-sandbox.sh <image>}"
 NAME="api-sandbox-smoke-$$"
 API_KEY="$(cat /proc/sys/kernel/random/uuid)"
 AGENT_ID="$(cat /proc/sys/kernel/random/uuid)"
+RUNTIME_ID="$(cat /proc/sys/kernel/random/uuid)"
 DB_PATH=/app/data/agent-swarm-db.sqlite
 
 cleanup() {
@@ -50,11 +51,22 @@ docker exec "$NAME" test -r /proc/1/environ || fail "control: root cannot read /
 MODE="$(docker exec "$NAME" stat -c %a "$(dirname "$DB_PATH")")"
 [[ "$MODE" == "700" ]] || fail "data dir mode is $MODE, expected 700"
 
-curl -fsS -X POST "$BASE_URL/api/agents" \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "X-Agent-ID: $AGENT_ID" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Sandbox Smoke Agent","isLead":false}' >/dev/null
+# Multi-runtime mode (the default) needs a runtime identity on register and run.
+api_post() {
+  local path="$1" body="$2" out
+  if ! out="$(printf '%s' "$body" | curl -sS --fail-with-body -X POST "$BASE_URL$path" \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "X-Agent-ID: $AGENT_ID" \
+    -H "X-Runtime-Instance-ID: $RUNTIME_ID" \
+    -H "Content-Type: application/json" \
+    -d @-)"; then
+    fail "POST $path: $(printf '%s' "$out" | head -c 1000)"
+  fi
+  printf '%s' "$out"
+}
+
+api_post /api/agents "$(jq -n --arg rid "$RUNTIME_ID" \
+  '{name: "Sandbox Smoke Agent", isLead: false, runtimeInstanceId: $rid}')" >/dev/null
 
 SOURCE=$(cat <<EOF
 export default async () => {
@@ -82,12 +94,8 @@ export default async () => {
 EOF
 )
 
-RESPONSE="$(jq -n --arg source "$SOURCE" '{source: $source, args: {}, intent: "api image sandbox smoke"}' |
-  curl -fsS -X POST "$BASE_URL/api/scripts/run" \
-    -H "Authorization: Bearer $API_KEY" \
-    -H "X-Agent-ID: $AGENT_ID" \
-    -H "Content-Type: application/json" \
-    -d @-)" || fail "script run request failed"
+RESPONSE="$(api_post /api/scripts/run "$(jq -n --arg source "$SOURCE" \
+  '{source: $source, args: {}, intent: "api image sandbox smoke"}')")"
 
 RESULT="$(printf '%s' "$RESPONSE" | jq -c '[.. | objects | select(has("canReadDb"))][0] // empty')"
 echo "script result: ${RESULT:-<none>}"
