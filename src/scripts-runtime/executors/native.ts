@@ -4,11 +4,19 @@ import {
   registerProcessGroup,
   terminateProcessGroup,
 } from "../../utils/process-group";
+import { chownForSandbox, leaseSandboxUid, type SandboxUidLease } from "../../utils/sandbox-uid";
 import {
   buildSandboxedCommand,
   readStreamCapped,
+  type SandboxSpawnOptions,
   sandboxSpawnEnv,
 } from "../../utils/sandboxed-process";
+import {
+  interpretSandboxProbe,
+  requireNativeIsolation,
+  type ScriptSandboxStatus,
+  sandboxProbeInput,
+} from "../sandbox-probe";
 import type { ExecutorInput, ExecutorOutput, ScriptExecutor, ScriptExecutorError } from "./types";
 
 function makeUnsupportedOutput(stderr: string): ExecutorOutput {
@@ -135,20 +143,68 @@ function harnessCommand(
   harnessPath: string,
   input: ExecutorInput,
   env: Record<string, string>,
+  options: SandboxSpawnOptions,
 ): string[] {
-  return buildSandboxedCommand(["bun", "run", harnessPath], env, {
-    virtualMemoryMb: input.resources.memoryMb,
-    cpuTimeSec: input.resources.cpuTimeSec,
-    maxProcs: input.resources.maxProcs,
-    maxFileKb: Math.floor(input.resources.maxFileBytes / 1024),
-    maxFdCount: input.resources.maxFdCount,
-  });
+  return buildSandboxedCommand(
+    ["bun", "run", harnessPath],
+    env,
+    {
+      virtualMemoryMb: input.resources.memoryMb,
+      cpuTimeSec: input.resources.cpuTimeSec,
+      maxProcs: input.resources.maxProcs,
+      maxFileKb: Math.floor(input.resources.maxFileBytes / 1024),
+      maxFdCount: input.resources.maxFdCount,
+    },
+    options,
+  );
+}
+
+let sandboxStatus: ScriptSandboxStatus | undefined;
+let sandboxStatusPromise: Promise<ScriptSandboxStatus> | undefined;
+
+/**
+ * Run the sandbox probe once per process (see `sandbox-probe.ts`). The API
+ * starts it at boot; `SCRIPT_NATIVE_REQUIRE_ISOLATION` runs await it.
+ */
+export function getNativeSandboxStatus(): Promise<ScriptSandboxStatus> {
+  sandboxStatusPromise ??= new NativeScriptExecutor()
+    .runUnchecked(sandboxProbeInput())
+    .then((output) => interpretSandboxProbe(output, process.getuid?.()))
+    .catch((error: unknown) => ({
+      level: "none" as const,
+      uidDropped: false,
+      seccomp: false,
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    .then((status) => {
+      sandboxStatus = status;
+      return status;
+    });
+  return sandboxStatusPromise;
+}
+
+/** The probe result, or `undefined` while it has not finished. */
+export function peekNativeSandboxStatus(): ScriptSandboxStatus | undefined {
+  return sandboxStatus;
 }
 
 export class NativeScriptExecutor implements ScriptExecutor {
   readonly name = "native";
 
   async run(input: ExecutorInput): Promise<ExecutorOutput> {
+    if (requireNativeIsolation()) {
+      const status = await getNativeSandboxStatus();
+      if (status.level !== "hardened") {
+        return makeUnsupportedOutput(
+          `SCRIPT_NATIVE_REQUIRE_ISOLATION is set, but the native script sandbox is "${status.level}", not "hardened". The API must run as root with the CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID and SETUID capabilities, and the seccomp filter must install.`,
+        );
+      }
+    }
+    return this.runUnchecked(input);
+  }
+
+  /** `run` without the isolation requirement; the sandbox probe uses it directly. */
+  async runUnchecked(input: ExecutorInput): Promise<ExecutorOutput> {
     if (input.fsMode === "workspace-rw") {
       return makeUnsupportedOutput("workspace-rw not supported by native executor in v1");
     }
@@ -171,6 +227,7 @@ export class NativeScriptExecutor implements ScriptExecutor {
     let killed = input.signal?.aborted ?? false;
     let removeAbortListener: (() => void) | undefined;
     let proc: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
+    let uidLease: SandboxUidLease | null = null;
 
     try {
       if (killed) {
@@ -196,6 +253,9 @@ export class NativeScriptExecutor implements ScriptExecutor {
       input.signal?.addEventListener("abort", onExternalAbort, { once: true });
       removeAbortListener = () => input.signal?.removeEventListener("abort", onExternalAbort);
 
+      uidLease = await leaseSandboxUid(input.signal);
+      if (uidLease) await chownForSandbox(tmpdir, uidLease.user);
+
       const timeout = setTimeout(() => {
         timedOut = true;
         if (proc) void terminateProcessGroup(proc.pid);
@@ -203,10 +263,12 @@ export class NativeScriptExecutor implements ScriptExecutor {
 
       const harnessEnv = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
-        HOME: process.env.HOME ?? "/tmp",
+        // The API's own HOME is not readable by a sandbox uid.
+        HOME: uidLease ? tmpdir : (process.env.HOME ?? "/tmp"),
         LANG: process.env.LANG ?? "C.UTF-8",
         LC_ALL: process.env.LC_ALL ?? "C.UTF-8",
         TMPDIR: tmpdir,
+        SWARM_SCRIPT_SECCOMP: requireNativeIsolation() ? "required" : "best-effort",
         SWARM_SCRIPT_TMPDIR: tmpdir,
         SWARM_SCRIPT_ARGS_FILE: argsFile,
         SWARM_SCRIPT_SOURCE_FILE: sourceFile,
@@ -216,7 +278,7 @@ export class NativeScriptExecutor implements ScriptExecutor {
       };
 
       proc = registerProcessGroup(
-        Bun.spawn(harnessCommand(harnessPath, input, harnessEnv), {
+        Bun.spawn(harnessCommand(harnessPath, input, harnessEnv, { user: uidLease?.user }), {
           // On POSIX, Bun.spawn only needs PATH itself to locate the `sh`
           // binary for argv[0] — the sandboxed command's `env -i` prelude is
           // what actually scrubs the child's environment down to `harnessEnv`
@@ -268,6 +330,7 @@ export class NativeScriptExecutor implements ScriptExecutor {
     } finally {
       removeAbortListener?.();
       if (proc) await terminateProcessGroup(proc.pid);
+      await uidLease?.release();
       await Bun.$`rm -rf ${tmpdir}`;
     }
   }

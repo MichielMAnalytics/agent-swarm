@@ -56,6 +56,7 @@ import { realtimeBus } from "../realtime/bus";
 import { closeRooms, removeNamespaceRooms, sweepRooms } from "../realtime/rooms";
 import { attachRealtimeTransport } from "../realtime/transport";
 import { startScriptRunSupervisor, stopScriptRunSupervisor } from "../script-workflows/supervisor";
+import { getNativeSandboxStatus } from "../scripts-runtime/executors/native";
 import { getServerSessionsProcessed } from "../server-runtime-counters";
 import { startSlackApp, stopSlackApp } from "../slack";
 import { telemetry } from "../telemetry";
@@ -717,6 +718,13 @@ httpServer
       setExtensionLoopbackBaseUrl(`http://127.0.0.1:${boundAddress.port}`);
     }
     console.log(`MCP HTTP server running on http://localhost:${port}/mcp`);
+
+    // Measure the native script sandbox once; /health reports the level.
+    void getNativeSandboxStatus().then((status) => {
+      console.log(
+        `[Scripts] Native script sandbox: ${status.level} (uid drop ${status.uidDropped ? "on" : "off"}, seccomp ${status.seccomp ? "on" : "off"})${status.error ? `; probe error: ${status.error}` : ""}`,
+      );
+    });
 
     ensure({
       id: "listen",

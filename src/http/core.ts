@@ -32,6 +32,7 @@ import { initGitLab, isGitLabEnabled, resetGitLab } from "../gitlab";
 import { initJira, resetJira } from "../jira";
 import { initLinear, resetLinear } from "../linear";
 import { can, decideAdmission, isRbacEnabled } from "../rbac";
+import { peekNativeSandboxStatus } from "../scripts-runtime/executors/native";
 import { startSlackApp, stopSlackApp } from "../slack";
 import type { AgentStatus } from "../types";
 import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
@@ -448,11 +449,14 @@ export async function handleCore(
     res.writeHead(200, { "Content-Type": "application/json" });
     // NOTE: /health is unauthenticated — never expose server configuration
     // here (feature flags, capabilities, integration state). `steeringEnabled`
-    // lives on the authenticated /api/stats payload instead.
+    // lives on the authenticated /api/stats payload instead. The one
+    // exception is `scriptSandbox`, the measured native script isolation
+    // level: operators and orchestrators (Helm, Dokploy) read it without a key.
     res.end(
       JSON.stringify({
         status: "ok",
         version,
+        scriptSandbox: peekNativeSandboxStatus()?.level ?? "pending",
       }),
     );
 

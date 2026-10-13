@@ -1,0 +1,222 @@
+/**
+ * Per-slot sandbox uids for every `buildSandboxedCommand` child.
+ *
+ * When the API runs as root, each sandboxed process runs as
+ * `SCRIPT_SANDBOX_UID_BASE + slot` instead. Slots come from a fixed pool, so
+ * two concurrent runs never share a uid: one run cannot signal, trace or read
+ * another run's process or tmpdir, and `ulimit -u` (RLIMIT_NPROC, counted per
+ * uid) applies per run.
+ *
+ * When the API is not root, `setpriv` is missing, or a test drop fails, the
+ * lease is `null` and the child runs as the API's own uid, as before.
+ */
+
+export type SandboxUser = { uid: number; gid: number };
+
+export type SandboxUidLease = {
+  user: SandboxUser;
+  /** Kill every process left under the uid, then return the slot. */
+  release(): Promise<void>;
+};
+
+export const DEFAULT_SANDBOX_UID_BASE = 61000;
+export const DEFAULT_SANDBOX_UID_POOL_SIZE = 64;
+
+function positiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** At least 1000, so the shared uid (`base - 1`) can never be root or a system uid. */
+export function sandboxUidBase(): number {
+  const base = positiveInt(process.env.SCRIPT_SANDBOX_UID_BASE, DEFAULT_SANDBOX_UID_BASE);
+  return base >= 1000 ? base : DEFAULT_SANDBOX_UID_BASE;
+}
+
+export function sandboxUidPoolSize(): number {
+  return Math.min(
+    positiveInt(process.env.SCRIPT_SANDBOX_UID_POOL_SIZE, DEFAULT_SANDBOX_UID_POOL_SIZE),
+    1024,
+  );
+}
+
+/** argv prefix that drops the following command to `user`. */
+export function setprivPrefix(user: SandboxUser): string[] {
+  return [
+    "setpriv",
+    `--reuid=${user.uid}`,
+    `--regid=${user.gid}`,
+    "--clear-groups",
+    "--no-new-privs",
+  ];
+}
+
+async function exitCode(argv: string[]): Promise<number> {
+  try {
+    const proc = Bun.spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    return await proc.exited;
+  } catch {
+    return -1;
+  }
+}
+
+/** `kill -KILL -1` as `user` signals every process of that uid except itself. */
+async function reapUid(user: SandboxUser): Promise<void> {
+  await exitCode([...setprivPrefix(user), "bash", "-c", "kill -KILL -1 2>/dev/null; exit 0"]);
+}
+
+export type SandboxUidPool = {
+  lease(signal?: AbortSignal): Promise<SandboxUidLease>;
+  inUse(): number;
+};
+
+/**
+ * A fixed pool of `size` uids starting at `base`. When every slot is taken,
+ * `lease` waits for a release instead of sharing a uid, because a shared uid
+ * would let one run read another and the release reap would kill the other
+ * run. Concurrency is already capped well below the default pool size
+ * (`SCRIPT_RUN_CONCURRENCY_CAP`, default 10).
+ */
+export function createSandboxUidPool(opts: {
+  base: number;
+  size: number;
+  reap?: (user: SandboxUser) => Promise<void>;
+}): SandboxUidPool {
+  const reap = opts.reap ?? reapUid;
+  const used = new Set<number>();
+  const waiters: Array<() => void> = [];
+  let cursor = 0;
+
+  function take(): number | undefined {
+    for (let i = 0; i < opts.size; i++) {
+      const slot = (cursor + i) % opts.size;
+      if (!used.has(slot)) {
+        used.add(slot);
+        // Round-robin, so a just-released uid is the last one handed out.
+        cursor = (slot + 1) % opts.size;
+        return slot;
+      }
+    }
+    return undefined;
+  }
+
+  async function lease(signal?: AbortSignal): Promise<SandboxUidLease> {
+    let slot = take();
+    while (slot === undefined) {
+      signal?.throwIfAborted();
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => {
+          const index = waiters.indexOf(wake);
+          if (index >= 0) waiters.splice(index, 1);
+          reject(signal?.reason ?? new Error("aborted"));
+        };
+        const wake = () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        };
+        waiters.push(wake);
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
+      slot = take();
+    }
+    const id = opts.base + slot;
+    const user = { uid: id, gid: id };
+    let released = false;
+    return {
+      user,
+      async release() {
+        if (released) return;
+        released = true;
+        try {
+          await reap(user);
+        } finally {
+          used.delete(slot);
+          waiters.shift()?.();
+        }
+      },
+    };
+  }
+
+  return { lease, inUse: () => used.size };
+}
+
+let defaultPool: SandboxUidPool | undefined;
+let dropCheck: Promise<boolean> | undefined;
+
+function apiIsRoot(): boolean {
+  return process.platform === "linux" && process.getuid?.() === 0;
+}
+
+/**
+ * Capabilities root needs to run a child under another uid and clean up
+ * after it: CHOWN (hand over the tmpdir), DAC_OVERRIDE and FOWNER (read the
+ * child's 0600 result files, delete its tmpdir), KILL (terminate and reap
+ * its processes), SETGID and SETUID (the drop itself). Docker grants all six
+ * by default.
+ */
+export const SANDBOX_UID_DROP_CAPS = {
+  CHOWN: 0,
+  DAC_OVERRIDE: 1,
+  FOWNER: 3,
+  KILL: 5,
+  SETGID: 6,
+  SETUID: 7,
+} as const;
+
+/** Whether the `CapEff` line of /proc/self/status holds every needed capability. */
+export function hasSandboxUidDropCaps(procStatus: string): boolean {
+  const hex = /^CapEff:\s*([0-9a-f]+)$/im.exec(procStatus)?.[1];
+  if (!hex) return false;
+  const effective = BigInt(`0x${hex}`);
+  return Object.values(SANDBOX_UID_DROP_CAPS).every((bit) => (effective >> BigInt(bit)) & 1n);
+}
+
+/**
+ * Whether children can be dropped to a sandbox uid: the API is root with the
+ * capabilities above, and one real `setpriv` drop to the base uid succeeds.
+ * A root process missing one (for example a Helm pod with
+ * `capabilities.drop: [ALL]`) keeps today's behavior. Checked once per process.
+ */
+export function sandboxUidDropAvailable(): Promise<boolean> {
+  if (!apiIsRoot()) return Promise.resolve(false);
+  dropCheck ??= (async () => {
+    if (!Bun.which("setpriv")) return false;
+    const status = await Bun.file("/proc/self/status")
+      .text()
+      .catch(() => "");
+    if (!hasSandboxUidDropCaps(status)) return false;
+    const base = sandboxUidBase();
+    return (await exitCode([...setprivPrefix({ uid: base, gid: base }), "true"])) === 0;
+  })();
+  return dropCheck;
+}
+
+/**
+ * Lease a sandbox uid for one sandboxed child, or `null` when uid drop is not
+ * available. The caller must `chown` the child's working files to
+ * `lease.user` before spawn and call `release()` after the child exits.
+ */
+export async function leaseSandboxUid(signal?: AbortSignal): Promise<SandboxUidLease | null> {
+  if (!(await sandboxUidDropAvailable())) return null;
+  defaultPool ??= createSandboxUidPool({ base: sandboxUidBase(), size: sandboxUidPoolSize() });
+  return defaultPool.lease(signal);
+}
+
+/**
+ * One fixed uid (`SCRIPT_SANDBOX_UID_BASE - 1`) for workflow inline `script`
+ * nodes, or `null` when uid drop is not available. These nodes are authored
+ * with the workflow and often reuse fixed `/tmp` paths across runs, which a
+ * per-run uid could not overwrite (sticky `/tmp`). They keep today's shared
+ * behavior, minus root. Release is a no-op: concurrent nodes share the uid,
+ * so a reap would kill a sibling.
+ */
+export async function leaseSharedSandboxUid(): Promise<SandboxUidLease | null> {
+  if (!(await sandboxUidDropAvailable())) return null;
+  const id = sandboxUidBase() - 1;
+  return { user: { uid: id, gid: id }, release: async () => {} };
+}
+
+/** Give `path` (recursively) to the sandbox uid so the child can use it. */
+export async function chownForSandbox(path: string, user: SandboxUser): Promise<void> {
+  await Bun.$`chown -R ${user.uid}:${user.gid} ${path}`.quiet();
+}
