@@ -1,5 +1,9 @@
 import type { ScriptEntrypoint } from "../../scripts-runtime/executors/registry";
-import { type RunScriptOutput, runScript } from "../../scripts-runtime/loader";
+import {
+  type RunScriptOutput,
+  runScript,
+  type ScriptRunCorrelation,
+} from "../../scripts-runtime/loader";
 import type { ScriptRecord } from "../../types";
 import {
   getScriptApiConnectionDescriptors,
@@ -24,6 +28,8 @@ export async function runSavedScriptAsAgent(
     agentId: string;
     /** Required so every caller states which executor policy applies. */
     entrypoint: ScriptEntrypoint;
+    /** Caller identity for the executor log; the script's id and name are added here. */
+    correlation?: ScriptRunCorrelation;
     timeoutMs?: number;
     signal?: AbortSignal;
   },
@@ -51,6 +57,11 @@ export async function runSavedScriptAsAgent(
     : await runScript({
         source: args.script.source,
         entrypoint: args.entrypoint,
+        correlation: {
+          scriptId: args.script.id,
+          scriptName: args.script.name,
+          ...args.correlation,
+        },
         args: args.input,
         fsMode: args.script.fsMode,
         agentId: args.agentId,

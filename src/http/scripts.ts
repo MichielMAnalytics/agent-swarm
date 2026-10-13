@@ -763,11 +763,16 @@ export async function handleScripts(
         ? "quickjs"
         : undefined;
 
+    // Allocated up front so the executor log line and the script_runs row share it.
+    const runId = crypto.randomUUID();
+    const scriptName = parsed.body.name ?? "(inline source)";
+
     const credentials = await buildScriptCredentialBindingsWithFailures({ agentId: agent.id });
     const output = await runScript({
       source: source as string,
       entrypoint: "agent",
       ...(parentExecutor ? { parentExecutor } : {}),
+      correlation: { runId, scriptId: namedScript?.id, scriptName },
       args: parsed.body.args,
       fsMode,
       agentId: agent.id,
@@ -851,14 +856,14 @@ export async function handleScripts(
         );
     try {
       await recordInlineScriptRun({
-        id: crypto.randomUUID(),
+        id: runId,
         agentId: agent.id,
         source: source as string,
         // Scrub args + result before persisting: the stored row is later served
         // raw by GET /api/script-runs/{id} to the dashboard, so it needs the same
         // redaction guarantees as the scrubbed run response below.
         args: scrubObject(parsed.body.args ?? null),
-        scriptName: parsed.body.name ?? "(inline source)",
+        scriptName,
         status: ok ? "completed" : "failed",
         output: scrubObject(output.result),
         error: runError,

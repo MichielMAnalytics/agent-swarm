@@ -286,6 +286,7 @@ async function pullFromScript(args: {
     script,
     agentId,
     entrypoint: "app-sync",
+    correlation: { appId: args.appId, appTarget: `sync:${args.model}/${args.sourceName}` },
     input: {
       ...source.args,
       app: { id: args.appId },

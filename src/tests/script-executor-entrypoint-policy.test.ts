@@ -341,3 +341,130 @@ describe("nested script_run clamp", () => {
     expect(nestedHeaders).toEqual(["native"]);
   });
 });
+
+// ─── executor log ↔ persisted run ────────────────────────────────────────────
+
+/** Busy for ~150 ms so two runs overlap, then reports its runtime. */
+const SLOW_PROBE_SOURCE = `export default async function run() {
+  const end = Date.now() + 150;
+  while (Date.now() < end) {}
+  return { bun: typeof Bun };
+}`;
+
+/** Captures `[scripts-runtime] run` lines, parsed into key/value fields. */
+async function captureRunLogs<T>(
+  fn: () => Promise<T>,
+): Promise<{ value: T; lines: Array<Record<string, string>> }> {
+  const lines: Array<Record<string, string>> = [];
+  const original = console.info;
+  console.info = (...parts: unknown[]) => {
+    const line = parts.map(String).join(" ");
+    if (!line.startsWith("[scripts-runtime] run ")) return original(...parts);
+    const fields: Record<string, string> = {};
+    for (const match of line.matchAll(/ (\w+)=("(?:[^"\\]|\\.)*"|\S+)/g)) {
+      const [, key, raw] = match as unknown as [string, string, string];
+      fields[key] = raw.startsWith('"') ? JSON.parse(raw) : raw;
+    }
+    lines.push(fields);
+  };
+  try {
+    return { value: await fn(), lines };
+  } finally {
+    console.info = original;
+  }
+}
+
+describe("executor log correlates with the persisted run", () => {
+  skip("two overlapping runs on different executors each log their own script_runs id", async () => {
+    process.env.SCRIPT_EXECUTOR_EXTERNAL = "quickjs";
+    const script = await insertSaved(SLOW_PROBE_SOURCE);
+
+    const { value, lines } = await captureRunLogs(() =>
+      Promise.all([callScriptApi(script.id), agentRun({ source: SLOW_PROBE_SOURCE })]),
+    );
+    const [api, inline] = value;
+    expect(api.result).toEqual({ bun: "undefined" });
+    expect(inline.result).toEqual({ bun: "object" });
+
+    const rows = await getDbClient().query<{
+      id: string;
+      scriptName: string;
+      output: string;
+      startedAt: string;
+      finishedAt: string;
+    }>("SELECT id, scriptName, output, startedAt, finishedAt FROM script_runs");
+    expect(rows).toHaveLength(2);
+    const apiRow = rows.find((row) => row.scriptName === script.name);
+    const inlineRow = rows.find((row) => row.scriptName === "(inline source)");
+    if (!apiRow || !inlineRow) throw new Error(`unexpected rows: ${JSON.stringify(rows)}`);
+
+    // The runs overlapped: each started before the other finished.
+    expect(apiRow.startedAt < inlineRow.finishedAt).toBe(true);
+    expect(inlineRow.startedAt < apiRow.finishedAt).toBe(true);
+
+    expect(lines).toHaveLength(2);
+    const apiLog = lines.find((line) => line.runId === apiRow.id);
+    const inlineLog = lines.find((line) => line.runId === inlineRow.id);
+    expect(apiLog).toMatchObject({
+      entrypoint: "script-api",
+      executor: "quickjs",
+      scriptId: script.id,
+      scriptName: script.name,
+      agentId: workerId,
+      exit: "0",
+    });
+    expect(inlineLog).toMatchObject({
+      entrypoint: "agent",
+      executor: "native",
+      scriptName: "(inline source)",
+      agentId: workerId,
+      exit: "0",
+    });
+    // Each record's output is the one its own executor produced.
+    expect(JSON.parse(apiRow.output)).toEqual({ bun: "undefined" });
+    expect(JSON.parse(inlineRow.output)).toEqual({ bun: "object" });
+  });
+
+  test("workflow, schedule and app identities reach the log line", async () => {
+    process.env.SCRIPT_EXECUTOR = "quickjs";
+    process.env.SCRIPT_EXECUTOR_EXTERNAL = "quickjs";
+    const workflowRunId = crypto.randomUUID();
+    const workflowStepId = crypto.randomUUID();
+    const scheduleId = crypto.randomUUID();
+    const { lines } = await captureRunLogs(async () => {
+      await runScript({
+        source: PROBE_SOURCE,
+        entrypoint: "workflow",
+        agentId: workerId,
+        correlation: { scriptName: "nightly report", workflowRunId, workflowStepId },
+      });
+      await runScript({
+        source: PROBE_SOURCE,
+        entrypoint: "schedule",
+        agentId: workerId,
+        correlation: { runId: "run-1", scheduleId },
+      });
+      await runScript({
+        source: PROBE_SOURCE,
+        entrypoint: "app-sync",
+        agentId: workerId,
+        correlation: { appId: "app-1", appTarget: "sync:deals/crm" },
+      });
+    });
+    expect(lines).toEqual([
+      expect.objectContaining({
+        entrypoint: "workflow",
+        executor: "quickjs",
+        scriptName: "nightly report",
+        workflowRunId,
+        workflowStepId,
+      }),
+      expect.objectContaining({ entrypoint: "schedule", runId: "run-1", scheduleId }),
+      expect.objectContaining({
+        entrypoint: "app-sync",
+        appId: "app-1",
+        appTarget: "sync:deals/crm",
+      }),
+    ]);
+  });
+});

@@ -87,6 +87,8 @@ async function executeScheduleScript(schedule: ScheduledTask): Promise<void> {
   const agentId = schedule.createdByAgentId ?? "schedule";
   const args = schedule.scriptArgs ?? {};
   const record = {
+    // Allocated up front so the executor log line and the script_runs row share it.
+    id: crypto.randomUUID(),
     agentId,
     scriptName: schedule.scriptName,
     // A pointer, not a copy: script schedules fire as often as every minute and
@@ -102,6 +104,12 @@ async function executeScheduleScript(schedule: ScheduledTask): Promise<void> {
     output = await runScript({
       source: script.source,
       entrypoint: "schedule",
+      correlation: {
+        runId: record.id,
+        scriptId: script.id,
+        scriptName: script.name,
+        scheduleId: schedule.id,
+      },
       args,
       fsMode: "none",
       agentId,
@@ -143,6 +151,7 @@ async function executeScheduleScript(schedule: ScheduledTask): Promise<void> {
  * Best effort: a persistence error never changes the schedule's outcome.
  */
 async function recordScheduleScriptRun(run: {
+  id: string;
   agentId: string;
   scriptName: string;
   source: string;
@@ -154,7 +163,7 @@ async function recordScheduleScriptRun(run: {
 }): Promise<void> {
   try {
     await recordInlineScriptRun({
-      id: crypto.randomUUID(),
+      id: run.id,
       agentId: run.agentId,
       scriptName: run.scriptName,
       source: run.source,

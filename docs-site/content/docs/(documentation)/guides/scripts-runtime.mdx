@@ -266,11 +266,12 @@ or outside callers trigger:
 | [Script APIs](/docs/guides/scripts-external-apis), app actions, app sync | `SCRIPT_EXECUTOR_EXTERNAL`, else `SCRIPT_EXECUTOR` |
 | Agent `script-run`, workflow `swarm-script` nodes, scheduled scripts, heartbeat gates | `SCRIPT_EXECUTOR` |
 
-Both default to `native`. A later release changes the `SCRIPT_EXECUTOR_EXTERNAL`
+Both default to `native` when both are unset. A later release changes the `SCRIPT_EXECUTOR_EXTERNAL`
 default to `quickjs`; check your scripts against the differences below first.
 A nested `ctx.swarm.script_run` from a script that runs under `quickjs` also
 runs under `quickjs`, whatever its own setting. The API server logs the
-entrypoint and executor of every run.
+entrypoint and executor of every run, with the run's persisted identity: the
+`script_runs` id, the workflow run and step, the schedule, or the app.
 
 | Value | How it runs | Per-run overhead (Linux) |
 |---|---|---|

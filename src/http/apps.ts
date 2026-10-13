@@ -1367,6 +1367,7 @@ export async function handleApps(
         input: { ...action.args, ...input, app: { id: app.id } },
         agentId: runAsAgentId,
         entrypoint: "app-action",
+        correlation: { appId: app.id, appTarget: `action:${parsed.params.name}` },
       });
       const ok = output.exitCode === 0 && !output.error && !output.runtimeError;
       const error = ok

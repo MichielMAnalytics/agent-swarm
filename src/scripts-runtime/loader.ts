@@ -36,6 +36,24 @@ import { validateScriptImports } from "./import-allowlist";
  */
 const CAPACITY_EXCEEDED_RETRY_DELAYS_MS = [200, 750];
 
+/**
+ * Persisted identity of a run, logged on the executor line so an operator can
+ * tell which executor ran a given record.
+ */
+export type ScriptRunCorrelation = {
+  /** `script_runs.id` the caller records; allocate it before the run. */
+  runId?: string;
+  scriptId?: string;
+  scriptName?: string;
+  workflowRunId?: string;
+  /** `workflow_run_steps.id` of the swarm-script node. */
+  workflowStepId?: string;
+  scheduleId?: string;
+  appId?: string;
+  /** `action:<name>` for an app action, `sync:<model>/<source>` for a sync pass. */
+  appTarget?: string;
+};
+
 export type RunScriptInput = {
   source: string;
   /** Where the run came from; selects the executor (see `executorFor`). */
@@ -45,6 +63,7 @@ export type RunScriptInput = {
    * `script_run`. A quickjs parent pins its child to quickjs.
    */
   parentExecutor?: string;
+  correlation?: ScriptRunCorrelation;
   args?: unknown;
   fsMode?: ScriptFsMode;
   agentId: string;
@@ -72,6 +91,14 @@ export type RunScriptOutput = Omit<ExecutorOutput, "result" | "stdout" | "stderr
 /** Executor name for a run: the entrypoint's policy, clamped to a nested run's parent. */
 function resolveRunExecutor(input: Pick<RunScriptInput, "entrypoint" | "parentExecutor">): string {
   return clampToParentExecutor(executorFor(input.entrypoint), input.parentExecutor);
+}
+
+/** ` key=value` pairs for the run log; values with spaces, quotes or `=` are JSON-quoted. */
+function formatRunLogFields(fields: Record<string, string | undefined>): string {
+  return Object.entries(fields)
+    .filter((entry): entry is [string, string] => entry[1] !== undefined && entry[1] !== "")
+    .map(([key, value]) => ` ${key}=${/[\s"=]/.test(value) ? JSON.stringify(value) : value}`)
+    .join("");
 }
 
 export type { ScriptRuntimeError, ScriptStackFrame } from "./executors/types";
@@ -158,10 +185,16 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
     output = await executor.run(executorInput);
   }
   console.info(
-    `[scripts-runtime] run entrypoint=${input.entrypoint} executor=${executorName}` +
-      `${input.parentExecutor ? ` parent=${input.parentExecutor}` : ""}` +
-      ` exit=${output.exitCode}${output.error ? ` error=${output.error}` : ""}` +
-      ` durationMs=${output.durationMs}`,
+    `[scripts-runtime] run${formatRunLogFields({
+      entrypoint: input.entrypoint,
+      executor: executorName,
+      parent: input.parentExecutor,
+      ...input.correlation,
+      agentId: input.agentId,
+      exit: String(output.exitCode),
+      error: output.error,
+      durationMs: String(output.durationMs),
+    })}`,
   );
 
   return {

@@ -128,7 +128,7 @@ executor. Config writes reject values other than `native` and `quickjs`.
 
 `SCRIPT_EXECUTOR_EXTERNAL` picks the executor for script APIs, app actions and app sync, the
 runs that users and outside callers trigger. Agent, workflow, schedule and heartbeat runs keep
-`SCRIPT_EXECUTOR`. Left unset, it follows `SCRIPT_EXECUTOR`, so the default is `native`. A
+`SCRIPT_EXECUTOR`. Left unset, it follows `SCRIPT_EXECUTOR`, so the default is `native` when both are unset. A
 later release changes that default to `quickjs`; set `native` explicitly to keep the current
 behavior. It accepts the same two values and also applies after a config reload.
 

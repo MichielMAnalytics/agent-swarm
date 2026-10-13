@@ -239,12 +239,16 @@ export async function handleX(
   // the retention sweep while this run is still in flight.
   const runStartTouch = script.isScratch ? await touchScratchScriptLastUsed(script.id) : null;
 
+  // Allocated up front so the executor log line and the script_runs row share it.
+  const runId = crypto.randomUUID();
+
   const credentials = await buildScriptCredentialBindingsWithFailures({
     agentId: endpoint.agentId,
   });
   const output = await runScript({
     source: script.source,
     entrypoint: "script-api",
+    correlation: { runId, scriptId: script.id, scriptName: script.name },
     args: args ?? null,
     fsMode: "none",
     agentId: endpoint.agentId,
@@ -279,7 +283,7 @@ export async function handleX(
   }
   try {
     await recordInlineScriptRun({
-      id: crypto.randomUUID(),
+      id: runId,
       agentId: endpoint.agentId,
       source: script.source,
       args: scrubObject(args ?? null),
