@@ -59,6 +59,7 @@ if [[ "$probe_status" -eq 134 ]]; then
     src/tests/schedule-target-type.test.ts \
     src/tests/script-connections.test.ts \
     src/tests/script-executor-conformance.test.ts \
+    src/tests/script-executor-entrypoint-policy.test.ts \
     src/tests/script-workflows-runtime-e2e.test.ts \
     src/tests/secret-canary-sweep.test.ts \
     src/tests/scripts-external-api.test.ts \
