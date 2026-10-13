@@ -1366,6 +1366,7 @@ export async function handleApps(
         script,
         input: { ...action.args, ...input, app: { id: app.id } },
         agentId: runAsAgentId,
+        entrypoint: "app-action",
       });
       const ok = output.exitCode === 0 && !output.error && !output.runtimeError;
       const error = ok

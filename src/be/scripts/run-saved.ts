@@ -1,3 +1,4 @@
+import type { ScriptEntrypoint } from "../../scripts-runtime/executors/registry";
 import { type RunScriptOutput, runScript } from "../../scripts-runtime/loader";
 import type { ScriptRecord } from "../../types";
 import {
@@ -21,6 +22,8 @@ export async function runSavedScriptAsAgent(
     script: ScriptRecord;
     input: unknown;
     agentId: string;
+    /** Required so every caller states which executor policy applies. */
+    entrypoint: ScriptEntrypoint;
     timeoutMs?: number;
     signal?: AbortSignal;
   },
@@ -47,6 +50,7 @@ export async function runSavedScriptAsAgent(
       }
     : await runScript({
         source: args.script.source,
+        entrypoint: args.entrypoint,
         args: args.input,
         fsMode: args.script.fsMode,
         agentId: args.agentId,

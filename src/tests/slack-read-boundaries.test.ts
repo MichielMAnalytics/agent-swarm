@@ -201,6 +201,7 @@ describe("slack-read response boundaries", () => {
 
     try {
       const output = await runScript({
+        entrypoint: "agent",
         agentId: AGENT_ID,
         mcpBaseUrl: `http://127.0.0.1:${server.port}`,
         resources: { memoryMb: 512, cpuTimeSec: 20, maxStdoutBytes: 1_048_576 },

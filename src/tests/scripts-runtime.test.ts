@@ -65,6 +65,7 @@ describe("runScript", () => {
 
   spawnTest("runs a trivial transform", async () => {
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       args: { x: 1 },
       resources,
@@ -78,6 +79,7 @@ describe("runScript", () => {
 
   spawnTest("ctx.stdlib.fetch returns a Response and fetchJson returns parsed JSON", async () => {
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       args: { url: 'data:application/json,{"ok":true}' },
       resources,
@@ -121,6 +123,7 @@ describe("runScript", () => {
 
     try {
       const output = await runScript({
+        entrypoint: "agent",
         agentId: "agent-1",
         mcpBaseUrl: `http://127.0.0.1:${server.port}`,
         resources,
@@ -156,6 +159,7 @@ describe("runScript", () => {
 
     try {
       const output = await runScript({
+        entrypoint: "agent",
         agentId: "agent-1",
         mcpBaseUrl: `http://127.0.0.1:${server.port}`,
         resources,
@@ -214,6 +218,7 @@ describe("runScript", () => {
 
     try {
       const output = await runScript({
+        entrypoint: "agent",
         agentId: "agent-1",
         mcpBaseUrl: `http://127.0.0.1:${server.port}`,
         resources,
@@ -264,6 +269,7 @@ describe("runScript", () => {
 
   spawnTest("bare stdlib imports resolve through runtime shims", async () => {
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       resources,
       source: `
@@ -280,6 +286,7 @@ describe("runScript", () => {
   spawnTest("timeout kills a running script", async () => {
     const started = Date.now();
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       timeoutMs: 150,
       resources: { ...resources, wallClockMs: 150 },
@@ -292,6 +299,7 @@ describe("runScript", () => {
 
   spawnTest("stdout is capped and marked truncated", async () => {
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       resources: { ...resources, maxStdoutBytes: 128 },
       source: "export default async () => { console.log('x'.repeat(2048)); return 'ok'; };",
@@ -308,6 +316,7 @@ describe("runScript", () => {
     const started = Date.now();
 
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       signal: controller.signal,
       resources,
@@ -324,6 +333,7 @@ describe("runScript", () => {
     refreshSecretScrubberCache();
 
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       resources,
       // Bun >= 1.4 injects BUN_FEATURE_FLAG_NO_ORPHANS=1 into the harness in
@@ -359,6 +369,7 @@ describe("runScript", () => {
 
   test("workspace-rw is rejected in v1", async () => {
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       fsMode: "workspace-rw",
       source: "export default async () => true;",
@@ -382,6 +393,7 @@ describe("runScript", () => {
       process.env.SCRIPT_RUNTIME_DIR = tmpdir;
 
       const output = await runScript({
+        entrypoint: "agent",
         agentId: "agent-1",
         args: { x: 42 },
         resources,
@@ -402,6 +414,7 @@ describe("runScript", () => {
     // when the caller serializes args as a JSON string (double-serialization).
     // Before the fix, property access like args.foo would always be undefined.
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       args: { foo: "bar" },
       resources,
@@ -432,6 +445,7 @@ describe("runScript", () => {
       process.env.SCRIPT_RUNTIME_DIR = tmpdir;
 
       const output = await runScript({
+        entrypoint: "agent",
         agentId: "agent-1",
         args: { foo: "bar" },
         resources,
@@ -467,6 +481,7 @@ describe("runScript", () => {
       process.env.SCRIPT_RUNTIME_DIR = tmpdir;
 
       const output = await runScript({
+        entrypoint: "agent",
         agentId: "agent-1",
         args: { name: "test" },
         resources,
@@ -488,6 +503,7 @@ describe("runScript", () => {
 
   spawnTest("argsSchema rejects invalid args with a formatted Zod error", async () => {
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       args: {},
       resources,
@@ -508,6 +524,7 @@ describe("runScript", () => {
 
   spawnTest("argsSchema applies .default() values when fields are omitted", async () => {
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       args: { repo: "owner/name" },
       resources,
@@ -528,6 +545,7 @@ describe("runScript", () => {
 
   spawnTest("script without argsSchema still works (backward-compat)", async () => {
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       args: { value: 42 },
       resources,

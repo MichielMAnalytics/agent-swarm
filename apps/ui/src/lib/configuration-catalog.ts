@@ -1384,6 +1384,16 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         docsUrl: `${DOCS}ui/configuration#script-executor`,
       },
       {
+        key: "SCRIPT_EXECUTOR_EXTERNAL",
+        label: "External script executor",
+        description:
+          "Executor for scripts that users or outside callers trigger: script APIs, app actions and app sync. Agent, workflow, schedule and heartbeat runs keep the script executor above. Leave unset to follow it. A later release changes the default to QuickJS. Applies to new runs after config reload.",
+        kind: "enum",
+        options: ["native", "quickjs"],
+        defaultValue: "native",
+        docsUrl: `${DOCS}ui/configuration#script-executor`,
+      },
+      {
         key: "SCRIPT_QUICKJS_POOL_SIZE",
         label: "QuickJS worker pool size",
         description:

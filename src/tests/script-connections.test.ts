@@ -1281,6 +1281,7 @@ describe("script connections", () => {
 
     try {
       const output = await runScript({
+        entrypoint: "agent",
         agentId: "agent-1",
         resources,
         egressSecrets: await buildScriptCredentialBindings({ agentId: "agent-1" }),

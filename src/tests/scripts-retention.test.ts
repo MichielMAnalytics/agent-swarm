@@ -338,7 +338,12 @@ describe("scratch script retention", () => {
     const old = "2026-07-01T00:00:00.000Z";
     await getDbClient().run("UPDATE scripts SET updatedAt = ? WHERE id = ?", [old, script.id]);
 
-    const output = await runSavedScriptAsAgent({ script, input: null, agentId: "agent-1" });
+    const output = await runSavedScriptAsAgent({
+      script,
+      input: null,
+      agentId: "agent-1",
+      entrypoint: "agent",
+    });
 
     expect(output.exitCode).toBe(0);
     expect(
@@ -355,7 +360,12 @@ describe("scratch script retention", () => {
     // touch, which claims its slot in the DbClient's FIFO queue before this
     // call returns — so the purge below is ordered after it and sees a fresh
     // row, mirroring a run that's still executing when the daily GC tick fires.
-    const runPromise = runSavedScriptAsAgent({ script, input: null, agentId: "agent-1" });
+    const runPromise = runSavedScriptAsAgent({
+      script,
+      input: null,
+      agentId: "agent-1",
+      entrypoint: "agent",
+    });
 
     expect(await purgeExpiredScratchScripts(NOW)).toBe(0);
     expect(
@@ -390,6 +400,7 @@ describe("scratch script retention", () => {
       script: staleScript,
       input: null,
       agentId: "agent-1",
+      entrypoint: "agent",
     });
 
     expect(output.exitCode).not.toBe(0);

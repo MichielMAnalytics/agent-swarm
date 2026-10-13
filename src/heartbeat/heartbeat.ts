@@ -1648,6 +1648,7 @@ export async function defaultChecklistGateRunner(
       script,
       input: { leadAgentId },
       agentId: leadAgentId,
+      entrypoint: "heartbeat",
       timeoutMs: checklistGateTimeoutMs,
       signal,
     },

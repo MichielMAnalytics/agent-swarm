@@ -698,6 +698,7 @@ describe("embedded connection auth", () => {
       expect(connection.generationError).toBeNull();
 
       const output = await runScript({
+        entrypoint: "agent",
         agentId: "agent-e2e",
         resources,
         egressSecrets: await buildScriptCredentialBindings({}),

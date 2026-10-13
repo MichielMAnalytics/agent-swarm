@@ -23,6 +23,9 @@ function headers(config: SwarmConfig): Record<string, string> {
     ...(config.extensionToken
       ? { "X-Extension-Token": Redacted.value(config.extensionToken) }
       : {}),
+    // The API clamps a nested script_run to this run's executor (quickjs never
+    // escalates to native).
+    ...(config.executor ? { "X-Script-Executor": config.executor } : {}),
     "Content-Type": "application/json",
   };
 }

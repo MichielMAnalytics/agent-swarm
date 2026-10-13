@@ -314,6 +314,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   },
   ...enumValidator("CLAUDE_TRANSPORT", ["cli", "sdk"]),
   ...enumValidator("SCRIPT_EXECUTOR", ["native", "quickjs"]),
+  ...enumValidator("SCRIPT_EXECUTOR_EXTERNAL", ["native", "quickjs"]),
   SCRIPT_QUICKJS_POOL_SIZE: validateQuickJSPoolSize,
   // fail: worker fails a task fast when every key has exhausted the task
   // model's weekly window (Fable/Opus/Sonnet). fallback: legacy random pick.

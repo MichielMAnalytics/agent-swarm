@@ -32,6 +32,7 @@ afterEach(() => {
 describe("runtime secret egress", () => {
   spawnTest("scrubObject catches unwrapped returned config secrets", async () => {
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       resources: { memoryMb: 2048 },
       source:
@@ -43,6 +44,7 @@ describe("runtime secret egress", () => {
 
   spawnTest("wrapped config values stringify to redacted in the result file", async () => {
     const output = await runScript({
+      entrypoint: "agent",
       agentId: "agent-1",
       resources: { memoryMb: 2048 },
       source: "export default async (_args, ctx) => ({ wrapped: ctx.swarm.config.apiKey });",
@@ -64,6 +66,7 @@ describe("runtime secret egress", () => {
 
     try {
       const output = await runScript({
+        entrypoint: "agent",
         agentId: "agent-1",
         resources: { memoryMb: 2048 },
         source: `

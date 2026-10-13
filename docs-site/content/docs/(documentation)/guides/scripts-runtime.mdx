@@ -258,7 +258,19 @@ debugging). The user-script path is normalized to the basename
 ## Executors
 
 The `SCRIPT_EXECUTOR` environment variable on the API server selects how
-scripts run. The setting applies to every script run on that server.
+scripts run. `SCRIPT_EXECUTOR_EXTERNAL` overrides it for the runs that users
+or outside callers trigger:
+
+| Entrypoint | Executor setting |
+|---|---|
+| [Script APIs](/docs/guides/scripts-external-apis), app actions, app sync | `SCRIPT_EXECUTOR_EXTERNAL`, else `SCRIPT_EXECUTOR` |
+| Agent `script-run`, workflow `swarm-script` nodes, scheduled scripts, heartbeat gates | `SCRIPT_EXECUTOR` |
+
+Both default to `native`. A later release changes the `SCRIPT_EXECUTOR_EXTERNAL`
+default to `quickjs`; check your scripts against the differences below first.
+A nested `ctx.swarm.script_run` from a script that runs under `quickjs` also
+runs under `quickjs`, whatever its own setting. The API server logs the
+entrypoint and executor of every run.
 
 | Value | How it runs | Per-run overhead (Linux) |
 |---|---|---|

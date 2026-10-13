@@ -266,6 +266,7 @@ describe("script subprocess carries the invoking worker's identity", () => {
     });
     try {
       const output = await runScript({
+        entrypoint: "agent",
         agentId: "agent-sub",
         runtimeInstanceId: "rt-subprocess-1",
         mcpBaseUrl: `http://127.0.0.1:${stub.port}`,
@@ -297,6 +298,7 @@ describe("script subprocess carries the invoking worker's identity", () => {
     });
     try {
       const output = await runScript({
+        entrypoint: "agent",
         agentId: "agent-sub",
         mcpBaseUrl: `http://127.0.0.1:${stub.port}`,
         resources,

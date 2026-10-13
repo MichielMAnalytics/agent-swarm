@@ -16,6 +16,12 @@ export type SwarmConfigPayload = {
      */
     runtimeInstanceId?: { value: string; isSecret: false };
     /**
+     * Executor this run resolved to. The SDK forwards it on nested
+     * `script_run` calls so the API never runs a quickjs script's child
+     * under a less restricted executor.
+     */
+    executor?: { value: string; isSecret: false };
+    /**
      * Per-process secret set only by the in-process extension `ctx.swarm` SDK. The
      * bridge requires it to grant the `extension` call origin. Never sent to scripts.
      */

@@ -9,6 +9,8 @@ export class SwarmConfig {
   readonly runtimeInstanceId: RedactedValue<string> | undefined;
   /** Per-process extension bridge secret; present only for in-process extension SDKs. */
   readonly extensionToken: RedactedValue<string> | undefined;
+  /** Executor this run resolved to; forwarded on nested `script_run` calls. */
+  readonly executor: string | undefined;
 
   private readonly userValues: Map<string, RedactedValue<string>>;
 
@@ -37,6 +39,7 @@ export class SwarmConfig {
           isSecret: payload.system.extensionToken.isSecret,
         })
       : undefined;
+    this.executor = payload.system.executor?.value;
     this.userValues = new Map(
       Object.entries(payload.user ?? {}).map(([key, value]) => [
         key,

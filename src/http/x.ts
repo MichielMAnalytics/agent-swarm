@@ -244,6 +244,7 @@ export async function handleX(
   });
   const output = await runScript({
     source: script.source,
+    entrypoint: "script-api",
     args: args ?? null,
     fsMode: "none",
     agentId: endpoint.agentId,

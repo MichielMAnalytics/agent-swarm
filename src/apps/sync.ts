@@ -285,6 +285,7 @@ async function pullFromScript(args: {
   const output = await runSavedScriptAsAgent({
     script,
     agentId,
+    entrypoint: "app-sync",
     input: {
       ...source.args,
       app: { id: args.appId },

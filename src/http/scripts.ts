@@ -756,9 +756,18 @@ export async function handleScripts(
     const runStartTouch = namedScript?.isScratch
       ? await touchScratchScriptLastUsed(namedScript.id)
       : null;
+    // A nested ctx.swarm.script_run carries its parent's executor. Honour it
+    // only as a restriction: a quickjs parent's child runs quickjs.
+    const parentExecutor =
+      ((h) => (Array.isArray(h) ? h[0] : h))(req.headers["x-script-executor"])?.trim() === "quickjs"
+        ? "quickjs"
+        : undefined;
+
     const credentials = await buildScriptCredentialBindingsWithFailures({ agentId: agent.id });
     const output = await runScript({
       source: source as string,
+      entrypoint: "agent",
+      ...(parentExecutor ? { parentExecutor } : {}),
       args: parsed.body.args,
       fsMode,
       agentId: agent.id,

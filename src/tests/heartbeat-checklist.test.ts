@@ -557,7 +557,7 @@ describe("Heartbeat Checklist", () => {
       const controller = new AbortController();
 
       const output = await runSavedScriptAsAgent(
-        { script, input: {}, agentId: lead.id, signal: controller.signal },
+        { script, input: {}, agentId: lead.id, entrypoint: "heartbeat", signal: controller.signal },
         {
           buildCredentials: async () => {
             controller.abort();

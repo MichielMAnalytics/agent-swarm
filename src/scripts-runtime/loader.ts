@@ -3,7 +3,12 @@ import { scrubObject, scrubSecrets } from "../utils/secret-scrubber";
 import type { ScriptApiConnectionDescriptor, ScriptMcpConnectionDescriptor } from "./api-types";
 import type { FailedCredentialBinding } from "./credential-broker";
 import { buildEgressSecrets } from "./egress-secrets";
-import { getScriptExecutor } from "./executors/registry";
+import {
+  clampToParentExecutor,
+  executorFor,
+  getScriptExecutor,
+  type ScriptEntrypoint,
+} from "./executors/registry";
 import {
   DEFAULT_SCRIPT_RESOURCES,
   type EgressSecretEntry,
@@ -33,6 +38,13 @@ const CAPACITY_EXCEEDED_RETRY_DELAYS_MS = [200, 750];
 
 export type RunScriptInput = {
   source: string;
+  /** Where the run came from; selects the executor (see `executorFor`). */
+  entrypoint: ScriptEntrypoint;
+  /**
+   * Executor of the script that started this run, when it is a nested
+   * `script_run`. A quickjs parent pins its child to quickjs.
+   */
+  parentExecutor?: string;
   args?: unknown;
   fsMode?: ScriptFsMode;
   agentId: string;
@@ -53,11 +65,21 @@ export type RunScriptOutput = Omit<ExecutorOutput, "result" | "stdout" | "stderr
   result: unknown | undefined;
   stdout: string;
   stderr: string;
+  /** Executor the run resolved to; absent when the run was refused before one was chosen. */
+  executor?: string;
 };
+
+/** Executor name for a run: the entrypoint's policy, clamped to a nested run's parent. */
+function resolveRunExecutor(input: Pick<RunScriptInput, "entrypoint" | "parentExecutor">): string {
+  return clampToParentExecutor(executorFor(input.entrypoint), input.parentExecutor);
+}
 
 export type { ScriptRuntimeError, ScriptStackFrame } from "./executors/types";
 
-async function buildConfigPayload(input: RunScriptInput): Promise<SwarmConfigPayload> {
+async function buildConfigPayload(
+  input: RunScriptInput,
+  executor: string,
+): Promise<SwarmConfigPayload> {
   const apiKey = getApiKey();
   if (!apiKey) throw new Error("Swarm API key is required to run scripts");
 
@@ -72,6 +94,7 @@ async function buildConfigPayload(input: RunScriptInput): Promise<SwarmConfigPay
       ...(input.runtimeInstanceId
         ? { runtimeInstanceId: { value: input.runtimeInstanceId, isSecret: false as const } }
         : {}),
+      executor: { value: executor, isSecret: false },
     },
     user: input.userConfig ?? {},
     egressSecrets: input.egressSecrets ?? (await buildEgressSecrets()),
@@ -113,7 +136,11 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
     ...(input.timeoutMs ? { wallClockMs: input.timeoutMs } : {}),
   };
 
-  const configPayload = await buildConfigPayload(input);
+  // Resolve once: capacity retries below reuse the same executor even if the
+  // config reloads mid-run.
+  const executorName = resolveRunExecutor(input);
+  const executor = getScriptExecutor(executorName);
+  const configPayload = await buildConfigPayload(input, executorName);
   const executorInput = {
     source: input.source,
     args: input.args ?? null,
@@ -124,12 +151,18 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
     signal: input.signal,
   };
 
-  let output = await getScriptExecutor().run(executorInput);
+  let output = await executor.run(executorInput);
   for (const delayMs of CAPACITY_EXCEEDED_RETRY_DELAYS_MS) {
     if (output.error !== "capacity_exceeded" || input.signal?.aborted) break;
     await Bun.sleep(delayMs);
-    output = await getScriptExecutor().run(executorInput);
+    output = await executor.run(executorInput);
   }
+  console.info(
+    `[scripts-runtime] run entrypoint=${input.entrypoint} executor=${executorName}` +
+      `${input.parentExecutor ? ` parent=${input.parentExecutor}` : ""}` +
+      ` exit=${output.exitCode}${output.error ? ` error=${output.error}` : ""}` +
+      ` durationMs=${output.durationMs}`,
+  );
 
   return {
     ...output,
@@ -137,5 +170,6 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
     stdout: scrubSecrets(output.stdout),
     stderr: scrubSecrets(output.stderr),
     ...(output.runtimeError ? { runtimeError: scrubObject(output.runtimeError) } : {}),
+    executor: executorName,
   };
 }

@@ -121,6 +121,7 @@ export class SwarmScriptExecutor extends BaseExecutor<
     });
     const output = await runScript({
       source: resolved.source,
+      entrypoint: "workflow",
       args: config.args,
       fsMode: "none",
       agentId: agentId ?? "workflow",

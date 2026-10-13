@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Scripts: `SCRIPT_EXECUTOR_EXTERNAL` picks the executor for script APIs, app actions and app sync; agent, workflow, schedule and heartbeat runs keep `SCRIPT_EXECUTOR`. It defaults to `native` (unset follows `SCRIPT_EXECUTOR`), so nothing changes on upgrade. A later release flips the default to `quickjs`; set `native` to keep today's behavior. A nested `script_run` from a `quickjs` script always runs under `quickjs`, and the API logs the entrypoint and executor of every run.
+
 ## [1.171.1] - 2026-10-13
 
 ### Changed

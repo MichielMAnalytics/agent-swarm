@@ -101,6 +101,7 @@ async function executeScheduleScript(schedule: ScheduledTask): Promise<void> {
   try {
     output = await runScript({
       source: script.source,
+      entrypoint: "schedule",
       args,
       fsMode: "none",
       agentId,
