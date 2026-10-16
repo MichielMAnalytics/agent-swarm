@@ -24,6 +24,8 @@
 #              its data intact and the dir tightened to 700, then boots on
 #              previous-image again (image rollback).
 set -euo pipefail
+# A failed api call inside $(...) must abort the whole run, not just the subshell.
+shopt -s inherit_errexit
 
 IMAGE="${1:?usage: smoke-api-sandbox.sh <image> [previous-image]}"
 PREV_IMAGE="${2:-ghcr.io/desplega-ai/agent-swarm:latest}"
@@ -159,8 +161,9 @@ expect() {
 # workflow_probe: run a one-node workflow `script` node, echo its stdout.
 workflow_probe() {
   local script="$1" created run_id run=""
-  created="$(api POST /api/workflows "$(jq -n --arg script "$script" '{
-    name: "sandbox-smoke-\(now | floor)",
+  created="$(api POST /api/workflows "$(jq -n --arg script "$script" \
+    --arg name "sandbox-smoke-$(cat /proc/sys/kernel/random/uuid)" '{
+    name: $name,
     definition: {nodes: [{id: "probe", type: "script", config: {runtime: "bash", script: $script}}]}
   }')")"
   run_id="$(api POST "/api/workflows/$(printf '%s' "$created" | jq -r '.id // .workflow.id')/trigger" '{}' |
