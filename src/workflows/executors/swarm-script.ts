@@ -96,7 +96,7 @@ export class SwarmScriptExecutor extends BaseExecutor<
     // Check the definition this walk executes, not the stored row: an edited
     // definition captured by a run must not inherit Lead after the row is restored.
     // The run's durable flag covers the stored row: any edit to it revokes the
-    // flag for every run (migration 221), so output produced while the row was
+    // flag for every run (migration 222), so output produced while the row was
     // edited is never consumed as Lead after it is restored.
     const seededPrincipal =
       workflow &&

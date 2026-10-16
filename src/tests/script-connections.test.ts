@@ -630,10 +630,10 @@ describe("script connections", () => {
       markMigrationApplied(database, "215_swarm_config_export_to_env.sql");
       // 219 rewrites task_context_snapshots, which this fixture does not create.
       markMigrationApplied(database, "219_relabel_pi_context_compactions.sql");
-      // 220 alters workflow_runs, which this migration-112-only fixture does not create.
-      markMigrationApplied(database, "220_workflow_run_lead_principal.sql");
-      // 221 adds a trigger on workflows, which this fixture does not create either.
-      markMigrationApplied(database, "221_workflow_edit_revokes_lead_principal.sql");
+      // 221 alters workflow_runs, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "221_workflow_run_lead_principal.sql");
+      // 222 adds a trigger on workflows, which this fixture does not create either.
+      markMigrationApplied(database, "222_workflow_edit_revokes_lead_principal.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();

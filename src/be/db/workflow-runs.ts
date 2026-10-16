@@ -116,7 +116,7 @@ function emitAfterCommit(childRunId: string, parentStepId: string): void {
   });
 }
 
-// Lead eligibility of a seeded run (migration 220).
+// Lead eligibility of a seeded run (migration 221).
 
 /**
  * Whether the run may still run seeded `runAs: "lead"` scripts as the Lead.
