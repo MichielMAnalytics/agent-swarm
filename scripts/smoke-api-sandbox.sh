@@ -17,9 +17,9 @@
 #   exec-off   SCRIPT_NATIVE_EXEC_DENY=false (the rollback switch): execDeny
 #              "off", level "uid-only", spawn works, the uid drop stays.
 #   cap-drop   --cap-drop ALL (k8s `capabilities.drop: [ALL]`): level "none",
-#              scripts still run as the API's uid.
+#              scripts still run as the API's uid, spawn still gets EPERM.
 #   non-root   --user 10001 with a writable data dir: level "none", scripts
-#              still run as the API's uid.
+#              still run as the API's uid, spawn still gets EPERM.
 #   upgrade    a data volume written by previous-image boots on <image> with
 #              its data intact and the dir tightened to 700, then boots on
 #              previous-image again (image rollback).
@@ -221,6 +221,7 @@ start cap-drop "$IMAGE" --cap-drop ALL
 expect_health none best-effort
 R="$(probe)"
 expect "$R" '.uid == 0' "script did not run as the API's uid"
+expect "$R" '.spawnExit == "EPERM"' "spawn was not denied under --cap-drop ALL"
 stop
 
 # --- non-root: the API itself runs as a plain uid ----------------------------
@@ -228,6 +229,7 @@ start non-root "$IMAGE" --user 10001:10001 --tmpfs "$DATA_DIR:uid=10001,gid=1000
 expect_health none best-effort
 R="$(probe)"
 expect "$R" '.uid == 10001' "script did not run as the API's uid"
+expect "$R" '.spawnExit == "EPERM"' "spawn was not denied as a non-root API"
 stop
 
 # --- upgrade + image rollback on one data volume ------------------------------
