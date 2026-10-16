@@ -33,7 +33,9 @@ import { reloadGlobalConfigsAndIntegrations, scheduleIntegrationsReload } from "
 import { route } from "./route-def";
 import { duplicateGuardedQueryKey, jsonError } from "./utils";
 
-const MAX_ENV_PRESENCE_KEYS = 200;
+// The dashboard sends every configuration-catalog key in one request, so this
+// must stay above the catalog size (205 keys as of the dreaming settings).
+const MAX_ENV_PRESENCE_KEYS = 400;
 const SECRETS_FORCE_MASK_NOTE =
   " (secret values masked: this token cannot read secrets in this scope)";
 
