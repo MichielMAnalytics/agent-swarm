@@ -9,6 +9,7 @@ import {
   isReservedConfigKey,
   reservedKeyError,
   validateConfigValue,
+  validateExportToEnv,
 } from "@/be/swarm-config-guard";
 import { scheduleIntegrationsReload } from "@/http/core";
 import { can } from "@/rbac";
@@ -29,6 +30,7 @@ const configEntryShape = z.looseObject({
   encrypted: z.boolean().optional(),
   exposure: z.string().nullable().optional(),
   effectiveExposure: z.string().optional(),
+  exportToEnv: z.boolean().optional(),
 });
 
 export const registerSetConfigTool = (server: McpServer) => {
@@ -37,7 +39,7 @@ export const registerSetConfigTool = (server: McpServer) => {
     {
       title: "Set Config",
       description:
-        "Set or update a swarm configuration value. Upserts by (scope, scopeId, key). Use scope='global' for server-wide settings, 'agent' for agent-specific, or 'repo' for repo-specific. Set isSecret=true to mask the value in API responses.",
+        "Set or update a swarm configuration value. Upserts by (scope, scopeId, key). Use scope='global' for server-wide settings, 'agent' for agent-specific, or 'repo' for repo-specific. Set isSecret=true to mask the value in API responses. Set exportToEnv=false to keep the row out of agent process env (agents then reach it through a connection or script credential binding).",
       annotations: { idempotentHint: true },
 
       inputSchema: z.object({
@@ -71,6 +73,12 @@ export const registerSetConfigTool = (server: McpServer) => {
           .describe(
             "Who may read this secret's value: 'worker' (any agent), 'lead' (lead and operator), or 'api' (API server only). Omit to keep the stored value; null clears the override so the key default applies.",
           ),
+        exportToEnv: z
+          .boolean()
+          .optional()
+          .describe(
+            "Export this row into agent process env (default true on create, false for a few server-side secrets; omitted on update keeps the stored flag). Rejected as true for keys only the API server reads.",
+          ),
       }),
       outputSchema: swarmToolOutputSchema({
         yourAgentId: z.string().optional(),
@@ -78,7 +86,7 @@ export const registerSetConfigTool = (server: McpServer) => {
       }),
     },
     async (
-      { scope, scopeId, key, value, isSecret, envPath, description, exposure },
+      { scope, scopeId, key, value, isSecret, envPath, description, exposure, exportToEnv },
       requestInfo,
     ) => {
       if (!requestInfo.agentId) {
@@ -126,7 +134,9 @@ export const registerSetConfigTool = (server: McpServer) => {
         }
 
         const validationError =
-          validateConfigValue(key, value) ?? validateExposureWrite(key, exposure);
+          validateConfigValue(key, value) ??
+          validateExposureWrite(key, exposure) ??
+          validateExportToEnv(key, exportToEnv);
         if (validationError) {
           return toolErr(validationError, { data: { yourAgentId: requestInfo.agentId } });
         }
@@ -140,6 +150,7 @@ export const registerSetConfigTool = (server: McpServer) => {
           envPath,
           description,
           exposure,
+          exportToEnv,
         });
 
         if (scope === "global") {

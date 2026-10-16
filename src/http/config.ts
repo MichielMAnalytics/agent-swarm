@@ -23,6 +23,7 @@ import {
   isReservedConfigKey,
   reservedKeyError,
   validateConfigValue,
+  validateExportToEnv,
 } from "../be/swarm-config-guard";
 import { can, isRbacEnabled, type PermissionVerb } from "../rbac";
 import { SecretExposureSchema, SwarmConfigSchema } from "../types";
@@ -118,6 +119,28 @@ export async function ensureConfigAdmin(
   res: ServerResponse,
   verb: Extract<PermissionVerb, "config.write.any" | "config.delete.any">,
 ): Promise<boolean> {
+  return ensureHttpPermission(
+    req,
+    res,
+    verb,
+    verb === "config.write.any"
+      ? "Writing swarm config requires the lead agent"
+      : "Deleting swarm config requires the lead agent",
+  );
+}
+
+/**
+ * The general form of `ensureConfigAdmin`: operators and users pass, guests
+ * get a plain 403, and an agent principal (session identity first, then the
+ * legacy X-Agent-ID header) must hold `verb`. On denial it writes a 403 with
+ * `forbiddenMessage` and returns false.
+ */
+export async function ensureHttpPermission(
+  req: IncomingMessage,
+  res: ServerResponse,
+  verb: PermissionVerb,
+  forbiddenMessage: string,
+): Promise<boolean> {
   const auth = getRequestAuth(req);
   if (auth?.kind === "operator" || auth?.kind === "user") return true;
   if (auth?.kind === "guest") {
@@ -133,13 +156,7 @@ export async function ensureConfigAdmin(
     source: "http",
   });
   if (!decision.allow) {
-    jsonError(
-      res,
-      verb === "config.write.any"
-        ? "Writing swarm config requires the lead agent"
-        : "Deleting swarm config requires the lead agent",
-      403,
-    );
+    jsonError(res, forbiddenMessage, 403);
     return false;
   }
   return true;
@@ -280,6 +297,12 @@ const upsertConfig = route({
     exposure: SecretExposureSchema.nullish().describe(
       "Who may read this secret's value: worker, lead or api. Omit to keep the stored value; null clears the override so the key default applies.",
     ),
+    exportToEnv: z
+      .boolean()
+      .optional()
+      .describe(
+        "Export this row into agent process env (default true on create, false for a few server-side secrets; omitted on update keeps the stored flag). Rejected as true for keys only the API server reads.",
+      ),
   }),
   responses: {
     200: { description: "Config entry upserted", schema: SwarmConfigSchema },
@@ -446,7 +469,8 @@ export async function handleConfig(
     const parsed = await upsertConfig.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
     if (!(await ensureConfigAdmin(req, res, "config.write.any"))) return true;
-    const { scope, scopeId, key, value, isSecret, envPath, description, exposure } = parsed.body;
+    const { scope, scopeId, key, value, isSecret, envPath, description, exposure, exportToEnv } =
+      parsed.body;
 
     if (scope === "global" && scopeId) {
       jsonError(res, "Global scope must not have scopeId", 400);
@@ -468,7 +492,10 @@ export async function handleConfig(
       return true;
     }
 
-    const validationError = validateConfigValue(key, value) ?? validateExposureWrite(key, exposure);
+    const validationError =
+      validateConfigValue(key, value) ??
+      validateExposureWrite(key, exposure) ??
+      validateExportToEnv(key, exportToEnv);
     if (validationError) {
       jsonError(res, validationError, 400);
       return true;
@@ -485,6 +512,7 @@ export async function handleConfig(
         envPath: envPath || null,
         description: description || null,
         exposure,
+        exportToEnv,
       });
       // Auto-reload integrations when a global-scoped config changes so callers
       // (CLI, automation, dashboard) don't have to remember to hit /reload.
