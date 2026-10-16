@@ -7797,7 +7797,7 @@ type WorkflowRunRow = {
   finishedAt: string | null;
   /** The `sub-workflow` step that started this run (migration 203). */
   parentStepId?: string | null;
-  /** See `isWorkflowRunLeadPrincipalEligible` (migration 220). */
+  /** See `isWorkflowRunLeadPrincipalEligible` (migration 221). */
   leadPrincipalEligible?: number;
 };
 
@@ -7833,7 +7833,7 @@ export async function createWorkflowRun(data: {
   triggerData?: unknown;
   createdBy?: string;
   parentStepId?: string;
-  /** The workflow is the unedited seeded template (migration 220). */
+  /** The workflow is the unedited seeded template (migration 221). */
   leadPrincipalEligible?: boolean;
 }): Promise<WorkflowRun> {
   const now = new Date().toISOString();

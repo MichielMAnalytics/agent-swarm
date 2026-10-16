@@ -159,7 +159,7 @@ export async function startWorkflowExecution(
     parentStepId: options.parentStepId,
     leadPrincipalEligible: await isPristineSeededLeadWorkflow(workflow),
   });
-  // Edits revoke eligibility in the workflows UPDATE trigger (migration 221),
+  // Edits revoke eligibility in the workflows UPDATE trigger (migration 222),
   // which only reaches runs that already exist. `workflow` may have been read
   // before an edit that committed ahead of this insert, so re-read the stored
   // row now: any later edit fires the trigger on this run.
