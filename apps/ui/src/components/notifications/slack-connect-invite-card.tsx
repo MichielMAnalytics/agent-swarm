@@ -1,13 +1,10 @@
 import { type FormEvent, useState } from "react";
-import { toast } from "sonner";
-import { useUpdateInboxItem } from "@/api/hooks/use-inbox-state";
-import { useNotificationEvents } from "@/api/hooks/use-notification-events";
 import type { InboxItemState } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { useCurrentUser } from "@/contexts/current-user-context";
 import type { NotificationDefinition } from "@/lib/notifications/definitions";
+import { useSlackConnectInvite } from "./use-slack-connect-invite";
 
 export function SlackConnectInviteCard({
   definition,
@@ -16,42 +13,14 @@ export function SlackConnectInviteCard({
   definition: NotificationDefinition;
   state?: InboxItemState;
 }) {
-  const currentUser = useCurrentUser();
-  const updateInboxItem = useUpdateInboxItem();
-  const { trackEvent, notifyUs } = useNotificationEvents();
+  const invite = useSlackConnectInvite(definition.key);
   const [email, setEmail] = useState("");
 
   const resolved = state?.status === "dismissed" || state?.status === "done";
 
-  function resolve(status: "dismissed" | "done") {
-    if (!currentUser.userId) return;
-    updateInboxItem.mutate({
-      userId: currentUser.userId,
-      itemType: "notification",
-      itemId: definition.key,
-      status,
-    });
-  }
-
-  function handleDismiss() {
-    trackEvent(definition.key, "dismiss");
-    resolve("dismissed");
-  }
-
-  function handleAlreadyHaveOne() {
-    trackEvent(definition.key, "already_have_one");
-    resolve("done");
-  }
-
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const value = email.trim();
-    if (!value) return;
-    const domain = value.split("@")[1] || undefined;
-    notifyUs(definition.key, "requested a Slack Connect channel invite", value);
-    trackEvent(definition.key, "submit", domain);
-    resolve("done");
-    toast.success("Thanks — we'll reach out to set up the Slack Connect channel.");
+    invite.submit(email);
   }
 
   return (
@@ -82,14 +51,9 @@ export function SlackConnectInviteCard({
               OK
             </Button>
           </div>
-          <div className="flex gap-2">
-            <Button type="button" variant="ghost" size="sm" onClick={handleDismiss}>
-              Dismiss
-            </Button>
-            <Button type="button" variant="outline" size="sm" onClick={handleAlreadyHaveOne}>
-              I already have one
-            </Button>
-          </div>
+          <Button type="button" variant="ghost" size="sm" onClick={invite.dismiss}>
+            Dismiss
+          </Button>
         </form>
       ) : null}
     </div>

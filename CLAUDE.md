@@ -68,7 +68,7 @@ Full rules: [runbooks/extensions.md](./runbooks/extensions.md).
 | Command | What it does |
 |---|---|
 | `bun install` | Install deps |
-| `bun run start:http` | MCP HTTP server (port 3013) |
+| `bun run start:http` | MCP HTTP server (port 3013). For a test or QA boot, prefix `DESPLEGA_TELEMETRY_ENV=test` |
 | `bun run dev:http` | Hot reload, portless: `https://api.swarm.localhost:1355` |
 | `bun run lint:fix` | Lint & format with Biome |
 | `bun run lint:slop` | Anti-slop Oxlint rule subset (`oxlint.config.ts`, vendored plugin in `tools/oxlint/anti-slop/`) |
@@ -76,7 +76,6 @@ Full rules: [runbooks/extensions.md](./runbooks/extensions.md).
 | `bun run tsc:check` | Type check with tsgo (`tsc:check:tsc` runs tsc 5, the CI authority) |
 | `bun run test:root` | Run root unit tests (`bun run test:root -- src/tests/<file>.test.ts` for one) |
 | `bun run e2e:ui` | Playwright UI suite: builds `apps/ui`, one seeded API per worker (`-- --grep @smoke`, `-- --no-build`) |
-| `bun run pm2-{start,stop,restart,logs,status}` | All services (API 3013, UI 5274, lead 3201, worker 3202) |
 | `bun run docker:build:worker` | Build Docker worker image (full) |
 | `bun run docker:build:worker:slim` | Build slim worker image (`--target worker-slim`, for CI/E2E) |
 | `bun run docker:build:api` | Build API server image |
@@ -88,7 +87,7 @@ Full rules: [runbooks/extensions.md](./runbooks/extensions.md).
 | `docker compose -f docker-compose.local.yml up --build` | Local compose (API + lead + worker) |
 | `uvx business-use-core@latest server dev` | BU backend on :13370 |
 
-PM2: lead/worker run in Docker. On code changes: `bun run docker:build:worker && bun run pm2-restart`.
+Lead/worker run in Docker. On code changes: `docker compose -f docker-compose.local.yml up --build`.
 
 </important>
 
@@ -328,7 +327,7 @@ bun run check
 bun run lint           # whole lint scope; NOT lint:fix — CI runs `lint` (read-only)
 bun run lint:slop      # anti-slop Oxlint rule subset
 bun run tsc:check:tsc  # tsc 5, the CI authority (`tsc:check` runs tsgo)
-bun run test:root -- --parallel=4     # CI: 2 shards x --parallel=4, balanced by cached --timings
+bun run test:root -- --parallel=4     # CI: 4 shards x --parallel=4, balanced by cached --timings
 bun run e2e                          # black-box contract suite: boots the API on a free port, no Docker, no LLM
 bun run e2e:ui                       # Playwright UI suite: seeded API per worker, headless Chromium, needs Node 22+
 bun run check:bun-version             # Dockerfile oven/bun tags == package.json packageManager
@@ -409,6 +408,12 @@ Full rulebook: [apps/evals/SCENARIO-AUTHORING.md](./apps/evals/SCENARIO-AUTHORIN
 <important if="you are modifying heartbeat, crash-recovery, or task-assignment/routing logic (src/heartbeat/*, src/tasks/worker-follow-up.ts resume/remediation, the pool/claim path in src/http/poll.ts + src/be/db.ts, or any stall/liveness/reaper threshold)">
 
 [runbooks/heartbeat-crash-recovery.md](./runbooks/heartbeat-crash-recovery.md) is the canonical flow reference — the heartbeat sweep, the stalled-task classifier, and the crash-recovery routing heuristic, with mermaid diagrams + pseudocode. It stores **only the current behavior (no history)**. Update it in the **same PR** whenever you change any of this logic so the diagrams/pseudocode stay true.
+
+</important>
+
+<important if="you are modifying runtime providers (src/runtime-providers/*), runtime pools or supervisor code (src/be/runtime-pools/*), or adding an infrastructure adapter">
+
+Adapter contract, supervisor behavior, owner isolation, and same-PR documentation rules: [runbooks/runtime-providers.md](./runbooks/runtime-providers.md).
 
 </important>
 

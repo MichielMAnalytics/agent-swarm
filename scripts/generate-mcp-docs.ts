@@ -70,6 +70,7 @@ interface ToolInfo {
   title: string;
   description: string;
   fields: FieldInfo[];
+  schemaSource?: string;
 }
 
 interface FieldInfo {
@@ -122,7 +123,13 @@ const CATEGORY_TITLE_OVERRIDES: Record<string, string> = {
   kv: "KV Tools",
   agentmail: "AgentMail Tools",
   kapso: "Kapso (WhatsApp) Tools",
+  "chat-sdk": "Chat SDK Tools",
   "swarm-x": "Swarm X Tools",
+};
+
+// Capabilities switched on by something other than the CAPABILITIES list.
+const CAPABILITY_ENABLE_HINTS: Record<string, string> = {
+  "chat-sdk": "set `CHAT_SDK_ENABLED=true` to enable (the `CAPABILITIES` list does not switch it)",
 };
 
 /**
@@ -322,7 +329,11 @@ async function parseToolFile(toolFileName: string): Promise<ToolInfo[]> {
     }
 
     const fields = parseSchemaFields(snippet, content);
-    infos.push({ name, title, description, fields });
+    const schemaSource =
+      fields.length === 0 && /inputSchema:\s*(?!z\b)[A-Za-z_$][\w$]*/.test(snippet)
+        ? toolFileName
+        : undefined;
+    infos.push({ name, title, description, fields, schemaSource });
   }
 
   return infos;
@@ -583,6 +594,8 @@ function generateToolMarkdown(tool: ToolInfo): string {
       md += `| \`${field.name}\` | \`${field.type}\` | ${req} | ${def} | ${desc} |\n`;
     }
     md += "\n";
+  } else if (tool.schemaSource) {
+    md += `See the [input schema](https://github.com/desplega-ai/agent-swarm/blob/main/src/tools/${tool.schemaSource}.ts) for parameters.\n\n`;
   } else {
     md += "*No parameters*\n\n";
   }
@@ -694,9 +707,12 @@ SDK allowlist instead), and HTTP REST routes are generally not gated.
     if (category.description) {
       markdown += `*${category.description}*\n\n`;
     }
+    const enableHint =
+      CAPABILITY_ENABLE_HINTS[category.name] ??
+      `add \`${category.name}\` to \`CAPABILITIES\` to enable`;
     markdown += category.enabledByDefault
       ? `Capability: \`${category.name}\` (enabled by default)\n\n`
-      : `Capability: \`${category.name}\` — **disabled by default**; add \`${category.name}\` to \`CAPABILITIES\` to enable.\n\n`;
+      : `Capability: \`${category.name}\` — **disabled by default**; ${enableHint}.\n\n`;
 
     for (const toolName of category.tools) {
       const tool = lookupTool(toolName);

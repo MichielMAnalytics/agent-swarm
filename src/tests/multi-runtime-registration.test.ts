@@ -33,7 +33,15 @@ import {
   getAgentMaxTasksConfig,
   getRuntimeInstanceById,
   hasReadyLiveRuntime,
+  insertProvisioningRuntime,
 } from "../be/multi-runtime";
+import {
+  bindAgentToPool,
+  createRuntimeController,
+  createRuntimePool,
+  updateRuntimePool,
+} from "../be/runtime-pools/db";
+import { mintRuntimeToken, resolveBySessionToken } from "../be/users";
 import {
   CREDENTIAL_RETRY_INTERVAL_MS,
   type CredentialRefreshState,
@@ -135,13 +143,23 @@ function createTestServer(): Server {
 async function register(
   agentId: string,
   body: Record<string, unknown> = {},
-): Promise<{ status: number; agent: { maxTasks?: number } }> {
+): Promise<{
+  status: number;
+  agent: { maxTasks?: number; deliveryMode?: string; pollRequired?: boolean };
+}> {
   const res = await fetch(`${baseUrl}/api/agents`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Agent-ID": agentId },
     body: JSON.stringify({ name: "mr-test-agent", ...body }),
   });
-  return { status: res.status, agent: (await res.json()) as { maxTasks?: number } };
+  return {
+    status: res.status,
+    agent: (await res.json()) as {
+      maxTasks?: number;
+      deliveryMode?: string;
+      pollRequired?: boolean;
+    },
+  };
 }
 
 async function putAgentMaxTasks(agentId: string, value: string): Promise<number> {
@@ -171,13 +189,21 @@ async function pingAgent(agentId: string, runtimeInstanceId?: string): Promise<n
   return res.status;
 }
 
-async function closeRuntime(agentId: string, runtimeInstanceId?: string): Promise<number> {
+async function closeRuntime(
+  agentId: string,
+  runtimeInstanceId?: string,
+  runtimeShutdown?: boolean,
+): Promise<number> {
   const headers: Record<string, string> = {
     "X-Agent-ID": agentId,
     Authorization: `Bearer ${API_KEY}`,
   };
   if (runtimeInstanceId) headers["X-Runtime-Instance-ID"] = runtimeInstanceId;
-  const res = await fetch(`${baseUrl}/close`, { method: "POST", headers });
+  const res = await fetch(`${baseUrl}/close`, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: runtimeShutdown === undefined ? undefined : JSON.stringify({ runtimeShutdown }),
+  });
   await res.text();
   return res.status;
 }
@@ -321,6 +347,111 @@ beforeEach(async () => {
     status: "idle",
     capabilities: [],
   });
+});
+
+test("registration adopts a provisioning runtime and preserves controller metadata", async () => {
+  process.env.MULTI_RUNTIME_ENABLED = "true";
+  const agentId = await makeAgent(4);
+  const id = crypto.randomUUID();
+  await insertProvisioningRuntime({
+    id,
+    agentId,
+    poolId: "test-pool",
+    controllerId: "test-controller",
+  });
+  const handle = { kind: "docker", externalId: "test-container" };
+  await getDbClient().run("UPDATE runtime_instances SET external_handle = ? WHERE id = ?", [
+    JSON.stringify(handle),
+    id,
+  ]);
+  expect((await register(agentId, { runtimeInstanceId: id, maxTasks: 2 })).status).toBe(200);
+  expect(await getRuntimeInstanceById(id)).toMatchObject({
+    status: "active",
+    poolId: "test-pool",
+    controllerId: "test-controller",
+    externalHandle: handle,
+    reportedSlots: 2,
+  });
+  expect((await getAgentById(agentId))?.maxTasks).toBe(4);
+});
+
+test("poll refuses a draining runtime and records task history after draining ends", async () => {
+  process.env.MULTI_RUNTIME_ENABLED = "true";
+  const agentId = await makeAgent(2);
+  const id = crypto.randomUUID();
+  await register(agentId, { runtimeInstanceId: id });
+  const task = await createTaskExtended("draining task", { agentId });
+  await getDbClient().run("UPDATE runtime_instances SET draining = 1 WHERE id = ?", [id]);
+  expect((await pollAgent(agentId, id))?.trigger).toBeNull();
+  expect((await getTaskById(task.id))?.status).toBe("pending");
+  await getDbClient().run("UPDATE runtime_instances SET draining = 0 WHERE id = ?", [id]);
+  expect((await pollAgent(agentId, id))?.trigger?.type).toBe("task_assigned");
+  expect((await getRuntimeInstanceById(id))?.taskId).toBe(task.id);
+});
+
+test("runner shutdown close terminates a pool runtime and revokes its token", async () => {
+  process.env.MULTI_RUNTIME_ENABLED = "true";
+  const agentId = await makeAgent(2);
+  const id = crypto.randomUUID();
+  await insertProvisioningRuntime({
+    id,
+    agentId,
+    poolId: "test-pool",
+    controllerId: "test-controller",
+  });
+  const token = await mintRuntimeToken(agentId, id);
+  await register(agentId, { runtimeInstanceId: id });
+  expect(await closeRuntime(agentId, id, true)).toBe(204);
+  expect(await resolveBySessionToken(token.plaintext)).toBeNull();
+  expect((await getRuntimeInstanceById(id))?.status).toBe("offline");
+  expect((await getAgentById(agentId))?.status).toBe("offline");
+});
+
+for (const runtimeShutdown of [undefined, false]) {
+  test(`session close preserves a pooled runtime and token (shutdown: ${runtimeShutdown ?? "omitted"})`, async () => {
+    process.env.MULTI_RUNTIME_ENABLED = "true";
+    const agentId = await makeAgent(2);
+    const id = crypto.randomUUID();
+    await insertProvisioningRuntime({
+      id,
+      agentId,
+      poolId: "test-pool",
+      controllerId: "test-controller",
+    });
+    const token = await mintRuntimeToken(agentId, id);
+    await register(agentId, { runtimeInstanceId: id });
+    const task = await createTaskExtended("active task", { agentId });
+    await startTask(task.id);
+    await startSessionFor(agentId, task.id, id);
+    const agentStatus = (await getAgentById(agentId))?.status;
+
+    expect(await closeRuntime(agentId, id, runtimeShutdown)).toBe(204);
+    expect((await getRuntimeInstanceById(id))?.status).toBe("active");
+    expect(await resolveBySessionToken(token.plaintext)).not.toBeNull();
+    expect((await getAgentById(agentId))?.status).toBe(agentStatus);
+    expect(await getActiveSessionForTask(task.id)).not.toBeNull();
+    expect(await pingAgent(agentId, id)).toBe(204);
+  });
+}
+
+test("runner shutdown cannot terminate another agent's pooled runtime", async () => {
+  process.env.MULTI_RUNTIME_ENABLED = "true";
+  const agentId = await makeAgent(2);
+  const otherAgentId = await makeAgent(1);
+  const id = crypto.randomUUID();
+  await insertProvisioningRuntime({
+    id,
+    agentId,
+    poolId: "test-pool",
+    controllerId: "test-controller",
+  });
+  const token = await mintRuntimeToken(agentId, id);
+  await register(agentId, { runtimeInstanceId: id });
+
+  expect(await closeRuntime(otherAgentId, id, true)).toBe(204);
+  expect((await getRuntimeInstanceById(id))?.status).toBe("active");
+  expect(await resolveBySessionToken(token.plaintext)).not.toBeNull();
+  expect((await getAgentById(agentId))?.status).toBe("idle");
 });
 
 // ─── Migration 131 ──────────────────────────────────────────────────────────
@@ -2933,4 +3064,88 @@ describe("post-task credential recovery without a restart", () => {
       }
     });
   }
+});
+
+describe("worker registration delivery mode", () => {
+  const originalPoolsFlag = process.env.RUNTIME_POOLS_ENABLED;
+  const originalDefaultDelivery = process.env.RUNTIME_DEFAULT_DELIVERY;
+  const originalWorkerMode = process.env.SWARM_DELIVERY_MODE;
+  const originalLeadMonitor = process.env.LEAD_MONITOR_CHANNELS;
+
+  afterAll(() => {
+    for (const [key, value] of Object.entries({
+      RUNTIME_POOLS_ENABLED: originalPoolsFlag,
+      RUNTIME_DEFAULT_DELIVERY: originalDefaultDelivery,
+      SWARM_DELIVERY_MODE: originalWorkerMode,
+      LEAD_MONITOR_CHANNELS: originalLeadMonitor,
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  test("API channel monitoring forces leads to poll with the same strict flag predicate", async () => {
+    process.env.RUNTIME_POOLS_ENABLED = "true";
+    process.env.RUNTIME_DEFAULT_DELIVERY = "push";
+    const agentId = crypto.randomUUID();
+    try {
+      process.env.LEAD_MONITOR_CHANNELS = "true";
+      expect((await register(agentId, { isLead: true })).agent).toMatchObject({
+        deliveryMode: "poll",
+        pollRequired: true,
+      });
+      expect((await register(crypto.randomUUID())).agent).toMatchObject({
+        deliveryMode: "push",
+        pollRequired: false,
+      });
+      for (const flag of ["false", "1", "TRUE"]) {
+        process.env.LEAD_MONITOR_CHANNELS = flag;
+        expect((await register(agentId, { isLead: true })).agent).toMatchObject({
+          deliveryMode: "push",
+          pollRequired: false,
+        });
+      }
+    } finally {
+      if (originalLeadMonitor === undefined) delete process.env.LEAD_MONITOR_CHANNELS;
+      else process.env.LEAD_MONITOR_CHANNELS = originalLeadMonitor;
+    }
+  });
+
+  test("flag off forces poll even with a push default and worker override", async () => {
+    process.env.RUNTIME_POOLS_ENABLED = "false";
+    process.env.RUNTIME_DEFAULT_DELIVERY = "push";
+    process.env.SWARM_DELIVERY_MODE = "push";
+    expect((await register(crypto.randomUUID())).agent.deliveryMode).toBe("poll");
+  });
+
+  test("unbound workers use the default and ignore the worker-side override", async () => {
+    process.env.RUNTIME_POOLS_ENABLED = "true";
+    process.env.RUNTIME_DEFAULT_DELIVERY = "push";
+    process.env.SWARM_DELIVERY_MODE = "poll";
+    expect((await register(crypto.randomUUID())).agent.deliveryMode).toBe("push");
+    delete process.env.RUNTIME_DEFAULT_DELIVERY;
+    expect((await register(crypto.randomUUID())).agent.deliveryMode).toBe("poll");
+  });
+
+  test("pool delivery wins and changes at the next registration", async () => {
+    process.env.RUNTIME_POOLS_ENABLED = "true";
+    process.env.RUNTIME_DEFAULT_DELIVERY = "poll";
+    const controller = await createRuntimeController({ name: crypto.randomUUID(), kind: "static" });
+    const pool = await createRuntimePool({
+      name: crypto.randomUUID(),
+      kind: "static",
+      placements: [controller.id],
+      delivery: "push",
+    });
+    const agentId = await makeAgent(1);
+    await bindAgentToPool(agentId, pool.id);
+    expect((await register(agentId)).agent.deliveryMode).toBe("push");
+    await updateRuntimePool(pool.id, { delivery: "poll" });
+    expect((await register(agentId)).agent.deliveryMode).toBe("poll");
+    await updateRuntimePool(pool.id, { delivery: null });
+    process.env.RUNTIME_DEFAULT_DELIVERY = "push";
+    expect((await register(agentId)).agent.deliveryMode).toBe("push");
+    delete process.env.RUNTIME_DEFAULT_DELIVERY;
+    expect((await register(agentId)).agent.deliveryMode).toBe("poll");
+  });
 });

@@ -6,6 +6,7 @@ import { normalizeAssetKey } from "./assets/key";
 import { isSafeBundlePath } from "./extensions/bundle-path";
 import { MAX_PROFILE_FILE_LENGTH } from "./utils/constants";
 import { z } from "./utils/zod-openapi";
+
 // ─── Asset namespaces ──────────────────────────────────────────────────────
 
 export const AssetKeySchema = z
@@ -390,6 +391,7 @@ export const AgentTaskSourceSchema = z.enum([
   "linear",
   "jira",
   "comb",
+  "chat",
 ]);
 export type AgentTaskSource = z.infer<typeof AgentTaskSourceSchema>;
 
@@ -445,7 +447,7 @@ export const SteeringStatusSchema = z.enum([
 ]);
 export type SteeringStatus = z.infer<typeof SteeringStatusSchema>;
 
-export const SteeringSourceSchema = z.enum(["ui", "mcp", "script", "slack", "api"]);
+export const SteeringSourceSchema = z.enum(["ui", "mcp", "script", "slack", "api", "chat"]);
 export type SteeringSource = z.infer<typeof SteeringSourceSchema>;
 
 export const SteeringMessageSchema = z
@@ -594,6 +596,7 @@ export const AgentTaskSchema = z
       "Origin of the routing reason: declared by the caller or chosen by the engine. Absent for unknown historical provenance or no reason.",
     ),
     routingNote: z.string().max(200).optional(),
+    poolWakeAt: z.string().optional(),
 
     // Task metadata
     taskType: z.string().max(50).optional(), // e.g., "bug", "feature", "chore"
@@ -679,6 +682,10 @@ export const AgentTaskSchema = z
     resolvedModel: z.string().optional(),
     modelSource: z.string().optional(),
     modelAlias: z.string().optional(),
+    // The effort the session ran at (task effort, else the agent's
+    // REASONING_EFFORT_OVERRIDE, dropped when the harness/model cannot take
+    // it). Reported at session start; unset when the harness default applied.
+    resolvedEffort: ReasoningEffortSchema.optional(),
 
     // Schedule linking (optional — set when task was created by a schedule).
     // z.string(): also reachable verbatim from the create-task query param.
@@ -1158,6 +1165,9 @@ export const AgentSchema = z
     name: z.string().min(1),
     isLead: z.boolean().default(false),
     status: AgentStatusSchema,
+    runtimePoolId: z.string().nullable().optional(),
+    runtimeProvisionAttempts: z.number().int().min(0).optional(),
+    runtimeProvisionRetryAt: z.string().nullable().optional(),
 
     // Profile fields
     description: z.string().optional(),
@@ -1453,7 +1463,7 @@ export type ChannelType = z.infer<typeof ChannelTypeSchema>;
 export type Channel = z.infer<typeof ChannelSchema>;
 export type ChannelMessage = z.infer<typeof ChannelMessageSchema>;
 
-// Service Types (for PM2/background services)
+// Service Types (removed PM2 service registry; kept with the services table)
 export const ServiceStatusSchema = z.enum(["starting", "healthy", "unhealthy", "stopped"]);
 
 export const ServiceSchema = z
@@ -1829,6 +1839,10 @@ export const SwarmConfigSchema = z
     // auto-encrypted during initDb; if that fails, boot aborts before normal API
     // reads occur.
     encrypted: z.boolean(),
+    // Whether workers export this row into agent process env. False keeps it
+    // server-side (connections, script credential bindings). Always false for
+    // keys only the API server reads (src/utils/config-env-export.ts).
+    exportToEnv: z.boolean(),
   })
   .openapi("SwarmConfig");
 
@@ -1959,12 +1973,120 @@ export type ActiveSession = z.infer<typeof ActiveSessionSchema>;
 // Runtime Instance Types (multi-runtime worker tracking)
 // ============================================================================
 
+export const WorkerNudgeSchema = z.object({
+  v: z.literal(1),
+  kind: z.enum(["work", "cancel", "steer", "config"]),
+  taskId: z.string().optional(),
+  at: z.iso.datetime(),
+});
+export type WorkerNudge = z.infer<typeof WorkerNudgeSchema>;
+
 /**
  * Lifecycle of a runtime instance. Zod is the source of truth for the allowed
  * values — the SQL column has no CHECK constraint (migration 132) so adding a
  * state doesn't require a table rebuild.
  */
-export const RuntimeInstanceStatusSchema = z.enum(["active", "offline"]);
+export const RuntimeInstanceStatusSchema = z.enum(["active", "offline", "provisioning"]);
+
+/**
+ * Infrastructure kind a runtime pool provisions on. `k8s` is reserved: write
+ * paths reject it until its adapter exists.
+ */
+export const RuntimeProviderKindSchema = z.enum(["static", "docker", "e2b", "k8s"]);
+export type RuntimeProviderKind = z.infer<typeof RuntimeProviderKindSchema>;
+
+export const DeliveryModeSchema = z.enum(["poll", "push"]);
+export type DeliveryMode = z.infer<typeof DeliveryModeSchema>;
+export const PoolLifecycleSchema = z.enum(["idle", "per-task"]);
+const RuntimeResourcesSchema = z
+  .object({
+    cpu: z.number().positive().optional(),
+    memoryMb: z.number().int().positive().optional(),
+  })
+  .strict();
+
+export const RuntimeControllerCreateSchema = z
+  .object({
+    name: z.string().min(1).max(200),
+    kind: RuntimeProviderKindSchema,
+    placement: z.enum(["builtin", "remote"]).default("remote"),
+    config: z.record(z.string(), z.string()).default({}),
+    secretConfig: z.record(z.string(), z.string().nullable()).optional(),
+  })
+  .strict();
+export const RuntimeControllerUpdateSchema = RuntimeControllerCreateSchema.partial().extend({
+  placement: z.enum(["builtin", "remote"]).optional(),
+  config: z.record(z.string(), z.string()).optional(),
+});
+export const RuntimeControllerSchema = RuntimeControllerCreateSchema.omit({ secretConfig: true })
+  .extend({
+    id: z.string(),
+    secretConfigKeys: z.array(z.string()),
+    secretConfigError: z.boolean().optional(),
+    status: z.enum(["online", "offline", "unknown"]),
+    lastSeenAt: z.string().nullable(),
+    lastError: z.string().nullable(),
+    lastErrorAt: z.string().nullable(),
+    createdBy: z.string().nullable(),
+    updatedBy: z.string().nullable(),
+    createdAt: z.string(),
+    updatedAt: z.string(),
+  })
+  .openapi("RuntimeController");
+export type RuntimeController = z.infer<typeof RuntimeControllerSchema>;
+
+export const RuntimePoolCreateSchema = z
+  .object({
+    name: z.string().min(1).max(200),
+    kind: RuntimeProviderKindSchema,
+    placements: z.array(z.string().min(1)).length(1),
+    image: z.string().min(1).nullable().optional(),
+    lifecycle: PoolLifecycleSchema.default("idle"),
+    idleMinutes: z.number().int().positive().nullable().default(null),
+    slotsPerRuntime: z.number().int().min(1).default(1),
+    maxRuntimes: z.number().int().min(0).nullable().default(null),
+    minRuntimes: z.number().int().min(0).default(0),
+    delivery: DeliveryModeSchema.nullable().default(null),
+    env: z.record(z.string(), z.string()).default({}),
+    resources: RuntimeResourcesSchema.nullable().default(null),
+    ttlSec: z.number().int().positive().nullable().default(null),
+    enabled: z.boolean().default(true),
+  })
+  .strict();
+export const RuntimePoolUpdateSchema = RuntimePoolCreateSchema.partial().extend({
+  lifecycle: PoolLifecycleSchema.optional(),
+  idleMinutes: z.number().int().positive().nullable().optional(),
+  slotsPerRuntime: z.number().int().min(1).optional(),
+  maxRuntimes: z.number().int().min(0).nullable().optional(),
+  minRuntimes: z.number().int().min(0).optional(),
+  delivery: DeliveryModeSchema.nullable().optional(),
+  env: z.record(z.string(), z.string()).optional(),
+  resources: RuntimeResourcesSchema.nullable().optional(),
+  ttlSec: z.number().int().positive().nullable().optional(),
+  enabled: z.boolean().optional(),
+});
+export const RuntimePoolSchema = RuntimePoolCreateSchema.extend({
+  id: z.string(),
+  resolvedImage: z.string().nullable(),
+  consecutiveFailures: z.number().int(),
+  circuitOpenUntil: z.string().nullable(),
+  lastError: z.string().nullable(),
+  lastErrorAt: z.string().nullable(),
+  createdBy: z.string().nullable(),
+  updatedBy: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+}).openapi("RuntimePool");
+export type RuntimePool = z.infer<typeof RuntimePoolSchema>;
+export const RuntimePoolCreateAgentSchema = z
+  .object({
+    name: z.string().min(1),
+    isLead: z.boolean().optional(),
+    harnessProvider: ProviderNameSchema.optional(),
+    maxTasks: z.number().int().min(1).max(100).optional(),
+    templateId: z.string().min(1).optional(),
+  })
+  .strict();
 
 /**
  * One worker process serving a logical agent. The `agents` row (AGENT_ID /
@@ -1979,6 +2101,16 @@ export const RuntimeInstanceSchema = z
     id: z.string(),
     agentId: z.string(),
     status: RuntimeInstanceStatusSchema,
+    poolId: z.string().nullable().optional(),
+    controllerId: z.string().nullable().optional(),
+    externalHandle: z.record(z.string(), z.unknown()).nullable().optional(),
+    provisionAttempts: z.number().int().optional(),
+    provisionError: z.string().nullable().optional(),
+    provisionRequestedAt: z.string().nullable().optional(),
+    draining: z.boolean().optional(),
+    idleSince: z.string().nullable().optional(),
+    leaseExpiresAt: z.string().nullable().optional(),
+    taskId: z.string().nullable().optional(),
     /** Runtime-local concurrent task capacity, self-reported at registration. */
     reportedSlots: z.number().int(),
     /** Process-local credential readiness; null when never reported. */
@@ -2505,6 +2637,7 @@ export type AgentTaskSummary = Pick<
   | "modelSource"
   | "modelAlias"
   | "effort"
+  | "resolvedEffort"
   | "provider"
   | "requestedByUserId"
   | "progress"
@@ -2713,8 +2846,20 @@ export const WorkflowRunSchema = z
     startedAt: z.string(),
     lastUpdatedAt: z.string(),
     finishedAt: z.string().optional(),
+    /** The `sub-workflow` step that started this run. Unset on a top-level run. */
+    parentStepId: z.string().optional(),
   })
   .openapi("WorkflowRun");
+
+/** The run and `sub-workflow` step that started a child run. */
+export const WorkflowRunParentSchema = z
+  .object({
+    runId: z.string(),
+    workflowId: z.string(),
+    stepId: z.string(),
+    nodeId: z.string(),
+  })
+  .openapi("WorkflowRunParent");
 export type WorkflowRun = z.infer<typeof WorkflowRunSchema>;
 
 /** List row of a run: no `context`, which `GET /api/workflow-runs/{id}` serves. */

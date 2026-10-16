@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { z } from "zod";
 import { initAgentMail, resetAgentMail } from "../agentmail";
 import {
   initAzureDevOps,
@@ -17,17 +18,21 @@ import {
   updateAgentStatus,
 } from "../be/db";
 import {
+  getRuntimeInstanceById,
   markRuntimeInstanceOffline,
+  markRuntimeTerminated,
   reconcileAgentStatusFromRuntimes,
   touchRuntimeInstance,
 } from "../be/multi-runtime";
 import { enqueueAdmissionRow } from "../be/rbac-audit";
 import { getUserGrant } from "../be/rbac-roles";
+import { syncTelemetryEnabled } from "../be/telemetry-enable";
 import { initGitHub, resetGitHub } from "../github";
 import { initGitLab, isGitLabEnabled, resetGitLab } from "../gitlab";
+import { restartChatSdkIfConfigChanged } from "../integrations/chat-sdk/runtime";
 import { initJira, resetJira } from "../jira";
 import { initLinear, resetLinear } from "../linear";
-import { decideAdmission, isRbacEnabled } from "../rbac";
+import { can, decideAdmission, isRbacEnabled } from "../rbac";
 import { startSlackApp, stopSlackApp } from "../slack";
 import type { AgentStatus } from "../types";
 import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
@@ -40,7 +45,13 @@ import { refreshSecretScrubberCache, registerSensitiveKeyName } from "../utils/s
 import { resolveHttpRequestAuth } from "./auth";
 import { generateOpenApiSpec, SCALAR_HTML } from "./openapi";
 import { findRoute, isPublicRoute, route, runtimeInstanceHeader } from "./route-def";
-import { agentWithCapacity, getPathSegments, jsonError, parseQueryParams } from "./utils";
+import {
+  agentWithCapacity,
+  duplicateGuardedQueryKey,
+  getPathSegments,
+  jsonError,
+  parseQueryParams,
+} from "./utils";
 
 /**
  * Load global swarm_config entries into process.env.
@@ -159,6 +170,12 @@ async function reloadGlobalConfigsAndIntegrationsInner(): Promise<ReloadConfigRe
 
   const updated = await loadGlobalConfigsIntoEnv(true);
 
+  // ANONYMIZED_TELEMETRY may have just flipped on: mint the install ID now
+  // instead of dropping every event until a restart.
+  await syncTelemetryEnabled("settings").catch((err) => {
+    console.error("[config-reload] telemetry re-init failed (non-fatal):", err);
+  });
+
   // Retire the old transport before any other integration can fail during
   // reload. HTTP/invalid selection must never leave the previous socket live.
   await stopSlackApp();
@@ -226,6 +243,9 @@ async function reloadGlobalConfigsAndIntegrationsInner(): Promise<ReloadConfigRe
   if (await initJira()) integrations.push("jira");
 
   if (await startSlackApp()) integrations.push("slack");
+
+  // After Slack: the Chat SDK Slack clash check reads SLACK_DISABLE.
+  if (await restartChatSdkIfConfigChanged()) integrations.push("chat-sdk");
 
   return {
     configsLoaded: updated.length,
@@ -380,17 +400,18 @@ const closeRoute = route({
   method: "post",
   path: "/close",
   pattern: ["close"],
-  summary: "Mark an agent or runtime offline on shutdown",
+  summary: "End a session or terminate an agent runtime",
   description:
-    `Retires the calling process. ${RUNTIME_HEADER_DOC} With multi-runtime mode on, the header ` +
-    "is required and only that runtime is retired; the agent goes offline once no live runtime " +
-    "remains. With the flag off, the agent is marked offline as before.",
+    `Closes the calling session. ${RUNTIME_HEADER_DOC} Pooled runtimes remain active unless ` +
+    "runtimeShutdown is true. With multi-runtime mode on, the header is required and static " +
+    "runtimes retire independently. With the flag off, static agents are marked offline.",
   tags: ["Core"],
   auth: { apiKey: true, agentId: true },
   headers: runtimeInstanceHeader("retire a runtime"),
+  body: z.object({ runtimeShutdown: z.boolean().optional() }).optional(),
   rbac: { ungated: "self-scoped: an agent retires its own runtime" },
   responses: {
-    204: { description: "Runtime (and agent, when last) marked offline" },
+    204: { description: "Session closed or runtime retired" },
     400: {
       description: "Missing X-Agent-ID, or missing X-Runtime-Instance-ID in multi-runtime mode",
     },
@@ -408,6 +429,14 @@ export async function handleCore(
   // await — so the (asynchronously resolved) auth reaches everything the
   // request pipeline does afterwards, including audit columns in the DB layer.
   beginRequestAuthScope();
+
+  // Controller credentials authorize only their separate WebSocket transport.
+  let auth = await resolveHttpRequestAuth(req, apiKey);
+  if (auth?.kind === "controller") {
+    setRequestAuth(req, auth);
+    jsonError(res, "Controller tokens can only connect to the controller socket", 403);
+    return true;
+  }
 
   // Handle preflight
   if (req.method === "OPTIONS") {
@@ -455,14 +484,12 @@ export async function handleCore(
   // either the global swarm key or an active user-bound `aswt_` token.
   const pathSegments = getPathSegments(req.url || "");
   const isUserMcpRoute = req.url === "/mcp-user";
-  let auth = null as Awaited<ReturnType<typeof resolveHttpRequestAuth>>;
   // `/mcp-user` runs its own `aswt_`-token auth in `handleMcpUser`; the swarm
   // API key must not gate it.
   if (isUserMcpRoute || isPublicRoute(req.method, pathSegments)) {
+    auth = null;
     setRequestAuth(req, null);
   } else {
-    auth = await resolveHttpRequestAuth(req, apiKey);
-
     if (!auth) {
       setRequestAuth(req, null);
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -470,6 +497,65 @@ export async function handleCore(
       return true;
     }
     setRequestAuth(req, auth);
+  }
+
+  if (auth?.kind === "agent") {
+    const query = parseQueryParams(req.url || "");
+    const duplicate = duplicateGuardedQueryKey(query);
+    if (duplicate) {
+      jsonError(res, `Duplicate query parameter: ${duplicate}`, 400);
+      return true;
+    }
+    if (req.headers["x-page-id"] !== undefined) {
+      jsonError(res, "Agent tokens cannot send X-Page-Id", 403);
+      return true;
+    }
+    const header = req.headers["x-agent-id"];
+    const agentId = Array.isArray(header) ? header[0] : header;
+    if (agentId !== undefined && agentId !== auth.agentId) {
+      jsonError(res, "X-Agent-ID does not match token", 403);
+      return true;
+    }
+    req.headers["x-agent-id"] = auth.agentId;
+    myAgentId = auth.agentId;
+    if (auth.runtimeId) {
+      const header = req.headers["x-runtime-instance-id"];
+      const runtimeId = Array.isArray(header) ? header[0] : header;
+      if (runtimeId !== undefined && runtimeId !== auth.runtimeId) {
+        jsonError(res, "X-Runtime-Instance-ID does not match token", 403);
+        return true;
+      }
+      req.headers["x-runtime-instance-id"] = auth.runtimeId;
+      const sourceHeader = req.headers["x-source-task-id"];
+      const taskId = Array.isArray(sourceHeader) ? sourceHeader[0] : sourceHeader;
+      if (taskId !== undefined && (await getTaskById(taskId))?.agentId !== auth.agentId) {
+        jsonError(res, "X-Source-Task-Id does not belong to token agent", 403);
+        return true;
+      }
+    }
+    const targetAgentId = pathSegments[2];
+    if (
+      pathSegments[0] === "api" &&
+      pathSegments[1] === "agents" &&
+      targetAgentId &&
+      targetAgentId !== auth.agentId &&
+      (req.method !== "GET" ||
+        query.get("resolveSecrets") === "true" ||
+        query.get("includeSecrets") === "true")
+    ) {
+      const agent = await getAgentById(auth.agentId);
+      if (
+        !can({
+          principal: { kind: "agent", agentId: auth.agentId, isLead: agent?.isLead ?? false },
+          verb: "agent.act.any",
+          resource: { kind: "agent", agentId: targetAgentId },
+          source: "http",
+        }).allow
+      ) {
+        jsonError(res, "Token cannot access another agent's scope", 403);
+        return true;
+      }
+    }
   }
 
   if (auth?.kind === "user" && isRbacEnabled()) {
@@ -682,6 +768,14 @@ export async function handleCore(
       return true;
     }
 
+    const parsed = await closeRoute.parse(
+      req,
+      res,
+      getPathSegments(req.url || ""),
+      new URLSearchParams(),
+    );
+    if (!parsed) return true;
+
     const found = await getDbClient().transaction(async () => {
       const agent = await getAgentById(myAgentId);
 
@@ -689,10 +783,14 @@ export async function handleCore(
         return false;
       }
 
-      if (multiRuntime && runtimeInstanceId) {
-        // One process exiting retires only its own runtime; the logical state
-        // is then recomputed from whatever is left — offline when nothing is,
-        // otherwise reflecting the surviving runtimes' readiness and work.
+      const runtime = runtimeInstanceId ? await getRuntimeInstanceById(runtimeInstanceId) : null;
+      if (runtime?.agentId === agent.id && runtime.poolId) {
+        // Session hooks do not end the runtime that owns their sessions.
+        if (parsed.body?.runtimeShutdown) {
+          await markRuntimeTerminated(runtime.id, "Runner shutdown");
+        }
+      } else if (multiRuntime && runtimeInstanceId) {
+        // Static runtimes retain independent close behavior.
         await markRuntimeInstanceOffline(runtimeInstanceId, agent.id);
         await reconcileAgentStatusFromRuntimes(agent.id);
       } else {

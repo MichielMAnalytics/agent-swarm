@@ -43,6 +43,7 @@ import {
   splitLegacyModelAlias,
 } from "@/types";
 import { findJsonSchemaShapeErrors } from "@/workflows/json-schema-validator";
+import { isAgentReachable } from "../be/runtime-pools/reachability";
 import { looseAgentTaskOutputSchema } from "./get-task-details";
 
 /**
@@ -291,7 +292,7 @@ export async function sendTaskHandler(
   }: SendTaskArgs,
 ): Promise<SwarmToolResult> {
   const userLead = ctx.kind === "user" ? await getLeadAgent() : null;
-  if (ctx.kind === "user" && (!userLead || userLead.status === "offline")) {
+  if (ctx.kind === "user" && (!userLead || !(await isAgentReachable(userLead)))) {
     return toolErr("No online Lead is available. Start or register a Lead before sending a task.");
   }
 
@@ -377,6 +378,30 @@ export async function sendTaskHandler(
   const effectiveParentTask = effectiveParentTaskId
     ? await getTaskById(effectiveParentTaskId)
     : null;
+  // The child inherits the parent's contextKey (its Slack or chat thread) and requester, and
+  // thread-scoped tools trust that binding. An agent can only build on a parent it owns or
+  // created; otherwise a worker could mint access to a foreign thread.
+  if (ctx.kind === "owner" && creatorAgentId && effectiveParentTask) {
+    const caller = await getAgentById(creatorAgentId);
+    const decision = can({
+      principal: { kind: "agent", agentId: creatorAgentId, isLead: caller?.isLead ?? false },
+      verb: "task.parent.attach",
+      resource: {
+        kind: "task",
+        taskId: effectiveParentTask.id,
+        requestedByUserId: effectiveParentTask.requestedByUserId,
+        creatorAgentId: effectiveParentTask.creatorAgentId,
+        agentId: effectiveParentTask.agentId,
+      },
+      source: "mcp",
+    });
+    if (!decision.allow) {
+      return toolErr(
+        `You don't have context for parent task ${effectiveParentTask.id}. Only its assignee, its creator, or a lead can create a child task under it.`,
+        { data: { yourAgentId: creatorAgentId } },
+      );
+    }
+  }
   if (effectiveParentTask?.routingAffinityInvalid) {
     return toolErr("Cannot continue a task with an invalid routing affinity.", {
       data: { yourAgentId: creatorAgentId },
@@ -661,7 +686,7 @@ export async function sendTaskHandler(
       };
     }
 
-    if (ctx.kind === "user" && (!agent.isLead || agent.status === "offline")) {
+    if (ctx.kind === "user" && (!agent.isLead || !(await isAgentReachable(agent)))) {
       return {
         success: false,
         message: "The Lead is no longer online. No task was created.",

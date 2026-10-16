@@ -18,9 +18,11 @@ Bun auto-loads `.env`. Don't use `dotenv`.
 |---|---|---|
 | `AGENT_SWARM_API_KEY` (preferred) / `API_KEY` (legacy) | `123123` | Auth header `Authorization: Bearer …`. `AGENT_SWARM_API_KEY` wins when both are set — prefer it when exporting in your shell profile so the CLI works from any cwd without colliding with other tools' `API_KEY`. |
 | `RBAC_ENABLED` | `true` | Gates REST calls authenticated with `aswt_` user tokens at HTTP admission against the user's RBAC role grants. Operator key and agent calls are unaffected. |
+| `RUNTIME_TOKEN_TTL_HOURS` | `168` | Runtime token lifetime in hours, greater than zero and at most 168. Applies to new tokens. |
 | `MCP_BASE_URL` | `http://localhost:3013` | Internal/worker-facing API base the workers/UI hit |
 | `PUBLIC_MCP_BASE_URL` | falls back to `MCP_BASE_URL` | Public origin for OAuth redirect URIs + webhook URLs. No action needed locally — leave unset and it defaults to `MCP_BASE_URL`. Only relevant in split deploys where `MCP_BASE_URL` is an internal/cluster address. |
 | `APP_URL` | `http://localhost:5274` | Dashboard URL |
+| `CORS_ALLOWED_ORIGINS` | built-in list (dashboard on 5274, portless UI, hosted domains) | Credentialed CORS allowlist. With `NODE_ENV=development` (`start:http`, `dev:http`) any `http://localhost:<port>`, `127.0.0.1` or `[::1]` origin is allowed too, so a dashboard dev server on another port needs no config. |
 | `SLACK_DISABLE` / `GITHUB_DISABLE` / `JIRA_DISABLE` / `LINEAR_DISABLE` | unset | Set `=true` to disable each integration |
 | `SLACK_ALLOW_DEV_SOCKET_MODE` | unset (off) | Explicitly allow a `NODE_ENV=development` API process to open Slack Socket Mode. `start:http` is blocked by default even when ambient Slack tokens exist. |
 | `SLACK_THREAD_STEERING` | `lead` | Slack thread steering: `lead` targets the latest in-progress lead task; `all` targets the latest active task. Other values preserve follow-up task routing. |
@@ -40,6 +42,11 @@ Bun auto-loads `.env`. Don't use `dotenv`.
 `HARNESS_PROVIDER=devin` requires `DEVIN_API_KEY` (prefix `cog_*`) and `DEVIN_ORG_ID` (prefix `org-*`). Optional: `DEVIN_POLL_INTERVAL_MS` (default 15000), `DEVIN_ACU_COST_USD` (default 2.25), `DEVIN_MAX_ACU_LIMIT` (per-session ACU cap, sent to Devin API and shown in UI budget bar), `DEVIN_API_BASE_URL` (override for testing). Repos are configured via the task's `vcsRepo` field — no env var needed. See `.env.docker-devin.example` for a full template.
 
 `AGENT_SWARM_API_KEY` / `API_KEY` and `SECRETS_ENCRYPTION_KEY` are reserved — they cannot be stored in `swarm_config`.
+
+Runtime tokens are `aseph_` bearer tokens bound to one agent and runtime, with access to that agent's resolved secrets.
+Repo-scoped secrets are not delivered to non-lead runtime-token workers in v1.
+Lead tokens retain `config.read.secrets`, and ACP tokens retain the global default scope.
+They replace the swarm key only for supervisor-provisioned runtimes, and runtime revocation also revokes their task tokens.
 
 SSRF guards on script-connection URL fetches (OpenAPI spec URLs, OAuth
 discovery, authorize/token URLs) **fail closed**: private/loopback and plain
@@ -66,6 +73,10 @@ Full guides:
 - [docs-site/.../integrations/linear.mdx](../docs-site/content/docs/(documentation)/integrations/linear.mdx)
 
 OAuth token refresh behavior and local smoke testing: [runbooks/oauth-tokens.md](./oauth-tokens.md).
+
+## Chat SDK channel
+
+With `CHAT_SDK_ENABLED=true`, the API starts the Chat SDK adapters in `CHAT_SDK_ADAPTERS` at boot, in the background. Each adapter calls its platform API while it initializes (Telegram `getMe`, Slack `auth.test`, Discord Gateway login), so the API host needs outbound network to those platforms. Webhook-mode adapters also need a public HTTPS `PUBLIC_MCP_BASE_URL`; point it at a tunnel in dev. Telegram `mode: "polling"` and Slack `mode: "socket"` need no public URL. For tests and local QA without real platforms, set the env-only `CHAT_SDK_API_URL_OVERRIDES` (for example `{"telegram":"http://127.0.0.1:<port>"}` with `bun scripts/dev/telegram-bot-api-mock.ts`). Full guide: [docs-site/.../integrations/chat-sdk.mdx](../docs-site/content/docs/(documentation)/integrations/chat-sdk.mdx).
 
 ## Secrets encryption
 

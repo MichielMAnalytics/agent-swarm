@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Agent Swarm API",
-    "version": "1.169.0",
+    "version": "2.0.0",
     "description": "Multi-agent orchestration API for Claude Code, Codex, and Gemini CLI. Enables task distribution, agent communication, and service discovery.\n\nMCP tools are documented separately in [MCP.md](./MCP.md)."
   },
   "servers": [
@@ -172,7 +172,8 @@
               "workflow",
               "linear",
               "jira",
-              "comb"
+              "comb",
+              "chat"
             ],
             "default": "mcp"
           },
@@ -197,6 +198,9 @@
           "routingNote": {
             "type": "string",
             "maxLength": 200
+          },
+          "poolWakeAt": {
+            "type": "string"
           },
           "taskType": {
             "type": "string",
@@ -371,6 +375,17 @@
           },
           "modelAlias": {
             "type": "string"
+          },
+          "resolvedEffort": {
+            "type": "string",
+            "enum": [
+              "off",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ]
           },
           "scheduleId": {
             "type": "string"
@@ -949,6 +964,22 @@
               "waiting_for_credentials"
             ]
           },
+          "runtimePoolId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtimeProvisionAttempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "runtimeProvisionRetryAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "description": {
             "type": "string"
           },
@@ -1380,6 +1411,9 @@
           },
           "encrypted": {
             "type": "boolean"
+          },
+          "exportToEnv": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -1393,7 +1427,8 @@
           "description",
           "createdAt",
           "lastUpdatedAt",
-          "encrypted"
+          "encrypted",
+          "exportToEnv"
         ]
       },
       "ContextSnapshot": {
@@ -2904,7 +2939,8 @@
               "mcp",
               "script",
               "slack",
-              "api"
+              "api",
+              "chat"
             ]
           },
           "senderLabel": {
@@ -3024,6 +3060,20 @@
           "eventType",
           "createdAt"
         ]
+      },
+      "UserCommsPrefs": {
+        "type": "object",
+        "properties": {
+          "tone": {
+            "type": "string"
+          },
+          "language": {
+            "type": "string"
+          },
+          "verbosity": {
+            "type": "string"
+          }
+        }
       },
       "Page": {
         "type": "object",
@@ -3310,20 +3360,6 @@
           "changedAt",
           "changeReason"
         ]
-      },
-      "UserCommsPrefs": {
-        "type": "object",
-        "properties": {
-          "tone": {
-            "type": "string"
-          },
-          "language": {
-            "type": "string"
-          },
-          "verbosity": {
-            "type": "string"
-          }
-        }
       },
       "BudgetRefusedTrigger": {
         "type": "object",
@@ -4396,93 +4432,6 @@
           "installedAt"
         ]
       },
-      "Service": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "agentId": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 50
-          },
-          "port": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 65535,
-            "default": 3000
-          },
-          "description": {
-            "type": "string"
-          },
-          "url": {
-            "type": "string",
-            "format": "uri"
-          },
-          "healthCheckPath": {
-            "type": "string",
-            "default": "/health"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "starting",
-              "healthy",
-              "unhealthy",
-              "stopped"
-            ],
-            "default": "starting"
-          },
-          "script": {
-            "type": "string",
-            "minLength": 1
-          },
-          "cwd": {
-            "type": "string"
-          },
-          "interpreter": {
-            "type": "string"
-          },
-          "args": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "env": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "string"
-            }
-          },
-          "metadata": {
-            "type": "object",
-            "additionalProperties": {},
-            "default": {}
-          },
-          "createdAt": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "lastUpdatedAt": {
-            "type": "string",
-            "format": "date-time"
-          }
-        },
-        "required": [
-          "id",
-          "agentId",
-          "name",
-          "script",
-          "createdAt",
-          "lastUpdatedAt"
-        ]
-      },
       "TaskTemplate": {
         "type": "object",
         "properties": {
@@ -5244,6 +5193,9 @@
           },
           "finishedAt": {
             "type": "string"
+          },
+          "parentStepId": {
+            "type": "string"
           }
         },
         "required": [
@@ -5294,6 +5246,9 @@
             "type": "string"
           },
           "finishedAt": {
+            "type": "string"
+          },
+          "parentStepId": {
             "type": "string"
           }
         },
@@ -5375,6 +5330,29 @@
           "nodeType",
           "status",
           "startedAt"
+        ]
+      },
+      "WorkflowRunParent": {
+        "type": "object",
+        "properties": {
+          "runId": {
+            "type": "string"
+          },
+          "workflowId": {
+            "type": "string"
+          },
+          "stepId": {
+            "type": "string"
+          },
+          "nodeId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "runId",
+          "workflowId",
+          "stepId",
+          "nodeId"
         ]
       },
       "WorkflowVersion": {
@@ -5673,6 +5651,403 @@
           "triggers",
           "enabled"
         ]
+      },
+      "RuntimePool": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "static",
+              "docker",
+              "e2b",
+              "k8s"
+            ]
+          },
+          "placements": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "idle",
+              "per-task"
+            ],
+            "default": "idle"
+          },
+          "idleMinutes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "exclusiveMinimum": 0,
+            "default": null
+          },
+          "slotsPerRuntime": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1
+          },
+          "maxRuntimes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "default": null
+          },
+          "minRuntimes": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0
+          },
+          "delivery": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "poll",
+              "push",
+              null
+            ],
+            "default": null
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {}
+          },
+          "resources": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "cpu": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "memoryMb": {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              }
+            },
+            "default": null,
+            "additionalProperties": false
+          },
+          "ttlSec": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "exclusiveMinimum": 0,
+            "default": null
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "id": {
+            "type": "string"
+          },
+          "resolvedImage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "consecutiveFailures": {
+            "type": "integer"
+          },
+          "circuitOpenUntil": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lastError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lastErrorAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdBy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updatedBy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "placements",
+          "id",
+          "resolvedImage",
+          "consecutiveFailures",
+          "circuitOpenUntil",
+          "lastError",
+          "lastErrorAt",
+          "createdBy",
+          "updatedBy",
+          "createdAt",
+          "updatedAt"
+        ],
+        "additionalProperties": false
+      },
+      "RuntimeInstance": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "offline",
+              "provisioning"
+            ]
+          },
+          "poolId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "controllerId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "externalHandle": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {}
+          },
+          "provisionAttempts": {
+            "type": "integer"
+          },
+          "provisionError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provisionRequestedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "draining": {
+            "type": "boolean"
+          },
+          "idleSince": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "leaseExpiresAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "taskId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reportedSlots": {
+            "type": "integer"
+          },
+          "credentialReady": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {}
+          },
+          "lastSeenAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "agentId",
+          "status",
+          "reportedSlots",
+          "metadata",
+          "lastSeenAt",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "RuntimeController": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "static",
+              "docker",
+              "e2b",
+              "k8s"
+            ]
+          },
+          "placement": {
+            "type": "string",
+            "enum": [
+              "builtin",
+              "remote"
+            ],
+            "default": "remote"
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {}
+          },
+          "id": {
+            "type": "string"
+          },
+          "secretConfigKeys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "secretConfigError": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "online",
+              "offline",
+              "unknown"
+            ]
+          },
+          "lastSeenAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lastError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lastErrorAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdBy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updatedBy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "id",
+          "secretConfigKeys",
+          "status",
+          "lastSeenAt",
+          "lastError",
+          "lastErrorAt",
+          "createdBy",
+          "updatedBy",
+          "createdAt",
+          "updatedAt"
+        ],
+        "additionalProperties": false
       }
     },
     "parameters": {}
@@ -6252,8 +6627,8 @@
     },
     "/close": {
       "post": {
-        "summary": "Mark an agent or runtime offline on shutdown",
-        "description": "Retires the calling process. Workers may send `X-Runtime-Instance-ID`, the per-boot identifier of the calling process. It is ignored unless MULTI_RUNTIME_ENABLED is set. With multi-runtime mode on, the header is required and only that runtime is retired; the agent goes offline once no live runtime remains. With the flag off, the agent is marked offline as before.",
+        "summary": "End a session or terminate an agent runtime",
+        "description": "Closes the calling session. Workers may send `X-Runtime-Instance-ID`, the per-boot identifier of the calling process. It is ignored unless MULTI_RUNTIME_ENABLED is set. Pooled runtimes remain active unless runtimeShutdown is true. With multi-runtime mode on, the header is required and static runtimes retire independently. With the flag off, static agents are marked offline.",
         "tags": [
           "Core"
         ],
@@ -6274,9 +6649,23 @@
             "in": "header"
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "runtimeShutdown": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "204": {
-            "description": "Runtime (and agent, when last) marked offline"
+            "description": "Session closed or runtime retired"
           },
           "400": {
             "description": "Missing X-Agent-ID, or missing X-Runtime-Instance-ID in multi-runtime mode",
@@ -9796,7 +10185,6 @@
                               "prompt-templates",
                               "mcp",
                               "profiles",
-                              "services",
                               "scheduling",
                               "memory",
                               "workflows",
@@ -9810,13 +10198,25 @@
                               "repo",
                               "agentmail",
                               "kapso",
+                              "chat-sdk",
                               "swarm-x"
                             ]
                           }
+                        },
+                        "deliveryMode": {
+                          "type": "string",
+                          "enum": [
+                            "poll",
+                            "push"
+                          ]
+                        },
+                        "pollRequired": {
+                          "type": "boolean"
                         }
                       },
                       "required": [
-                        "enabledCapabilities"
+                        "enabledCapabilities",
+                        "deliveryMode"
                       ]
                     }
                   ]
@@ -9848,7 +10248,6 @@
                               "prompt-templates",
                               "mcp",
                               "profiles",
-                              "services",
                               "scheduling",
                               "memory",
                               "workflows",
@@ -9862,13 +10261,25 @@
                               "repo",
                               "agentmail",
                               "kapso",
+                              "chat-sdk",
                               "swarm-x"
                             ]
                           }
+                        },
+                        "deliveryMode": {
+                          "type": "string",
+                          "enum": [
+                            "poll",
+                            "push"
+                          ]
+                        },
+                        "pollRequired": {
+                          "type": "boolean"
                         }
                       },
                       "required": [
-                        "enabledCapabilities"
+                        "enabledCapabilities",
+                        "deliveryMode"
                       ]
                     }
                   ]
@@ -10644,7 +11055,63 @@
                             "type": "string",
                             "enum": [
                               "active",
-                              "offline"
+                              "offline",
+                              "provisioning"
+                            ]
+                          },
+                          "poolId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "controllerId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "externalHandle": {
+                            "type": [
+                              "object",
+                              "null"
+                            ],
+                            "additionalProperties": {}
+                          },
+                          "provisionAttempts": {
+                            "type": "integer"
+                          },
+                          "provisionError": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "provisionRequestedAt": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "draining": {
+                            "type": "boolean"
+                          },
+                          "idleSince": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "leaseExpiresAt": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "taskId": {
+                            "type": [
+                              "string",
+                              "null"
                             ]
                           },
                           "reportedSlots": {
@@ -15197,6 +15664,10 @@
                       "string",
                       "null"
                     ]
+                  },
+                  "exportToEnv": {
+                    "type": "boolean",
+                    "description": "Export this row into agent process env (default true on create, false for a few server-side secrets; omitted on update keeps the stored flag). Rejected as true for keys only the API server reads."
                   }
                 },
                 "required": [
@@ -16126,82 +16597,6 @@
           },
           "404": {
             "description": "Task not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/ecosystem": {
-      "get": {
-        "summary": "Get PM2 ecosystem config for agent services",
-        "tags": [
-          "Ecosystem"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "PM2 ecosystem config",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "apps": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "properties": {
-                          "name": {
-                            "type": "string"
-                          },
-                          "script": {
-                            "type": "string"
-                          },
-                          "cwd": {
-                            "type": "string"
-                          },
-                          "interpreter": {
-                            "type": "string"
-                          },
-                          "args": {
-                            "type": "array",
-                            "items": {
-                              "type": "string"
-                            }
-                          },
-                          "env": {
-                            "type": "object",
-                            "additionalProperties": {
-                              "type": "string"
-                            }
-                          }
-                        },
-                        "required": [
-                          "name",
-                          "script"
-                        ]
-                      }
-                    }
-                  },
-                  "required": [
-                    "apps"
-                  ]
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Missing X-Agent-ID",
             "content": {
               "application/json": {
                 "schema": {
@@ -20562,6 +20957,247 @@
                 "schema": {
                   "type": "object",
                   "additionalProperties": {}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/integrations/chat/status": {
+      "get": {
+        "summary": "Chat SDK channel status: enabled flag, Slack clash, per-adapter health and webhook URL.",
+        "tags": [
+          "Integrations"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-adapter status. `health` is `disabled` for an adapter that is not running. Never contains secret values.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "slackClash": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "adapters": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string",
+                            "enum": [
+                              "telegram",
+                              "slack",
+                              "discord",
+                              "teams"
+                            ]
+                          },
+                          "configured": {
+                            "type": "boolean"
+                          },
+                          "enabled": {
+                            "type": "boolean"
+                          },
+                          "health": {
+                            "type": "string",
+                            "enum": [
+                              "ok",
+                              "error",
+                              "disabled",
+                              "incomplete"
+                            ]
+                          },
+                          "error": {
+                            "type": "string"
+                          },
+                          "webhookUrl": {
+                            "type": "string"
+                          },
+                          "mode": {
+                            "type": "string"
+                          },
+                          "gateway": {
+                            "type": "object",
+                            "properties": {
+                              "state": {
+                                "type": "string",
+                                "enum": [
+                                  "running",
+                                  "backoff",
+                                  "stopped"
+                                ]
+                              },
+                              "since": {
+                                "type": "string"
+                              },
+                              "restarts": {
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "state",
+                              "since",
+                              "restarts"
+                            ]
+                          },
+                          "guilds": {
+                            "type": "object",
+                            "properties": {
+                              "count": {
+                                "type": "number"
+                              },
+                              "names": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "required": [
+                              "count",
+                              "names"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "configured",
+                          "enabled",
+                          "health",
+                          "webhookUrl"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "enabled",
+                    "slackClash",
+                    "adapters"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/integrations/chat/telegram/register-webhook": {
+      "post": {
+        "summary": "Register this swarm's public Telegram webhook URL and secret token with the Bot API (setWebhook), then return getWebhookInfo.",
+        "tags": [
+          "Integrations"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Webhook registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "webhookUrl": {
+                      "type": "string"
+                    },
+                    "webhookInfo": {
+                      "type": "object",
+                      "properties": {
+                        "url": {
+                          "type": "string"
+                        },
+                        "has_custom_certificate": {
+                          "type": "boolean"
+                        },
+                        "pending_update_count": {
+                          "type": "number"
+                        },
+                        "last_error_date": {
+                          "type": "number"
+                        },
+                        "last_error_message": {
+                          "type": "string"
+                        },
+                        "max_connections": {
+                          "type": "number"
+                        },
+                        "ip_address": {
+                          "type": "string"
+                        },
+                        "allowed_updates": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "required": [
+                        "url"
+                      ],
+                      "additionalProperties": {}
+                    }
+                  },
+                  "required": [
+                    "webhookUrl",
+                    "webhookInfo"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Telegram is not configured for webhook mode",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Only the lead agent or a dashboard user can register the webhook",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The Telegram Bot API rejected the call",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -26608,6 +27244,21 @@
                 "schema": {
                   "type": "object",
                   "properties": {
+                    "runtime_pools": {
+                      "type": "object",
+                      "properties": {
+                        "enabled": {
+                          "type": "boolean"
+                        },
+                        "supervisor": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "enabled",
+                        "supervisor"
+                      ]
+                    },
                     "identity": {
                       "type": "object",
                       "properties": {
@@ -26999,9 +27650,39 @@
                       "required": [
                         "enabled"
                       ]
+                    },
+                    "instance": {
+                      "type": "object",
+                      "properties": {
+                        "first_seen_at": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "tasks_completed": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "tasks_failed": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "workflow_runs_completed": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "required": [
+                        "first_seen_at",
+                        "tasks_completed",
+                        "tasks_failed",
+                        "workflow_runs_completed"
+                      ]
                     }
                   },
                   "required": [
+                    "runtime_pools",
                     "identity",
                     "setup",
                     "activity",
@@ -29274,7 +29955,8 @@
                                   "workflow",
                                   "linear",
                                   "jira",
-                                  "comb"
+                                  "comb",
+                                  "chat"
                                 ],
                                 "default": "mcp"
                               },
@@ -29337,6 +30019,17 @@
                                 "type": "string"
                               },
                               "effort": {
+                                "type": "string",
+                                "enum": [
+                                  "off",
+                                  "low",
+                                  "medium",
+                                  "high",
+                                  "xhigh",
+                                  "max"
+                                ]
+                              },
+                              "resolvedEffort": {
                                 "type": "string",
                                 "enum": [
                                   "off",
@@ -29588,7 +30281,8 @@
                       "workflow",
                       "linear",
                       "jira",
-                      "comb"
+                      "comb",
+                      "chat"
                     ]
                   },
                   "outputSchema": {
@@ -29652,6 +30346,16 @@
           },
           "400": {
             "description": "Validation error, an unknown `model` (set `allowCustomModel` to store a custom id), or agentId/offeredTo targets an extension identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An agent caller names a parentTaskId it neither owns nor created, or a non-lead agent binds the task to a chat thread",
             "content": {
               "application/json": {
                 "schema": {
@@ -29844,6 +30548,21 @@
                       "model": {
                         "type": "string"
                       },
+                      "effort": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "enum": [
+                          "off",
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh",
+                          "max",
+                          null
+                        ]
+                      },
                       "providerMeta": {
                         "type": "object",
                         "properties": {
@@ -30031,7 +30750,8 @@
                       "mcp",
                       "script",
                       "slack",
-                      "api"
+                      "api",
+                      "chat"
                     ]
                   },
                   "requestedByUserId": {
@@ -30948,6 +31668,33 @@
                                 "items": {
                                   "$ref": "#/components/schemas/TaskAttachment"
                                 }
+                              },
+                              "requestedBy": {
+                                "type": "object",
+                                "properties": {
+                                  "id": {
+                                    "type": "string"
+                                  },
+                                  "name": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  },
+                                  "email": {
+                                    "type": "string"
+                                  },
+                                  "role": {
+                                    "type": "string"
+                                  },
+                                  "notes": {
+                                    "type": "string"
+                                  },
+                                  "comms": {
+                                    "$ref": "#/components/schemas/UserCommsPrefs"
+                                  }
+                                },
+                                "required": [
+                                  "name"
+                                ]
                               }
                             },
                             "required": [
@@ -31336,6 +32083,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AgentTask"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Task belongs to another token agent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -37801,7 +38558,8 @@
               "enum": [
                 "openapi",
                 "graphql",
-                "mcp"
+                "mcp",
+                "sql"
               ]
             },
             "required": false,
@@ -37861,7 +38619,8 @@
                               "raw",
                               "openapi",
                               "mcp",
-                              "graphql"
+                              "graphql",
+                              "sql"
                             ]
                           },
                           "scope": {
@@ -38993,6 +39752,274 @@
                       "kind",
                       "mcpServerId"
                     ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "slug": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80
+                      },
+                      "displayName": {
+                        "type": "string",
+                        "maxLength": 160
+                      },
+                      "scope": {
+                        "type": "string",
+                        "enum": [
+                          "global",
+                          "agent",
+                          "repo"
+                        ]
+                      },
+                      "scopeId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "minLength": 1,
+                        "maxLength": 255
+                      },
+                      "allowedHosts": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "credentialBindingId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "format": "uuid"
+                      },
+                      "auth": {
+                        "oneOf": [
+                          {
+                            "type": "object",
+                            "properties": {
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "none"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "type"
+                            ]
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "bearer"
+                                ]
+                              },
+                              "secret": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "configKey": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 255
+                              },
+                              "template": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "hosts": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              }
+                            },
+                            "required": [
+                              "type"
+                            ]
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "header"
+                                ]
+                              },
+                              "headerName": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 255
+                              },
+                              "secret": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "configKey": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 255
+                              },
+                              "template": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "hosts": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "headerName"
+                            ]
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "query"
+                                ]
+                              },
+                              "paramName": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 255
+                              },
+                              "secret": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "configKey": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 255
+                              },
+                              "template": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "hosts": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "paramName"
+                            ]
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "oauth"
+                                ]
+                              },
+                              "authorizationId": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 255
+                              },
+                              "configKey": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 255
+                              },
+                              "template": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "hosts": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "authorizationId"
+                            ]
+                          }
+                        ]
+                      },
+                      "configKey": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 255
+                      },
+                      "headerTemplate": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "queryTemplate": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "authKind": {
+                        "type": "string",
+                        "enum": [
+                          "config",
+                          "oauth"
+                        ]
+                      },
+                      "oauthAuthorizationId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 255
+                      },
+                      "enabled": {
+                        "type": "boolean"
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "sql"
+                        ]
+                      },
+                      "dsn": {
+                        "type": "object",
+                        "properties": {
+                          "secret": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "configKey": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 255
+                          }
+                        }
+                      }
+                    },
+                    "required": [
+                      "slug",
+                      "kind"
+                    ]
                   }
                 ]
               }
@@ -39028,7 +40055,8 @@
                             "raw",
                             "openapi",
                             "mcp",
-                            "graphql"
+                            "graphql",
+                            "sql"
                           ]
                         },
                         "scope": {
@@ -39403,7 +40431,8 @@
                             "raw",
                             "openapi",
                             "mcp",
-                            "graphql"
+                            "graphql",
+                            "sql"
                           ]
                         },
                         "scope": {
@@ -39952,7 +40981,8 @@
                             "raw",
                             "openapi",
                             "mcp",
-                            "graphql"
+                            "graphql",
+                            "sql"
                           ]
                         },
                         "scope": {
@@ -40354,7 +41384,8 @@
                             "raw",
                             "openapi",
                             "mcp",
-                            "graphql"
+                            "graphql",
+                            "sql"
                           ]
                         },
                         "scope": {
@@ -43895,6 +44926,145 @@
         }
       }
     },
+    "/api/script-connections/{id}/sql-query": {
+      "post": {
+        "summary": "Run one read-only query on a SQL script connection",
+        "tags": [
+          "Script Connections"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "sql": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100000
+                  },
+                  "params": {
+                    "type": "array",
+                    "items": {},
+                    "maxItems": 100
+                  }
+                },
+                "required": [
+                  "sql"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Query rows or a scrubbed error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "ok": {
+                          "type": "boolean",
+                          "enum": [
+                            true
+                          ]
+                        },
+                        "rows": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": {}
+                          }
+                        },
+                        "rowCount": {
+                          "type": "number"
+                        },
+                        "truncated": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "ok",
+                        "rows",
+                        "rowCount",
+                        "truncated"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "ok": {
+                          "type": "boolean",
+                          "enum": [
+                            false
+                          ]
+                        },
+                        "error": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "ok",
+                        "error"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid SQL connection or request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not allowed to invoke this SQL connection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Script connection or agent not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/session-logs": {
       "post": {
         "summary": "Store session logs",
@@ -44066,6 +45236,10 @@
               "schema": {
                 "type": "object",
                 "properties": {
+                  "id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
                   "sessionId": {
                     "type": "string",
                     "minLength": 1
@@ -44076,6 +45250,9 @@
                   },
                   "totalCostUsd": {
                     "type": "number"
+                  },
+                  "harnessCostBilled": {
+                    "type": "boolean"
                   },
                   "taskId": {
                     "type": "string"
@@ -44790,8 +45967,8 @@
     },
     "/api/sessions/tokens": {
       "post": {
-        "summary": "Mint an ephemeral session token for an ACP provider session",
-        "description": "Returns a short-lived aseph_ bearer for use by the ACP adapter in place of the full operator key. The token expires at the requested TTL and is actively revoked when the session ends. Only the operator key may mint session tokens.",
+        "summary": "Mint an ephemeral task or runtime token",
+        "description": "Operators can mint task or runtime tokens. Runtime tokens can mint task tokens for their own assigned tasks. Child tokens expire with their parent runtime.",
         "tags": [
           "Sessions"
         ],
@@ -44814,6 +45991,10 @@
                     "type": "string",
                     "minLength": 1
                   },
+                  "runtimeId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
                   "ttlMs": {
                     "type": "integer",
                     "exclusiveMinimum": 0,
@@ -44821,9 +46002,7 @@
                   }
                 },
                 "required": [
-                  "agentId",
-                  "taskId",
-                  "ttlMs"
+                  "agentId"
                 ]
               }
             }
@@ -44871,6 +46050,16 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Token cannot mint for this agent or task",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -44878,7 +46067,7 @@
     "/api/sessions/tokens/{tokenId}": {
       "delete": {
         "summary": "Revoke an ephemeral session token",
-        "description": "Revokes an aseph_ bearer token by ID. No-op if already revoked.",
+        "description": "Operators can revoke any ephemeral token. With runtime pools enabled, runtime tokens can revoke their own child task tokens. Repeated revocation has no effect.",
         "tags": [
           "Sessions"
         ],
@@ -44903,6 +46092,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Token cannot revoke this child",
             "content": {
               "application/json": {
                 "schema": {
@@ -45076,7 +46275,8 @@
                                       "workflow",
                                       "linear",
                                       "jira",
-                                      "comb"
+                                      "comb",
+                                      "chat"
                                     ],
                                     "default": "mcp"
                                   },
@@ -50395,68 +51595,6 @@
         }
       }
     },
-    "/api/services": {
-      "get": {
-        "summary": "List all registered services",
-        "tags": [
-          "Stats"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "parameters": [
-          {
-            "schema": {
-              "type": "string"
-            },
-            "required": false,
-            "name": "status",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string"
-            },
-            "required": false,
-            "name": "agentId",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string"
-            },
-            "required": false,
-            "name": "name",
-            "in": "query"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Service list",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "services": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/components/schemas/Service"
-                      }
-                    }
-                  },
-                  "required": [
-                    "services"
-                  ]
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/scheduled-tasks": {
       "get": {
         "summary": "List scheduled tasks",
@@ -51188,6 +52326,162 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/telemetry/ui-event": {
+      "post": {
+        "summary": "Send a dashboard telemetry event",
+        "description": "Relays one catalogued dashboard event (`popup.*`, `notification.*`, ...) through the API's telemetry client, so it carries the normal v2 envelope. Answers 204 without sending anything when telemetry is off.",
+        "tags": [
+          "Telemetry"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "event": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "properties": {
+                    "type": "object",
+                    "additionalProperties": {},
+                    "default": {}
+                  }
+                },
+                "required": [
+                  "event"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Accepted, or dropped because telemetry is off"
+          },
+          "400": {
+            "description": "Unknown event or invalid properties",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Guest page sessions cannot send events",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/telemetry/enable": {
+      "post": {
+        "summary": "Turn telemetry on",
+        "description": "Stores `ANONYMIZED_TELEMETRY=true` and applies it to the running server: the install ID is minted if needed and `telemetry.enabled` is sent once, so no restart is needed.",
+        "tags": [
+          "Telemetry"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "via": {
+                    "type": "string",
+                    "enum": [
+                      "banner",
+                      "settings"
+                    ],
+                    "default": "banner"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Telemetry is on",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "enabled"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Only a config admin can turn telemetry on",
             "content": {
               "application/json": {
                 "schema": {
@@ -52231,6 +53525,268 @@
           },
           "503": {
             "description": "Linear not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/used-by": {
+      "post": {
+        "summary": "Grant or revoke the 'used by' logo consent",
+        "description": "Records whether agent-swarm.dev may show this organization's logo as a company that uses Agent Swarm. Sends the organization name and website to the telemetry proxy, where a person approves each logo by hand. An explicit admin action, so it is not gated by the telemetry opt-out.",
+        "tags": [
+          "Telemetry"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "granted": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "granted"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Consent recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "granted": {
+                      "type": "boolean"
+                    },
+                    "changedAt": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "granted",
+                    "changedAt"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Organization name or website is not set (a revoke falls back to the identity of the last grant)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Only a config admin can change the consent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The telemetry proxy did not accept the consent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/fleet-benchmark": {
+      "get": {
+        "summary": "Compare this swarm with similar swarms",
+        "description": "Places this swarm's tasks per week and task success rate (last 30 days) in the fleet percentiles published by the telemetry proxy, against swarms with the same agent count when enough exist. Needs telemetry on and an organization name; otherwise `state` says what is missing and the proxy is not called. `unavailable` also covers an install whose first event the proxy saw cannot be established locally (until 30 days after the first accepted event). The fleet numbers are cached for a day.",
+        "tags": [
+          "Telemetry"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Benchmark, or the reason it is not shown",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "ready",
+                        "telemetry_off",
+                        "no_org_name",
+                        "not_enough_tasks",
+                        "unavailable"
+                      ]
+                    },
+                    "local": {
+                      "type": [
+                        "object",
+                        "null"
+                      ],
+                      "properties": {
+                        "tasksPerWeek": {
+                          "type": "number"
+                        },
+                        "taskSuccessRate": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "finishedTasks": {
+                          "type": "integer"
+                        },
+                        "agents": {
+                          "type": "integer"
+                        },
+                        "bucket": {
+                          "type": [
+                            "string",
+                            "null"
+                          ],
+                          "enum": [
+                            "1",
+                            "2-5",
+                            "6+",
+                            null
+                          ]
+                        }
+                      },
+                      "required": [
+                        "tasksPerWeek",
+                        "taskSuccessRate",
+                        "finishedTasks",
+                        "agents",
+                        "bucket"
+                      ]
+                    },
+                    "minFinishedTasks": {
+                      "type": "integer"
+                    },
+                    "generatedAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "comparisons": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "key": {
+                            "type": "string",
+                            "enum": [
+                              "tasksPerWeek",
+                              "taskSuccessRate"
+                            ]
+                          },
+                          "value": {
+                            "type": "number"
+                          },
+                          "p50": {
+                            "type": "number"
+                          },
+                          "band": {
+                            "type": "string",
+                            "enum": [
+                              "top_10",
+                              "top_25",
+                              "above_median",
+                              "below_median",
+                              "bottom_25"
+                            ]
+                          },
+                          "peers": {
+                            "type": "string",
+                            "enum": [
+                              "1",
+                              "2-5",
+                              "6+",
+                              "all"
+                            ]
+                          },
+                          "installs": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "key",
+                          "value",
+                          "p50",
+                          "band",
+                          "peers",
+                          "installs"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "state",
+                    "local",
+                    "minFinishedTasks",
+                    "generatedAt",
+                    "comparisons"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Guest page sessions cannot read the benchmark",
             "content": {
               "application/json": {
                 "schema": {
@@ -55063,6 +56619,81 @@
         }
       }
     },
+    "/api/integrations/chat/{adapter}/webhook": {
+      "post": {
+        "summary": "Handle Chat SDK platform webhooks (Telegram, Slack, Discord, Teams)",
+        "tags": [
+          "Webhooks"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "description": "Chat SDK adapter name, e.g. telegram"
+            },
+            "required": true,
+            "description": "Chat SDK adapter name, e.g. telegram",
+            "name": "adapter",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Adapter response"
+          },
+          "401": {
+            "description": "Invalid platform signature or secret token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Teams activity whose serviceUrl is not a Bot Framework host",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Chat SDK disabled or adapter not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body exceeds 1 MiB",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Adapter configured but failed to start",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/workflow-runs/{runId}/events": {
       "post": {
         "summary": "Fire a run-scoped event signal",
@@ -56751,6 +58382,9 @@
                       "items": {
                         "$ref": "#/components/schemas/WorkflowRunStep"
                       }
+                    },
+                    "parent": {
+                      "$ref": "#/components/schemas/WorkflowRunParent"
                     }
                   },
                   "required": [
@@ -57342,6 +58976,1560 @@
           },
           "501": {
             "description": "workspace-rw scripts are not supported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/runtime-pools": {
+      "get": {
+        "operationId": "runtime_listPools",
+        "summary": "List runtime pools",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pools": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RuntimePool"
+                      }
+                    }
+                  },
+                  "required": [
+                    "pools"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "runtime_createPool",
+        "summary": "Create a runtime pool",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "static",
+                      "docker",
+                      "e2b",
+                      "k8s"
+                    ]
+                  },
+                  "placements": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "image": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "minLength": 1
+                  },
+                  "lifecycle": {
+                    "type": "string",
+                    "enum": [
+                      "idle",
+                      "per-task"
+                    ],
+                    "default": "idle"
+                  },
+                  "idleMinutes": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "exclusiveMinimum": 0,
+                    "default": null
+                  },
+                  "slotsPerRuntime": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1
+                  },
+                  "maxRuntimes": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0,
+                    "default": null
+                  },
+                  "minRuntimes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0
+                  },
+                  "delivery": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "enum": [
+                      "poll",
+                      "push",
+                      null
+                    ],
+                    "default": null
+                  },
+                  "env": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "default": {}
+                  },
+                  "resources": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "properties": {
+                      "cpu": {
+                        "type": "number",
+                        "exclusiveMinimum": 0
+                      },
+                      "memoryMb": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0
+                      }
+                    },
+                    "default": null,
+                    "additionalProperties": false
+                  },
+                  "ttlSec": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "exclusiveMinimum": 0,
+                    "default": null
+                  },
+                  "enabled": {
+                    "type": "boolean",
+                    "default": true
+                  }
+                },
+                "required": [
+                  "name",
+                  "kind",
+                  "placements"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pool": {
+                      "$ref": "#/components/schemas/RuntimePool"
+                    },
+                    "warning": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pool"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Entity is in use or already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/runtime-pools/{id}": {
+      "get": {
+        "operationId": "runtime_getPool",
+        "summary": "Get a runtime pool",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pool": {
+                      "$ref": "#/components/schemas/RuntimePool"
+                    }
+                  },
+                  "required": [
+                    "pool"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "operationId": "runtime_patchPool",
+        "summary": "Update a runtime pool",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "static",
+                      "docker",
+                      "e2b",
+                      "k8s"
+                    ]
+                  },
+                  "placements": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "image": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "minLength": 1
+                  },
+                  "lifecycle": {
+                    "type": "string",
+                    "enum": [
+                      "idle",
+                      "per-task"
+                    ]
+                  },
+                  "idleMinutes": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "exclusiveMinimum": 0
+                  },
+                  "slotsPerRuntime": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "maxRuntimes": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0
+                  },
+                  "minRuntimes": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "delivery": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "enum": [
+                      "poll",
+                      "push",
+                      null
+                    ]
+                  },
+                  "env": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "resources": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "properties": {
+                      "cpu": {
+                        "type": "number",
+                        "exclusiveMinimum": 0
+                      },
+                      "memoryMb": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "ttlSec": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "exclusiveMinimum": 0
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pool": {
+                      "$ref": "#/components/schemas/RuntimePool"
+                    }
+                  },
+                  "required": [
+                    "pool"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Entity is in use or already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "runtime_deletePool",
+        "summary": "Delete a runtime pool",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true",
+                "false"
+              ]
+            },
+            "required": false,
+            "name": "force",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "deleted": {
+                      "type": "boolean",
+                      "enum": [
+                        true
+                      ]
+                    }
+                  },
+                  "required": [
+                    "deleted"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Entity is in use or already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/runtime-pools/{id}/runtimes": {
+      "get": {
+        "operationId": "runtime_runtimes",
+        "summary": "List pool runtimes",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "runtimes": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RuntimeInstance"
+                      }
+                    }
+                  },
+                  "required": [
+                    "runtimes"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/runtime-pools/{id}/agents": {
+      "post": {
+        "operationId": "runtime_createAgent",
+        "summary": "Create an offline agent in a pool",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "isLead": {
+                    "type": "boolean"
+                  },
+                  "harnessProvider": {
+                    "type": "string",
+                    "enum": [
+                      "claude",
+                      "codex",
+                      "pi",
+                      "devin",
+                      "claude-managed",
+                      "opencode",
+                      "acp",
+                      "dsh",
+                      "amp",
+                      "cursor",
+                      "grok"
+                    ]
+                  },
+                  "maxTasks": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100
+                  },
+                  "templateId": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "agent": {
+                      "$ref": "#/components/schemas/Agent"
+                    }
+                  },
+                  "required": [
+                    "agent"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Entity is in use or already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/runtime-controllers": {
+      "get": {
+        "operationId": "runtime_listControllers",
+        "summary": "List runtime controllers",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "controllers": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RuntimeController"
+                      }
+                    }
+                  },
+                  "required": [
+                    "controllers"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "runtime_createController",
+        "summary": "Create a runtime controller",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "static",
+                      "docker",
+                      "e2b",
+                      "k8s"
+                    ]
+                  },
+                  "placement": {
+                    "type": "string",
+                    "enum": [
+                      "builtin",
+                      "remote"
+                    ],
+                    "default": "remote"
+                  },
+                  "config": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "default": {}
+                  },
+                  "secretConfig": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "name",
+                  "kind"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "controller": {
+                      "$ref": "#/components/schemas/RuntimeController"
+                    }
+                  },
+                  "required": [
+                    "controller"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Entity is in use or already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/runtime-controllers/{id}": {
+      "get": {
+        "operationId": "runtime_getController",
+        "summary": "Get a runtime controller",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "controller": {
+                      "$ref": "#/components/schemas/RuntimeController"
+                    }
+                  },
+                  "required": [
+                    "controller"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "operationId": "runtime_patchController",
+        "summary": "Update a runtime controller",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "static",
+                      "docker",
+                      "e2b",
+                      "k8s"
+                    ]
+                  },
+                  "placement": {
+                    "type": "string",
+                    "enum": [
+                      "builtin",
+                      "remote"
+                    ]
+                  },
+                  "config": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "secretConfig": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "controller": {
+                      "$ref": "#/components/schemas/RuntimeController"
+                    }
+                  },
+                  "required": [
+                    "controller"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Entity is in use or already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "runtime_deleteController",
+        "summary": "Delete a runtime controller",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "deleted": {
+                      "type": "boolean",
+                      "enum": [
+                        true
+                      ]
+                    }
+                  },
+                  "required": [
+                    "deleted"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Entity is in use or already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/{id}/runtime-pool": {
+      "put": {
+        "operationId": "runtime_bindAgent",
+        "summary": "Bind or unbind an agent to a pool",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "poolId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "poolId"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "agent": {
+                      "$ref": "#/components/schemas/Agent"
+                    }
+                  },
+                  "required": [
+                    "agent"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/runtime-controllers/{id}/token": {
+      "post": {
+        "operationId": "runtime_mintControllerToken",
+        "summary": "Mint a remote controller token",
+        "description": "Returns the token once. Revokes the previous token and disconnects its session.",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Controller token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tokenId": {
+                      "type": "string"
+                    },
+                    "plaintext": {
+                      "type": "string"
+                    },
+                    "expiresAt": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "tokenId",
+                    "plaintext",
+                    "expiresAt"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Controller placement must be remote",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Operator or user credentials required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Controller not found or runtime pools disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/controllers/connect": {
+      "get": {
+        "summary": "Connect a remote runtime controller",
+        "description": "Requires a controller token and a WebSocket upgrade. Accepts one session per controller.",
+        "tags": [
+          "Runtime pools"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Controller socket connected"
+          },
+          "401": {
+            "description": "Controller token required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Runtime pools disabled",
             "content": {
               "application/json": {
                 "schema": {

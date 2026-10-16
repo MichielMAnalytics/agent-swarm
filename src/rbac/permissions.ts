@@ -25,6 +25,10 @@ export const PERMISSIONS = {
     description: "Update another agent's profile.",
     namespace: "agent",
   },
+  "agent.act.any": {
+    description: "Act on another agent's scope over HTTP.",
+    namespace: "agent",
+  },
   "agent.context.read.any": {
     description: "View or diff another agent's context history.",
     namespace: "agent",
@@ -75,6 +79,11 @@ export const PERMISSIONS = {
     description: "Mutate a task's filesystem artifacts and attachments.",
     namespace: "task",
   },
+  "task.parent.attach": {
+    description:
+      "Create a task under an existing parent task. The child inherits the parent's thread context (contextKey, Slack thread, requester).",
+    namespace: "task",
+  },
   "task.progress.write": {
     description:
       "Write a task's progress, status, or output (its assignee, a lead, a human, or anyone while unassigned).",
@@ -118,6 +127,22 @@ export const PERMISSIONS = {
   },
   "integration.kapso.manage": {
     description: "Register or unregister a Kapso inbound number.",
+    namespace: "integration",
+  },
+  "integration.chat.manage": {
+    description: "Register or unregister a Chat SDK channel route.",
+    namespace: "integration",
+  },
+  "integration.chat.post": {
+    description: "Post to a Chat SDK thread or channel other than the thread of the current task.",
+    namespace: "integration",
+  },
+  "integration.chat.read": {
+    description: "Read a Chat SDK thread other than the thread of the current task.",
+    namespace: "integration",
+  },
+  "integration.chat.dm": {
+    description: "Open a direct-message thread with a user on a Chat SDK adapter.",
     namespace: "integration",
   },
   "integration.slack.post": {
@@ -310,6 +335,18 @@ export const PERMISSIONS = {
   "script.api.delete": {
     description: "Delete an external script API endpoint.",
     namespace: "script",
+  },
+  "runtime_pool.write": {
+    description: "Create, update, or delete runtime pools (image, provider kind, placement).",
+    namespace: "runtime_pool",
+  },
+  "runtime_pool.bind": {
+    description: "Bind an agent to an existing runtime pool, or create an agent in one.",
+    namespace: "runtime_pool",
+  },
+  "runtime_controller.write": {
+    description: "Create, update, or delete runtime controllers.",
+    namespace: "runtime_controller",
   },
   "extension.write": {
     description: "Install, update, or uninstall a swarm extension.",

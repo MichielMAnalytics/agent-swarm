@@ -379,6 +379,12 @@
     "routing_note": {
       "pending": "unassigned: no batch yet scrubs this writer"
     },
+    "pool_wake_at": {
+      "exempt": "timestamp"
+    },
+    "runtime_instance_id": {
+      "exempt": "identifier"
+    },
     "routing_source": {
       "pending": "unassigned: no batch yet scrubs this writer"
     },
@@ -393,6 +399,9 @@
     },
     "modelAlias": {
       "pending": "unassigned: no batch yet scrubs this writer"
+    },
+    "resolvedEffort": {
+      "exempt": "enum"
     }
   },
   "agentmail_inbox_mappings": {
@@ -490,6 +499,12 @@
     },
     "harnessCliVersion": {
       "pending": "unassigned: no batch yet scrubs this writer"
+    },
+    "runtime_pool_id": {
+      "exempt": "runtime pool identifier"
+    },
+    "runtime_provision_retry_at": {
+      "exempt": "timestamp"
     }
   },
   "api_key_status": {
@@ -2010,7 +2025,29 @@
     },
     "updated_by": {
       "exempt": "identifier"
-    }
+    },
+    "pool_id": {
+      "exempt": "identifier"
+    },
+    "controller_id": {
+      "exempt": "identifier"
+    },
+    "task_id": {
+      "exempt": "identifier"
+    },
+    "provision_requested_at": {
+      "exempt": "timestamp"
+    },
+    "idle_since": {
+      "exempt": "timestamp"
+    },
+    "lease_expires_at": {
+      "exempt": "timestamp"
+    },
+    "external_handle": {
+      "exempt": "provider handle must round trip byte exact"
+    },
+    "provision_error": "scrubbed"
   },
   "scheduled_tasks": {
     "id": {
@@ -2572,6 +2609,9 @@
     }
   },
   "session_tokens": {
+    "runtimeId": { "exempt": "identifier" },
+    "parentRuntimeId": { "exempt": "identifier" },
+    "controllerId": { "exempt": "identifier" },
     "id": {
       "exempt": "identifier"
     },
@@ -3569,6 +3609,170 @@
     },
     "requires": {
       "pending": "unassigned: no batch yet scrubs this writer"
+    }
+  },
+  "runtime_controllers": {
+    "id": {
+      "exempt": "identifier"
+    },
+    "name": {
+      "exempt": "controller name must round trip byte exact"
+    },
+    "kind": {
+      "exempt": "enum"
+    },
+    "placement": {
+      "exempt": "enum"
+    },
+    "config": {
+      "exempt": "target configuration must round trip byte exact"
+    },
+    "secret_config": {
+      "exempt": "AES-GCM ciphertext"
+    },
+    "status": {
+      "exempt": "enum"
+    },
+    "last_seen_at": {
+      "exempt": "timestamp"
+    },
+    "last_error": {
+      "pending": "health status written by later supervisor steps"
+    },
+    "last_error_at": {
+      "exempt": "timestamp"
+    },
+    "created_by": {
+      "exempt": "identifier"
+    },
+    "updated_by": {
+      "exempt": "identifier"
+    },
+    "created_at": {
+      "exempt": "timestamp"
+    },
+    "updated_at": {
+      "exempt": "timestamp"
+    }
+  },
+  "runtime_pools": {
+    "id": {
+      "exempt": "identifier"
+    },
+    "name": {
+      "exempt": "pool name must round trip byte exact"
+    },
+    "kind": {
+      "exempt": "enum"
+    },
+    "placements": {
+      "exempt": "JSON controller identifiers"
+    },
+    "image": {
+      "exempt": "provider image reference"
+    },
+    "lifecycle": {
+      "exempt": "enum"
+    },
+    "delivery": {
+      "exempt": "enum"
+    },
+    "env": {
+      "exempt": "worker environment must round trip byte exact"
+    },
+    "resources": {
+      "exempt": "JSON resource settings"
+    },
+    "resolved_image": {
+      "exempt": "provider artifact reference"
+    },
+    "circuit_open_until": {
+      "exempt": "timestamp"
+    },
+    "last_error": {
+      "pending": "health status written by later supervisor steps"
+    },
+    "last_error_at": {
+      "exempt": "timestamp"
+    },
+    "created_by": {
+      "exempt": "identifier"
+    },
+    "updated_by": {
+      "exempt": "identifier"
+    },
+    "created_at": {
+      "exempt": "timestamp"
+    },
+    "updated_at": {
+      "exempt": "timestamp"
+    }
+  },
+  "chat_state_kv": {
+    "key": {
+      "exempt": "identifier"
+    },
+    "value": {
+      "exempt": "byte-exact Chat SDK StateAdapter contract: serialized SDK state must round-trip"
+    }
+  },
+  "chat_subscriptions": {
+    "thread_id": {
+      "exempt": "identifier"
+    },
+    "created_at": {
+      "exempt": "timestamp"
+    }
+  },
+  "chat_locks": {
+    "thread_id": {
+      "exempt": "identifier"
+    },
+    "token": {
+      "exempt": "identifier"
+    }
+  },
+  "chat_lists": {
+    "key": {
+      "exempt": "identifier"
+    },
+    "value": {
+      "exempt": "byte-exact Chat SDK StateAdapter contract: serialized SDK state must round-trip"
+    }
+  },
+  "chat_queue": {
+    "thread_id": {
+      "exempt": "identifier"
+    },
+    "entry": {
+      "exempt": "byte-exact Chat SDK StateAdapter contract: serialized SDK state must round-trip"
+    }
+  },
+  "chat_relay_obligations": {
+    "task_id": {
+      "exempt": "identifier"
+    },
+    "delivered_at": {
+      "exempt": "timestamp"
+    },
+    "last_attempt_at": {
+      "exempt": "timestamp"
+    },
+    "given_up_at": {
+      "exempt": "timestamp"
+    },
+    "last_error": "scrubbed",
+    "created_at": {
+      "exempt": "timestamp"
+    },
+    "updated_at": {
+      "exempt": "timestamp"
+    },
+    "created_by": {
+      "exempt": "identifier"
+    },
+    "updated_by": {
+      "exempt": "identifier"
     }
   }
 }
