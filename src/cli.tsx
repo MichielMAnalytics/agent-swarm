@@ -161,6 +161,19 @@ const COMMAND_HELP: Record<
   string,
   { usage: string; description: string; options: string; examples: string }
 > = {
+  controller: {
+    usage: `${binName} controller --api-url <url> --kind docker [options]`,
+    description: "Run a remote controller next to the worker infrastructure.",
+    options: [
+      "  --api-url <url>        Swarm API URL (default: MCP_BASE_URL)",
+      "  Token: AGENT_SWARM_CONTROLLER_TOKEN environment variable",
+      "  --kind <kind>         Runtime provider (default: docker)",
+      "  --docker-host <url>   Docker Unix socket (or DOCKER_HOST)",
+      "  --docker-network <n>  Worker network (or DOCKER_NETWORK)",
+      "  -h, --help            Show this help",
+    ].join("\n"),
+    examples: `  ${binName} controller --api-url https://api.example.test --kind docker`,
+  },
   onboard: {
     usage: `${binName} onboard [options]`,
     description:
@@ -289,12 +302,6 @@ const COMMAND_HELP: Record<
     description: "Generate a Claude session summary from a JSON request read over stdin.",
     options: "  Internal command; no user-facing options",
     examples: `  ${binName} session-summary-stdin`,
-  },
-  artifact: {
-    usage: `${binName} artifact <subcommand> [options]`,
-    description: "Manage agent artifacts (serve, list, etc.).",
-    options: "  -h, --help             Show this help",
-    examples: [`  ${binName} artifact serve`, `  ${binName} artifact help`].join("\n"),
   },
   x: {
     usage: `${binName} x <target> [args]`,
@@ -427,11 +434,11 @@ function printHelp(command?: string) {
     ["worker", "Run Claude in headless loop mode"],
     ["lead", "Run Claude as lead agent in headless loop"],
     ["api", "Start the API + MCP HTTP server"],
+    ["controller", "Run a remote runtime controller"],
     ["claude", "Run Claude CLI"],
     ["hook", "Handle Claude Code hook events (stdin)"],
     ["codex-hook", "Handle Codex CLI hook events (stdin, steering delivery)"],
     ["session-summary-stdin", "Generate a Claude session summary (internal, stdin)"],
-    ["artifact", "Manage agent artifacts"],
     ["x", "Execute external command routes"],
     ["scripts", "Reusable scripts maintenance"],
     ["rbac", "RBAC role management (bootstrap)"],
@@ -724,13 +731,15 @@ if (args.showHelp || args.command === "help" || args.command === undefined) {
 } else if (args.command === "version") {
   console.log(`${binName} v${pkg.version}`);
   process.exit(0);
-} else if (args.command === "onboard" && !process.versions.bun) {
-  // The published bin uses Node, but the onboarding wizard requires Bun APIs.
+} else if ((args.command === "onboard" || args.command === "controller") && !process.versions.bun) {
+  // The published bin uses Node, but these commands require Bun APIs.
   const { spawnSync } = await import("node:child_process");
   const result = spawnSync("bun", process.argv.slice(1), { stdio: "inherit" });
   if (result.error) {
     console.error(
-      "Onboarding requires Bun. Install Bun from https://bun.sh, then retry this command.",
+      args.command === "onboard"
+        ? "Onboarding requires Bun. Install Bun from https://bun.sh, then retry this command."
+        : "Controller requires Bun. Install Bun from https://bun.sh, then retry this command.",
     );
   }
   process.exit(result.status ?? 1);
@@ -758,15 +767,6 @@ if (args.showHelp || args.command === "help" || args.command === undefined) {
   const { runSessionSummaryFromStdin } = await import("./hooks/hook.ts");
   await runSessionSummaryFromStdin();
   process.exit(process.exitCode ?? 0);
-} else if (args.command === "artifact") {
-  // Pass all args after "artifact" directly
-  const artifactArgs = process.argv.slice(process.argv.indexOf("artifact") + 1);
-  const { runArtifact } = await import("./commands/artifact");
-  await runArtifact(artifactArgs[0] || "help", {
-    additionalArgs: artifactArgs.slice(1),
-    port: args.port,
-    key: args.key,
-  });
 } else if (args.command === "x") {
   const xArgs = process.argv.slice(process.argv.indexOf("x") + 1);
   const { runXCommand } = await import("./commands/x");
@@ -807,6 +807,9 @@ if (args.showHelp || args.command === "help" || args.command === undefined) {
   const { runE2BCommand } = await import("./commands/e2b");
   const e2bArgs = process.argv.slice(process.argv.indexOf("e2b") + 1);
   await runE2BCommand(e2bArgs);
+} else if (args.command === "controller") {
+  const { runController } = await import("./commands/controller");
+  await runController(process.argv.slice(process.argv.indexOf("controller") + 1));
 } else {
   render(<App args={args} />);
 }

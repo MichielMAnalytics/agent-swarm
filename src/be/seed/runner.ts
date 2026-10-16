@@ -27,6 +27,7 @@ export async function runSeeder(seeder: Seeder, opts?: SeederRunOptions): Promis
     skippedUnchanged: 0,
     skippedUserModified: 0,
     rebaselined: 0,
+    retired: 0,
     failed: [],
   };
 
@@ -94,11 +95,22 @@ export async function runSeeder(seeder: Seeder, opts?: SeederRunOptions): Promis
     }
   }
 
+  if (seeder.retire) {
+    try {
+      result.retired = (await seeder.retire()).length;
+    } catch (err) {
+      result.failed.push({
+        key: "(retire)",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   if (!opts?.quiet) {
     console.log(
       `[seed:${result.kind}] created=${result.created} updated=${result.updated} ` +
         `unchanged=${result.skippedUnchanged} preserved=${result.skippedUserModified} ` +
-        `rebaselined=${result.rebaselined} failed=${result.failed.length}`,
+        `rebaselined=${result.rebaselined} retired=${result.retired} failed=${result.failed.length}`,
     );
     for (const f of result.failed) {
       console.error(`[seed:${result.kind}] FAILED ${f.key}: ${f.error}`);

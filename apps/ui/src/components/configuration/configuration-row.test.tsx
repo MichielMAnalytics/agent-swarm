@@ -6,8 +6,10 @@ import type { ConfigCatalogEntry } from "../../lib/configuration-catalog";
 
 // The test runner cannot resolve ui's `@/` alias (see review-ack.test.tsx), so
 // each aliased module in this component's graph maps to its real file.
+mock.module("@/api/hooks/status-query", () => require("../../api/hooks/status-query"));
 mock.module("@/api/hooks/use-agents", () => require("../../api/hooks/use-agents"));
 mock.module("@/api/hooks/use-config-api", () => require("../../api/hooks/use-config-api"));
+mock.module("@/components/shared/image-preview", () => require("../shared/image-preview"));
 mock.module("@/components/ui/badge", () => require("../ui/badge"));
 mock.module("@/components/ui/button", () => require("../ui/button"));
 mock.module("@/components/ui/dropdown-menu", () => require("../ui/dropdown-menu"));
@@ -53,6 +55,7 @@ function renderRow(saved: string | null, entry: ConfigCatalogEntry = RBAC, inEnv
             createdAt: "2026-09-26T00:00:00Z",
             lastUpdatedAt: "2026-09-26T00:00:00Z",
             encrypted: false,
+            exportToEnv: true,
           },
         ];
   client.setQueryData(["configs", { scope: "global" }], { configs });
@@ -122,5 +125,27 @@ describe("ConfigurationRow model tier resolution", () => {
 
   test("rows without a resolution render no Resolves to line", () => {
     expect(renderRow(null)).not.toContain("Resolves to");
+  });
+});
+
+describe("ConfigurationRow image preview", () => {
+  const LOGO: ConfigCatalogEntry = {
+    key: "SWARM_ORG_LOGO_URL",
+    label: "Organization logo URL",
+    description: "Logo.",
+    kind: "string",
+    preview: "image",
+  };
+
+  test("previews the logo URL next to the field", () => {
+    const html = renderRow("https://cdn.acme.com/logo.svg", LOGO, false);
+    expect(html).toContain('data-testid="image-preview"');
+    expect(html).toContain('src="https://cdn.acme.com/logo.svg"');
+  });
+
+  test("an empty value shows an empty preview, and other rows show none", () => {
+    expect(renderRow(null, LOGO, false)).toContain('data-testid="image-preview"');
+    expect(renderRow(null, LOGO, false)).not.toContain("<img");
+    expect(renderRow("x", { ...LOGO, preview: undefined }, false)).not.toContain("image-preview");
   });
 });

@@ -12,11 +12,14 @@ import type {
   AgentSkill,
   AgentTask,
   McpServerWithInstallInfo,
+  SessionCost,
 } from "@/api/types";
 import { AgentActivityGraph } from "@/components/shared/agent-activity-graph";
 import { AgentAppearancePicker } from "@/components/shared/agent-appearance-picker";
 import { AgentAvatar as AgentAvatarDisc } from "@/components/shared/agent-avatar";
+import { AgentRuntimePoolSelect } from "@/components/shared/agent-runtime-pool-select";
 import { AgentRuntimeSettings } from "@/components/shared/agent-runtime-settings";
+import { BetaTag } from "@/components/shared/beta-tag";
 import { HarnessCell } from "@/components/shared/harness-cell";
 import { MobileList, MobileListRow } from "@/components/shared/mobile-list";
 import { StatusBadge } from "@/components/shared/status-badge";
@@ -50,6 +53,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { readNumberParam, readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
+import { formatCost } from "@/lib/cost-format";
+import { useRuntimePoolsGate } from "@/lib/runtime-pools";
 import { taskListTitle } from "@/lib/task-title";
 import { cn, formatRelativeTime, formatSmartTime } from "@/lib/utils";
 import { CredentialsPanel } from "./credentials-panel";
@@ -82,6 +87,16 @@ const DOCUMENT_FIELDS: Array<{ field: MdField; tab: string; label: string }> = [
   { field: "setupScript", tab: "setup", label: "Setup script" },
   { field: "heartbeatMd", tab: "heartbeat", label: "HEARTBEAT.md" },
 ];
+
+/** A tab label with its count, e.g. `Skills (12)`, or `Skills (... loading)`. */
+function tabLabel(name: string, loading: boolean, value: number | string): string {
+  return `${name} (${loading ? "... loading" : value})`;
+}
+
+/** The Usage tab's Total Cost: the sum over the sessions it loads. */
+function totalCostUsd(costs: SessionCost[]): number {
+  return costs.reduce((sum, cost) => sum + cost.totalCostUsd, 0);
+}
 
 function MarkdownDocumentEditor({
   field,
@@ -197,6 +212,7 @@ export default function AgentDetailPage() {
   const { data: agent, isLoading } = useAgent(id!);
   const updateName = useUpdateAgentName();
   const updateProfile = useUpdateAgentProfile();
+  const runtimePools = useRuntimePoolsGate();
 
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState("");
@@ -248,16 +264,17 @@ export default function AgentDetailPage() {
     return f;
   }, [id, taskStatus, taskSearch, taskPage]);
 
+  // The tab queries run on mount, in parallel, so each tab label shows its
+  // count before the tab is opened. Opening a tab reads the same cache.
   const { data: tasksData, isLoading: tasksLoading } = useTasks(taskFilters);
-  const { data: agentCosts } = useSessionCosts({
+  const { data: agentCosts, isLoading: agentCostsLoading } = useSessionCosts({
     agentId: id,
     limit: 1000,
-    enabled: activeTab === "usage",
   });
-  const { data: agentSkillsData } = useAgentSkills(id!, activeTab === "skills");
+  const { data: agentSkillsData, isLoading: agentSkillsLoading } = useAgentSkills(id!);
   const uninstallSkill = useUninstallSkill();
   const agentSkillsList = agentSkillsData?.skills ?? [];
-  const { data: agentMcpServersData } = useAgentMcpServers(id!, activeTab === "mcp-servers");
+  const { data: agentMcpServersData, isLoading: agentMcpServersLoading } = useAgentMcpServers(id!);
   const uninstallMcpServer = useUninstallMcpServer();
   const agentMcpServersList = agentMcpServersData?.servers ?? [];
 
@@ -405,10 +422,16 @@ export default function AgentDetailPage() {
           <TabsTrigger value="profile">Profile</TabsTrigger>
           <TabsTrigger value="credentials">Credentials</TabsTrigger>
           <TabsTrigger value="documents">Documents</TabsTrigger>
-          <TabsTrigger value="tasks">Tasks ({taskTotal})</TabsTrigger>
-          <TabsTrigger value="skills">Skills ({agentSkillsList.length})</TabsTrigger>
-          <TabsTrigger value="mcp-servers">MCP Servers ({agentMcpServersList.length})</TabsTrigger>
-          <TabsTrigger value="usage">Usage</TabsTrigger>
+          <TabsTrigger value="tasks">{tabLabel("Tasks", tasksLoading, taskTotal)}</TabsTrigger>
+          <TabsTrigger value="skills">
+            {tabLabel("Skills", agentSkillsLoading, agentSkillsList.length)}
+          </TabsTrigger>
+          <TabsTrigger value="mcp-servers">
+            {tabLabel("MCP Servers", agentMcpServersLoading, agentMcpServersList.length)}
+          </TabsTrigger>
+          <TabsTrigger value="usage">
+            {tabLabel("Usage", agentCostsLoading, formatCost(totalCostUsd(agentCosts ?? [])))}
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="profile" className="mt-4 overflow-y-auto">
@@ -432,6 +455,18 @@ export default function AgentDetailPage() {
                       <InfoRow label="Runtime">
                         <AgentRuntimeSettings agent={agent} />
                       </InfoRow>
+                      {runtimePools.open && (
+                        <InfoRow
+                          label={
+                            <span className="inline-flex items-center gap-2">
+                              Runtime pool
+                              <BetaTag tooltip="Run agents on Docker or E2B runtimes" side="top" />
+                            </span>
+                          }
+                        >
+                          <AgentRuntimePoolSelect agent={agent} />
+                        </InfoRow>
+                      )}
                       {agent.description && (
                         <InfoRow label="Description">{agent.description}</InfoRow>
                       )}

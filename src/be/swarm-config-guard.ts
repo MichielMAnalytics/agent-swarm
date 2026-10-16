@@ -1,8 +1,11 @@
+import { validateChatSdkAdaptersValue } from "../integrations/chat-sdk/schema";
 import { validateQuickJSPoolSize } from "../scripts-runtime/executors/quickjs-pool-config";
 import { normalizeSlackReactionShortcode } from "../slack/reaction-shortcode";
 import { ProviderNameSchema } from "../types";
 import { API_DRAIN_MAX_MS_LIMIT } from "../utils/api-drain";
+import { envExportRestrictedError, isEnvExportRestrictedKey } from "../utils/config-env-export";
 import { parseEnabledTools } from "../utils/enabled-tools";
+import { normalizeOrgWebsite } from "../utils/org-website";
 import { parseTaskToolManifest } from "../utils/task-tool-manifest";
 import { isTierConfigKey, validateTierConfigValue } from "./model-tier-keys";
 
@@ -23,22 +26,58 @@ import { isTierConfigKey, validateTierConfigValue } from "./model-tier-keys";
  * rejected at every write path (DB helpers, HTTP routes, MCP tools).
  */
 // Lead activation is also deployment-only: leads can write ordinary global config.
+// CHAT_SDK_API_URL_OVERRIDES points Chat SDK adapters (and the secrets they carry)
+// at another host, so it must never come from a config row.
+/**
+ * Teams SDK env fallbacks; a config row must not redirect the bot token.
+ * `@microsoft/teams.apps` reads these from `process.env`. Operators may still
+ * store them (they are not reserved), they just never reach env through
+ * `getInjectableGlobalConfigs`.
+ */
+export const TEAMS_SDK_ENV_KEYS = [
+  "SERVICE_URL",
+  "TENANT_ID",
+  "CLIENT_ID",
+  "CLIENT_SECRET",
+  "MANAGED_IDENTITY_CLIENT_ID",
+  "CLOUD",
+] as const;
+
+/** SQL literal list for the `NOT IN (...)` injection denylist in db.ts. */
+export function teamsSdkEnvKeysSql(): string {
+  return TEAMS_SDK_ENV_KEYS.map((key) => `'${key}'`).join(", ");
+}
+
 const RESERVED_KEYS = new Set([
   "API_KEY",
   "SECRETS_ENCRYPTION_KEY",
   "CORS_ALLOW_ANY_ORIGIN",
   "EXTENSION_ALLOW_LEAD_ACTIVATION",
+  "CHAT_SDK_API_URL_OVERRIDES",
 ]);
 
+// Config keys the API server owns for its own use and must NEVER hand out over
+// HTTP or to a script — workers/entrypoints read config to build their env, and
+// the agent-fs bootstrap admin key would let a compromised worker administer the
+// shared org. The API materializes these into its own process.env at boot via
+// getInjectableGlobalConfigs, so no HTTP consumer legitimately needs them.
+const API_ONLY_CONFIG_KEYS = new Set(["API_AGENT_FS_API_KEY", "SLACK_SIGNING_SECRET"]);
+
+export function isApiOnlyConfigKey(key: string): boolean {
+  return API_ONLY_CONFIG_KEYS.has(key);
+}
+
 /** Config rows owned by dedicated API surfaces, not the generic config API. */
-export const INTERNAL_CONFIG_KEYS = new Set(["onboarding_state"]);
+export const INTERNAL_CONFIG_KEYS = new Set(["onboarding_state", "runtime_owner_id"]);
 
 export function isInternalConfigKey(key: string): boolean {
   return INTERNAL_CONFIG_KEYS.has(key.toLowerCase());
 }
 
 export function internalConfigKeyError(key: string): Error {
-  return new Error(`Key '${key}' is managed by /api/onboarding`);
+  const owner =
+    key.toLowerCase() === "runtime_owner_id" ? "the runtime supervisor" : "/api/onboarding";
+  return new Error(`Key '${key}' is managed by ${owner}`);
 }
 
 export function isReservedConfigKey(key: string): boolean {
@@ -225,7 +264,54 @@ function validateFloatRange(
   return null;
 }
 
+export function validateRuntimeTokenTtlHours(value: unknown): string | null {
+  const hours = Number(value);
+  return typeof value === "string" && Number.isFinite(hours) && hours > 0 && hours <= 168
+    ? null
+    : "Invalid RUNTIME_TOKEN_TTL_HOURS (must be greater than zero and at most 168)";
+}
+
+export const validateControllerTokenTtlDays = boundedIntegerValidators(
+  ["RUNTIME_CONTROLLER_TOKEN_TTL_DAYS"],
+  1,
+  3650,
+).RUNTIME_CONTROLLER_TOKEN_TTL_DAYS!;
+
+export const validateControllerGraceSec = boundedIntegerValidators(
+  ["RUNTIME_CONTROLLER_GRACE_SEC"],
+  0,
+  86_400,
+).RUNTIME_CONTROLLER_GRACE_SEC!;
+
 const VALIDATED_KEYS: Record<string, ConfigValidator> = {
+  ...booleanValidators(["RUNTIME_POOLS_ENABLED"]),
+  ...enumValidator("RUNTIME_DEFAULT_DELIVERY", ["poll", "push"]),
+  RUNTIME_TOKEN_TTL_HOURS: validateRuntimeTokenTtlHours,
+  RUNTIME_CONTROLLER_TOKEN_TTL_DAYS: validateControllerTokenTtlDays,
+  RUNTIME_CONTROLLER_GRACE_SEC: validateControllerGraceSec,
+  ...integerValidators(
+    [
+      "RUNTIME_SUPERVISOR_INTERVAL_MS",
+      "RUNTIME_PROVISION_TIMEOUT_SEC",
+      "RUNTIME_PROVISION_CONCURRENCY",
+      "RUNTIME_PER_TASK_EXIT_GRACE_SEC",
+      "RUNTIME_PROVISION_MAX_ATTEMPTS",
+      "RUNTIME_CIRCUIT_THRESHOLD",
+      "RUNTIME_CIRCUIT_OPEN_MIN",
+      "RUNTIME_TOKEN_ROTATE_BEFORE_MIN",
+      "RUNTIME_LEASE_RENEW_BEFORE_SEC",
+      "RUNTIME_E2B_BUILD_TIMEOUT_SEC",
+      "RUNTIME_ROTATE_BEFORE_SEC",
+      "E2B_MAX_CONTINUOUS_SEC",
+    ],
+    1,
+  ),
+  ...integerValidators(["RUNTIME_SOCKET_GRACE_SEC"], 0),
+  ...integerValidators(
+    ["RUNTIME_WAKE_GRACE_SEC", "RUNTIME_WAKE_REROUTE_SEC", "RUNTIME_ROUTING_INTERVAL_MS"],
+    0,
+  ),
+  CHAT_SDK_ADAPTERS: validateChatSdkAdaptersValue,
   TASK_TOOL_MANIFESTS: (value) => {
     try {
       if (typeof value !== "string") throw new Error("Expected JSON string");
@@ -327,7 +413,15 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
     }
     return null;
   },
+  // A bare public hostname, as `normalizeOrgWebsite` stores it, or empty to clear it.
+  SWARM_ORG_WEBSITE: (value) => {
+    const str = String(value).trim();
+    return str === "" || normalizeOrgWebsite(str) === str
+      ? null
+      : "Invalid SWARM_ORG_WEBSITE (must be a public hostname such as example.com, without scheme, www, path or port)";
+  },
   ...booleanValidators([
+    "SWARM_USED_BY_CONSENT",
     "SWARM_DEV_MODE",
     "MULTI_RUNTIME_ENABLED",
     "STEERING_ENABLED",
@@ -344,8 +438,10 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
     "OPENROUTER_APP_ATTRIBUTION",
     "CURSOR_NATIVE_SYSTEM_PROMPT",
     "SLACK_DISABLE",
+    "CHAT_SDK_ENABLED",
     "SLACK_RENDER_V2",
     "SLACK_RENDER_V2_DELEGATION",
+    "SLACK_BLOCK_EXTERNAL_CHANNELS",
     "GITHUB_DISABLE",
     "GITLAB_DISABLE",
     "AZURE_DEVOPS_DISABLE",
@@ -437,6 +533,10 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   ...integerValidators(["APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS"], 0),
   // 0 turns the shutdown drain off; the shutdown path clamps to the same limit.
   ...boundedIntegerValidators(["API_DRAIN_MAX_MS"], 0, API_DRAIN_MAX_MS_LIMIT),
+  // Chat SDK thread buffer window. 0 or an invalid value falls back to the 10 s
+  // default in thread-buffer.ts; above 10 minutes a
+  // reply waits longer than any operator expects.
+  ...boundedIntegerValidators(["CHAT_SDK_BUFFER_MS"], 1, 600_000),
   // Below ~100 tokens the preamble can't fit a useful summary; above 20000
   // (~80k chars) it risks the SIGTERM-143 context-saturation failure mode
   // the cap exists to prevent (see context-preamble.ts).
@@ -482,4 +582,14 @@ export function validateConfigValue(key: string, value: unknown): string | null 
   if (isTierConfigKey(key)) return validateTierConfigValue(key.toUpperCase(), value);
   const validator = VALIDATED_KEYS[key.toUpperCase()];
   return validator ? validator(value) : null;
+}
+
+/**
+ * Rejects `exportToEnv: true` for keys only the API server reads. Omitting the
+ * flag is fine: the write path stores false for those keys.
+ */
+export function validateExportToEnv(key: string, exportToEnv: boolean | undefined): string | null {
+  return exportToEnv === true && isEnvExportRestrictedKey(key)
+    ? envExportRestrictedError(key)
+    : null;
 }

@@ -342,6 +342,8 @@ declare module "swarm-sdk" {
       types?: Array<"public" | "private" | "dm" | "mpim">;
       limit?: number;
     }): Promise<unknown>;
+    // --- chat sdk ---
+    chat_readThread(args: { threadId: string; limit?: number }): Promise<unknown>;
     // --- messaging ---
     message_read(args?: {
       channel?: string;
@@ -350,13 +352,6 @@ declare module "swarm-sdk" {
       unreadOnly?: boolean;
       mentionsOnly?: boolean;
       markAsRead?: boolean;
-    }): Promise<unknown>;
-    // --- services ---
-    service_list(args?: {
-      agentId?: string;
-      name?: string;
-      status?: "starting" | "healthy" | "unhealthy" | "stopped";
-      includeOwn?: boolean;
     }): Promise<unknown>;
     // --- context / profiles ---
     context_history(args?: {
@@ -452,6 +447,7 @@ declare module "swarm-sdk" {
       scope?: "global" | "agent" | "repo";
       scopeId?: string;
       isSecret?: boolean;
+      exportToEnv?: boolean;
     }): Promise<unknown>;
     config_delete(args: { id: string }): Promise<unknown>;
 
@@ -492,19 +488,35 @@ declare module "swarm-sdk" {
     slack_delete(args: { channelId: string; messageTs: string }): Promise<unknown>;
     slack_update(args: { channelId: string; messageTs: string; message: string }): Promise<unknown>;
 
+    // --- write: chat sdk ---
+    chat_reply(args: { text: string }): Promise<unknown>;
+    chat_post(args: {
+      adapter: "telegram" | "slack" | "discord" | "teams";
+      threadId?: string;
+      channelId?: string;
+      text: string;
+    }): Promise<unknown>;
+    chat_openDm(args: {
+      adapter: "telegram" | "slack" | "discord" | "teams";
+      userId: string;
+    }): Promise<unknown>;
+    chat_registerChannel(args: {
+      adapter: "telegram" | "slack" | "discord" | "teams";
+      channelId: string;
+      agentId?: string;
+      workflowId?: string;
+      name?: string;
+    }): Promise<unknown>;
+    chat_unregisterChannel(args: {
+      adapter: "telegram" | "slack" | "discord" | "teams";
+      channelId: string;
+    }): Promise<unknown>;
+
     // --- write: messaging (internal) ---
     message_post(args: { channel?: string; content: string; to?: string }): Promise<unknown>;
 
     // --- write: profiles ---
     profile_update(args: Record<string, unknown>): Promise<unknown>;
-
-    // --- write: services ---
-    service_register(args: Record<string, unknown>): Promise<unknown>;
-    service_unregister(args: { name: string }): Promise<unknown>;
-    service_updateStatus(args: {
-      name: string;
-      status: "starting" | "healthy" | "unhealthy" | "stopped";
-    }): Promise<unknown>;
 
     // --- write: schedules ---
     schedule_create(args: Record<string, unknown>): Promise<unknown>;
@@ -571,6 +583,21 @@ declare module "swarm-sdk" {
     extension_enable(args: { id: string }): Promise<unknown>;
     extension_disable(args: { id: string }): Promise<unknown>;
     extension_activate_version(args: { id: string; version: number }): Promise<unknown>;
+
+    // --- runtime pools ---
+    runtime_pool_list(args?: Record<string, never>): Promise<unknown>;
+    runtime_pool_upsert(args: Record<string, unknown>): Promise<unknown>;
+    runtime_pool_delete(args: { poolId: string; force?: boolean }): Promise<unknown>;
+    runtime_pool_bind_agent(args: { agentId: string; poolId: string | null }): Promise<unknown>;
+    runtime_pool_create_agent(args: {
+      poolId: string;
+      name: string;
+      isLead?: boolean;
+      harnessProvider?: string;
+      maxTasks?: number;
+      templateId?: string;
+    }): Promise<unknown>;
+    runtime_controller_list(args?: Record<string, never>): Promise<unknown>;
 
     // --- write: repos ---
     repo_update(args: Record<string, unknown>): Promise<unknown>;

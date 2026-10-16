@@ -8,6 +8,9 @@ const RESERVED_FAMILIES = new Map([
   ["apps", "namespace is reserved for swarm apps; use the app row endpoints"],
   // step-9: Comb's "Send to swarm" claims (`comb:sent`).
   ["comb", "namespace is reserved for Comb; use POST /api/comb/review-batches"],
+  ["worker", "namespace is reserved for worker nudges"],
+  // Durable dedupe for SLACK_BLOCK_EXTERNAL_CHANNELS alerts (src/slack/external-channel.ts).
+  ["slack-external-alert", "namespace is reserved for Slack external channel alerts"],
 ]);
 
 export function isReservedNamespace(namespace: string): boolean {

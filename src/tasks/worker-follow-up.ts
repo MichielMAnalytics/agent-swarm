@@ -14,6 +14,7 @@ import {
   isAgentEligibleForTask,
 } from "../be/db";
 import { repointTrackerSyncBySwarmId } from "../be/db-queries/tracker";
+import { isAgentReachable } from "../be/runtime-pools/reachability";
 import { dispatchPre } from "../extensions/dispatcher";
 import { resolveTemplate } from "../prompts/resolver";
 import {
@@ -31,6 +32,7 @@ import {
 } from "../types";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import { taskAttachmentDisplayUrl } from "../utils/task-attachment-links";
+import { taskModelPin } from "./model-pin";
 import { createTaskWithSiblingAwareness } from "./sibling-awareness";
 // Side-effect import: registers task lifecycle templates in the in-memory registry.
 import "../tools/templates";
@@ -114,14 +116,13 @@ export const GRACEFUL_SHUTDOWN_PIN_TAG = "graceful-shutdown-pin";
 export const REBOOT_RETRY_PIN_TAG = "reboot-retry-pin";
 
 /**
- * Shared "is this agent even a pin candidate" gate: the row still exists and
- * is not `offline`. Used identically by `createResumeFollowUp`'s same-agent
- * pin and the heartbeat's reboot-retry pin (`runRebootSweep`) — both then
- * apply their own capacity (and, for resumes, freshness) rules on top.
+ * Resume and reboot recovery require a reachable agent.
+ * A sleeping agent on a provisionable pool can receive a pinned resume.
+ * Callers also check capacity and, where required, fresh activity.
  */
 export async function getPinCandidateAgent(agentId: string): Promise<Agent | null> {
   const candidate = await getAgentById(agentId);
-  if (!candidate || candidate.status === "offline") return null;
+  if (!candidate || !(await isAgentReachable(candidate))) return null;
   return candidate;
 }
 
@@ -142,7 +143,7 @@ export async function resolveLeadOnlyRecoveryAssignment(
     return { agentId: sourceCandidate.id, decision: "source_lead_pin" };
   }
   const lead = await getLeadAgent();
-  if (lead && lead.status !== "offline" && isAgentEligibleForTask(lead, task)) {
+  if (lead && (await isAgentReachable(lead)) && isAgentEligibleForTask(lead, task)) {
     return { agentId: lead.id, decision: "rerouted_to_lead" };
   }
   return { decision: "escalated_unassigned" };
@@ -165,23 +166,8 @@ export function getNextResumeGeneration(parent: Pick<AgentTask, "tags">): number
  * reboot retry) must carry: the parent's portable `modelTier`, plus its
  * concrete `model` only when that `model` was a task-level pin.
  *
- * `agent_tasks.model` is not always the creator's pin: the worker reports the
- * model it actually ran on `POST /api/tasks/{id}/session`, which overwrites the
- * column. So the pin is read from the claim-time record instead:
- *   - `modelSource = "model"`: the task's own `model` won at claim. A `latest:`
- *     alias survives only in `modelAlias` (the session report replaced `model`
- *     with the concrete id), so the alias is what travels.
- *   - `modelSource = "fallback:cli-unsupported:model"`: the task's own
- *     `latest:` alias won, then the claiming CLI rejected what it resolved to.
- *     The alias in `modelAlias` travels, with or without a `modelTier`.
- *   - `modelSource = "fallback:cli-unsupported"` (a tier layer's alias fell
- *     back) is not a pin. Rows written before the `:model` variant existed are
- *     ambiguous; one with a `modelAlias` and no `modelTier` can only have come
- *     from a `model` alias, so its alias travels. With a `modelTier` it stays
- *     ambiguous and only the tier travels.
- *   - no claim record and no session: `model` is still the creator's value.
- * Anything else (a tier layer won, or `model` is just the session report) is
- * not a pin and is left off, so the resume resolves on its claiming worker.
+ * The pin rules live in `taskModelPin` (`./model-pin`); anything that is not
+ * a pin is left off, so the resume resolves on its claiming worker.
  *
  * `resolvedModel`, `modelSource` and `modelAlias` themselves are NOT copied:
  * claim time writes all three together for the task being claimed, and the
@@ -196,20 +182,7 @@ export function inheritedModelSelection(
     "model" | "modelTier" | "modelSource" | "modelAlias" | "resolvedModel" | "claudeSessionId"
   >,
 ): Pick<CreateTaskOptions, "model" | "modelTier"> {
-  let model: string | undefined;
-  if (parent.modelSource === "model") {
-    model = parent.modelAlias ?? parent.model;
-  } else if (parent.modelSource === "fallback:cli-unsupported:model" && parent.modelAlias) {
-    model = parent.modelAlias;
-  } else if (
-    parent.modelSource === "fallback:cli-unsupported" &&
-    parent.modelAlias &&
-    !parent.modelTier
-  ) {
-    model = parent.modelAlias;
-  } else if (!parent.modelSource && !parent.resolvedModel && !parent.claudeSessionId) {
-    model = parent.model;
-  }
+  const model = taskModelPin(parent);
   return {
     ...(model ? { model } : {}),
     ...(parent.modelTier ? { modelTier: parent.modelTier } : {}),
@@ -441,20 +414,10 @@ export type CreateResumeFollowUpResult =
  * `modelTier`, and the `model` only when it was a pin. Without a pin the
  * resume still runs on the assignee agent's own model.
  *
- * Routing: the parent's assigned worker (`parent.agentId`) is preferred when
- * the agent row still exists, is not `offline`, and has remaining capacity
- * (`getActiveTaskCount < agent.maxTasks`). For `crash_recovery` the pin holds
- * regardless of `lastActivityAt` freshness — the agent ID is stable across a
- * restart and the crashed row survives intact, so a stale `lastActivityAt` at
- * the ~5-min crash-detection mark means "restarting", not "gone". `graceful_shutdown`
- * follows the same pin path when `HEARTBEAT_PIN_GRACEFUL_RESUME` is enabled:
- * deploy/SIGTERM restarts preserve the stable agent ID and the stale-pin reaper
- * now handles the "agent never returns" case. Pinning keeps the resume off the
- * role-blind unassigned pool so no wrong-specialization worker can grab it
- * (DES-523). For `context_limits` / `manual_supersede` the worker is alive, so
- * `lastActivityAt` freshness is still required. The resume falls back to the
- * unassigned pool only when the agent is genuinely gone (graceful close →
- * `offline`) or its row is absent.
+ * Routing prefers the parent's assigned worker when that agent is reachable
+ * and has capacity. Crash and graceful recovery can pin to a sleeping pool
+ * agent. Other resume reasons require fresh activity. The stale-pin reaper
+ * escalates resumes that the selected agent never claims (DES-523).
  *
  * Gone-agent / never-reclaimed case: a pin whose agent never returns is NOT
  * re-pooled — the heartbeat's stale-resume reaper (`escalateUnreclaimedResumes`
@@ -478,30 +441,10 @@ export async function createResumeFollowUp(args: {
 
   // Routing decision — same DB process so the read-then-create window is small.
   //
-  // For `crash_recovery`, deliberately PIN to the same (stable-ID) agent even
-  // when `lastActivityAt` is stale. This REVERSES the prior "let staleness pool
-  // it" behavior: crash detection only fires after STALL_THRESHOLD_NO_SESSION_MIN
-  // (~5 min), by which point a healthy-but-restarting worker is always >30s
-  // stale, so the old `fresh` gate dumped every crash resume into the role-blind
-  // pool where a wrong-specialization worker could grab it (DES-523). The agent
-  // ID is stable across restart and the crashed row survives intact, so here
-  // "stale" means "restarting", not "gone". We KEEP the `offline` guard — only a
-  // graceful close sets `offline`, i.e. genuinely gone → pool — and the capacity
-  // guard. An unreclaimed pin is escalated to a Lead decision by the heartbeat
-  // reaper, never silently re-pooled.
-  //
-  // `graceful_shutdown` uses the same pin machinery: deploy/SIGTERM restarts
-  // preserve the stable agent ID, and the reaper now prevents an unreclaimed pin
-  // from being orphaned forever. `HEARTBEAT_PIN_GRACEFUL_RESUME=0` restores the
-  // old forced-pool path for this reason.
-  //
-  // Brittleness note: this relies on a hard crash NEVER marking the agent
-  // `offline` (only `POST /close` does). If future code offlines stale agents
-  // before remediation, this re-opens the pool path for `crash_recovery` —
-  // revisit the gate then.
-  //
-  //   - `context_limits` / `manual_supersede`: the worker is alive and
-  //     responsive, so keep requiring `fresh`.
+  // Crash and graceful recovery preserve the original agent when reachable.
+  // Sleeping pool agents remain reachable after runtime death.
+  // Static offline agents use the pool fallback. Other reasons require freshness.
+  // The heartbeat reaper escalates any resume that remains unclaimed.
   let preferredAgentId: string | undefined;
   let authorizationDecision:
     | "source_lead_pin"
