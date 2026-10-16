@@ -23,7 +23,7 @@ import {
   getScriptApiConnectionDescriptors,
   getScriptMcpConnectionDescriptors,
 } from "@/be/script-connections";
-import { buildScriptCredentialBindings } from "@/be/script-credential-broker";
+import { buildScriptCredentialBindingsWithFailures } from "@/be/script-credential-broker";
 import { getScript } from "@/be/scripts/db";
 import { type RunScriptOutput, runScriptAfterSetup } from "@/scripts-runtime/loader";
 import { telemetry } from "@/telemetry";
@@ -112,15 +112,19 @@ async function executeScheduleScript(schedule: ScheduledTask): Promise<void> {
         },
         agentId,
       },
-      async () => ({
-        source: script.source,
-        args,
-        fsMode: "none",
-        egressSecrets: await buildScriptCredentialBindings({ agentId }),
-        apiConnections: getScriptApiConnectionDescriptors({ agentId }),
-        mcpConnections: getScriptMcpConnectionDescriptors({ agentId }),
-        timeoutMs: 60_000,
-      }),
+      async () => {
+        const credentials = await buildScriptCredentialBindingsWithFailures({ agentId });
+        return {
+          source: script.source,
+          args,
+          fsMode: "none",
+          egressSecrets: credentials.egressSecrets,
+          userConfig: credentials.userConfig,
+          apiConnections: getScriptApiConnectionDescriptors({ agentId }),
+          mcpConnections: getScriptMcpConnectionDescriptors({ agentId }),
+          timeoutMs: 60_000,
+        };
+      },
     );
   } catch (err) {
     await recordScheduleScriptRun({

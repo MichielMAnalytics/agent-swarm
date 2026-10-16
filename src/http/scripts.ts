@@ -787,6 +787,7 @@ export async function handleScripts(
             runtimeInstanceId,
             egressSecrets: credentials.egressSecrets,
             failedBindings: credentials.failedBindings,
+            userConfig: credentials.userConfig,
             apiConnections: getScriptApiConnectionDescriptors({ agentId: agent.id }),
             mcpConnections: getScriptMcpConnectionDescriptors({ agentId: agent.id }),
           };
