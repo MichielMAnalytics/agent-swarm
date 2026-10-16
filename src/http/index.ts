@@ -722,7 +722,8 @@ httpServer
     }
     console.log(`MCP HTTP server running on http://localhost:${port}/mcp`);
 
-    // Measure the native script sandbox once; /health reports the level.
+    // Measure the native script sandbox once; /health reports the level as
+    // `meta.scripts.sandbox`.
     void getNativeSandboxStatus().then((status) => {
       console.log(
         `[Scripts] Native script sandbox: ${status.level} (uid drop ${status.uidDropped ? "on" : "off"}, seccomp ${status.seccomp ? "on" : "off"}, exec-deny policy ${nativeSeccompPolicy()})${status.error ? `; probe error: ${status.error}` : ""}`,

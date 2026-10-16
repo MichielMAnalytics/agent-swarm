@@ -457,15 +457,19 @@ export async function handleCore(
     // lives on the authenticated /api/stats payload instead. The one
     // exception is the measured native script isolation level and the
     // exec-deny policy it ran under: operators and orchestrators (Helm,
-    // Dokploy) read them without a key. `scriptSandboxScope` says which
-    // entrypoint the level covers (the native executor only).
+    // Dokploy) read them without a key, under `meta.scripts`. `scope` says
+    // which entrypoint the level covers (the native executor only).
     res.end(
       JSON.stringify({
         status: "ok",
         version,
-        scriptSandbox: peekNativeSandboxStatus()?.level ?? "pending",
-        scriptSandboxScope: SCRIPT_SANDBOX_SCOPE,
-        scriptSandboxExecDeny: nativeSeccompPolicy(),
+        meta: {
+          scripts: {
+            sandbox: peekNativeSandboxStatus()?.level ?? "pending",
+            scope: SCRIPT_SANDBOX_SCOPE,
+            execDeny: nativeSeccompPolicy(),
+          },
+        },
       }),
     );
 

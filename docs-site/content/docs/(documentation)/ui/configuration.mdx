@@ -198,16 +198,17 @@ subprocess. Two layers harden it:
   error that names `SCRIPT_NATIVE_EXEC_DENY`.
 
 At startup the API runs one probe script through the native executor and reports the result
-as `scriptSandbox` on `/health`: `hardened` (both layers), `uid-only` (sandbox user without the
-filter), or `none` (the API is not root or cannot change uid). It is `pending` until the probe
-finishes. `scriptSandboxScope` is `native-executor`: the level covers native script runs only.
+as `meta.scripts.sandbox` on `/health`: `hardened` (both layers), `uid-only` (sandbox user
+without the filter), or `none` (the API is not root or cannot change uid). It is `pending` until
+the probe finishes. `meta.scripts.scope` is `native-executor`: the level covers native script
+runs only.
 Durable script runs get the sandbox user but not the filter, and workflow `script` nodes get the
 shared uid and no filter, so `hardened` does not describe them.
 
 `SCRIPT_NATIVE_EXEC_DENY` (default `true`) is the exec-deny switch. Set it to `false` to let
 native scripts start programs again, for example to recover a script after a regression. The
 change applies to the next run without a restart. `/health` reports the effective policy as
-`scriptSandboxExecDeny`: `best-effort` (default), `required`, or `off`. With the filter off the
+`meta.scripts.execDeny`: `best-effort` (default), `required`, or `off`. With the filter off the
 probe re-runs and the level is at most `uid-only`.
 
 `SCRIPT_NATIVE_REQUIRE_ISOLATION` (default `false`) makes native script runs fail unless the

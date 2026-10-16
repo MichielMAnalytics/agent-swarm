@@ -101,5 +101,5 @@ export function nativeSeccompPolicy(): SeccompPolicy {
   return requireNativeIsolation() ? "required" : "best-effort";
 }
 
-/** Which script entrypoint `scriptSandbox` on /health measures. */
+/** Which script entrypoint `meta.scripts.sandbox` on /health measures. */
 export const SCRIPT_SANDBOX_SCOPE = "native-executor";
