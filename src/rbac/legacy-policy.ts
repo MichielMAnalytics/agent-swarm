@@ -206,8 +206,9 @@ const memoryDelete: LegacyRule = {
 };
 
 /**
- * task.fs.mutate — operator OR user OR lead OR task-assignee OR task-creator
- * (src/http/fs.ts canMutateTask). Order-independent OR: today's early
+ * task.fs.mutate and task.parent.attach: operator OR user OR lead OR
+ * task-assignee OR task-creator (src/http/fs.ts canMutateTask; send-task and
+ * POST /api/tasks for a parentTaskId). Order-independent OR: today's early
  * operator/user returns short-circuit before agent identity, but no input
  * satisfies one branch while failing another, so a flat OR is equivalent
  * (plan Appendix A row 36 note).
@@ -263,6 +264,7 @@ export const LEGACY_RULES = {
 export const LEGACY_POLICY = {
   "user.manage": leadOnly,
   "agent.profile.update.any": leadOnly,
+  "agent.act.any": leadOnly,
   "agent.context.read.any": leadOnly,
   "task.cancel.any": leadOrTaskCreator,
   "approval.cancel.any": humanOrLeadOrResourceOwner,
@@ -275,6 +277,7 @@ export const LEGACY_POLICY = {
   "task.steer.own": requesterOwnsTask,
   "task.action.own": requesterOwnsTask,
   "task.fs.mutate": taskFsMutate,
+  "task.parent.attach": taskFsMutate,
   "task.progress.write": taskProgressWrite,
   "favorite.write.own": anyAuthenticated,
   "memory.learning.inject": leadOnly,
@@ -285,6 +288,10 @@ export const LEGACY_POLICY = {
   "channel.delete": leadOnly,
   "repo.merge-policy.write": leadOrOperatorOrUser,
   "integration.kapso.manage": leadOnly,
+  "integration.chat.manage": leadOnly,
+  "integration.chat.post": leadOnly,
+  "integration.chat.read": leadOnly,
+  "integration.chat.dm": leadOnly,
   "integration.slack.post": leadOnly,
   "integration.slack.read": leadOnly,
   "integration.slack.thread.start": leadOnly,
@@ -302,6 +309,8 @@ export const LEGACY_POLICY = {
   "config.write.any": leadOnly,
   "config.delete.any": leadOnly,
   "config.read.secrets": leadOnly,
+  // HTTP runtime tokens can read their own resolved config in src/http/config.ts.
+  // Lead tokens retain config.read.secrets. This exception does not grant config administration.
   "models.catalog.write": leadOrOperator,
   "models.harness-support.write": agentOrOperator,
   "skill.create.swarm": leadOnly,
@@ -332,6 +341,11 @@ export const LEGACY_POLICY = {
   "script.api.update": leadOnly,
   "script.api.rotate": leadOnly,
   "script.api.delete": leadOnly,
+  // Pool writes pick the image that receives a runtime token, so only humans
+  // may make them. The lead may only place agents into operator-made pools.
+  "runtime_pool.write": operatorOrUser,
+  "runtime_pool.bind": leadOrOperatorOrUser,
+  "runtime_controller.write": operatorOrUser,
   "extension.write": extensionWrite,
   "extension.activate": extensionActivation,
   "extension.install.inline": leadOrOperatorOrUser,

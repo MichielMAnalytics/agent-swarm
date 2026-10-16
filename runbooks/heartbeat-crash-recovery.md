@@ -32,10 +32,22 @@ flowchart TD
   3. If `__runId` is missing/unparseable, both checks fall back to the legacy behavior (session exists → skip, no claim-time check). Never more aggressive than before.
 - **Reboot sweep dependents.** `failTask` normally cascade-fails every non-terminal task whose `dependsOn` names the failed task (`cascadeFailDependents`, reason `Blocked dependency <id8> was failed`). The reboot sweep calls it with `cascadeDependents: false` and settles the dependents itself once the retry decision is made: each never-started dependent (`draft`/`backlog`/`unassigned`/`offered`/`reviewing`/`pending`) has the swept id in `dependsOn` replaced by the retry child's id and waits on the retry (`task_dependency_repointed` log row). The dependent keeps its row, so agent, Slack fields, `followUpConfig`, priority and parent are unchanged. Anything still depending on the swept task afterwards — no retry was created (skip-type task, invalid affinity, a non-terminal child already existed, retry creation threw), or a dependent that already started — cascade-fails exactly as before. Already-terminal dependents are never touched. Every other `failTask` caller cascades as today.
 - **Worker side** (`src/commands/runner.ts`): the worker registers its active session (POST `/api/active-sessions`, keyed on the per-task runner session id) *before* it starts the provider spawn, and fills in the provider session id on `session_init`. So the window in which an `in_progress` task has no session row is one HTTP round trip, not the whole spawn. On spawn failure the worker fails the task and then removes the row.
+- **Worker completion writes**: final progress and `/finish` retry network errors and HTTP 5xx with exponential delays from one second to 30 seconds. They share a `RUNNER_FINISH_RETRY_MAX_SEC` budget (worker environment, default 300 seconds). HTTP 4xx receive no retry, and HTTP 401 stops completion writes immediately. The worker retains its task slot and active session until these writes settle. Per-task and exit-after-N workers wait for completion writes before exit. Budget exhaustion logs a scrubbed error and permits cleanup. Recovery can repeat the task if the API never accepts its result.
+- Tasks completed in one pass finish concurrently. Credential reports retain their batch order. Each task releases its slot in `finally`, including when completion preparation throws.
 - **Worker slot reconciliation** (`reconcileActiveTasks` in `src/commands/runner.ts`, every main-loop iteration): a task the server holds as `cancelled` gets its session aborted. Every `RUNNER_TASK_RECONCILE_INTERVAL_MS` (default 30s) the worker also reads each active task's status; a task already terminal server-side (for example failed by the stalled-task sweep) gets its session aborted. A session that has not settled 10s after any abort is settled by the runner (`runner exited without result: ...`), so `checkCompletedProcesses` frees the slot. For a task that was terminal server-side the worker sends no `/finish` and no credential or model outcome, so the server's output and failureReason stand. The slot frees at most interval + grace after the server marks the task terminal.
 - The **boot-triage seed script** (`src/be/seed-scripts/catalog/boot-triage.ts`) mirrors this logic: it flags `in_progress` tasks that are on an offline agent OR whose session's `lastHeartbeatAt` is older than `stuckMinutes` ago (no fresh session heartbeat).
 - `autoAssignPoolTasks` and `claimTask`/`assignUnassignedTaskPending` are gated by the **routing-affinity eligibility check** (§4, `isAgentEligibleForTask`) — a pooled task tagged with a `routingAffinity` snapshot (from a resume/retry, or an explicit `requiredCapabilities` on a fresh `send-task`) can only go to a role/capability-matching agent. Untagged tasks are unaffected — assignment stays open to any idle (non-lead) worker, exactly as before. The pool paths (`autoAssignPoolTasks` and the poll auto-claim scan) also apply `poolTaskRunsOnHarness(task, harness)` (`src/be/model-validation.ts`): a task that pins a `model` the worker's harness cannot run is skipped for that worker and waits for a compatible one ([model-tiers.md § Harness compatibility](./model-tiers.md)). `autoAssignPoolTasks` **does** skip idle workers whose `emptyPollCount >= MAX_EMPTY_POLLS` (the poll gate) — assigning to them would just have them exit on their next poll. The filter reads `emptyPollCount` off the rows `getIdleWorkersWithCapacity()` already returns (no per-worker re-query). Note the poll gate is cleared on a genuine `waiting_for_credentials -> ready` recovery (`updateAgentCredentialState`) and on re-register, but **not** by routine post-task `ready:true` credential reports.
 - `checkWorkerHealth` only flips `busy↔idle` (it pre-filters `offline`) and never sets `offline`. A successful `/api/poll` dispatch updates the agent to `busy` in the same transaction that starts a pre-assigned task or claims a pool task; the worker-only `poll-task` tool does the same for its direct pending-task path. The heartbeat sweep remains the reconciliation backstop for any other task-state transition that leaves `agents.status` stale. Leads can become `busy` while running a directly assigned task, but remain structurally excluded from pool assignment (`getIdleWorkersWithCapacity` and the pool dispatch query filter `isLead=0`). `offline` has two writers: the graceful `POST /close` handler (`src/http/core.ts`), and — only when `MULTI_RUNTIME_ENABLED` is enabled — the stale-runtime expiry in §1a. With the flag explicitly off, a hard-crashed (SIGKILL) worker is still never auto-offlined.
+
+### Offer cleanup
+
+After runtime expiry, heartbeat releases offers to deleted or unreachable offline recipients.
+Both full triage and cleanup-only sweeps pass `isAgentReachable` to the legacy offer reaper.
+With runtime pools enabled, an offline agent remains reachable when its enabled pool can wake or already has a provision in progress.
+Wakeable pools require nonzero runtime capacity and an image or resolved image, in addition to a provisionable kind and closed circuit.
+An existing provision preserves reachability during an open circuit.
+The guarded update only releases tasks still offered to an offline or deleted recipient, so a concurrent claim wins.
+With `RUNTIME_POOLS_ENABLED=false`, the reaper retains its legacy offline predicate and clears the released recipient and offer timestamp.
 
 ### Workflow recovery
 
@@ -101,14 +113,36 @@ count lands in `staleCleanup.connectorCodes` and adds to `stale_cleanup=`.
 
 ## 1a. Runtime liveness (`MULTI_RUNTIME_ENABLED` only)
 
+Remote controllers authenticate on a separate socket at `/api/controllers/connect`.
+A disconnect marks the controller offline and prevents provisioning or provider death checks through that controller.
+`RUNTIME_CONTROLLER_GRACE_SEC` defaults to 120 seconds. Runtime rows remain unchanged during the grace.
+A reconnect lists owner-filtered runtimes before the controller becomes online.
+Known handles remain. Ownership labels restore handles when a provision result was lost.
+After the grace, `reconcileDisconnectedControllers` invokes its runtime recovery callback for each remaining runtime.
+The supervisor supplies `recoverRuntime`, which marks the runtime offline, revokes its tokens, and remediates active tasks.
+Failed reconnect handshakes do not extend the original disconnect grace.
+Reconnection retires provisioning rows with no handle when the controller list does not report them.
+This retirement releases capacity and revokes tokens without a provision failure or infrastructure termination.
+Controller offline errors and command timeouts do not increment failures, apply backoff, or change the pool circuit.
+An API restart gives persisted online controllers a new grace period when their sockets are absent.
+
 With multi-runtime mode enabled, one logical agent may be served by several
 worker processes, each recorded in `runtime_instances`. Workers send their per-boot `X-Runtime-Instance-ID` on `POST /ping` and on
 `GET /api/poll`; either refreshes that row's `last_seen_at`, so liveness
 tracks actual worker traffic rather than one endpoint's cadence — a worker
-sitting inside the long-poll loop keeps itself fresh. `POST /close` retires
-just that row. Neither can revive a retired or expired runtime: the refresh
+sitting inside the long-poll loop keeps itself fresh. For pooled runtimes, `POST /close` retires
+the row only when the runner sends `runtimeShutdown: true`. Session hooks preserve the row and token.
+Static workers retain their existing close behavior. A ping cannot revive a retired or expired runtime: the refresh
 only matches a row that is already live, and registration is the sole path
 back to `active`.
+
+Workers preserve an injected `SWARM_RUNTIME_INSTANCE_ID` instead of generating a new runtime ID.
+Runtime tokens bind authentication to that agent and runtime, and central authentication rejects conflicting headers.
+
+Push workers send `/ping` at least every 30 seconds, including during budget backoff.
+Their safety tick fetches work, cancellation, steering, and configuration every 30 seconds by default.
+`RUNNER_PUSH_SAFETY_POLL_MS` changes that fetch interval without changing the ping interval.
+Poll workers retain their existing ping and poll cadence.
 
 A crashed, OOM-killed, or network-partitioned process never reaches `/close`,
 so status alone would leave it `active` forever and keep its agent falsely
@@ -142,9 +176,77 @@ is never expired):
   cleans the session when it remediates; the sweep's 30-minute stale-session
   cleanup backstops any leftover row. The worker's next re-registration
   restores its runtime row.
-- Retired rows are **deleted, not kept**. Runtime identity is per boot, so
-  retaining them would add one row per boot per agent indefinitely; nothing
-  reads a runtime once it stops being live.
+- The heartbeat prunes stale offline rows, including pooled runtimes. It retains active pooled rows and provisioning rows for the supervisor.
+- The supervisor batches provider status checks for pooled runtimes every five seconds by default.
+  Provider `exited`, `failed`, or absence from a successful owner-filtered list triggers immediate recovery.
+  The ping cutoff also triggers termination and recovery. A fresh `unknown` runtime present in the list remains unchanged.
+  Provider errors do not prove death.
+  An unplanned pause resumes a wanted idle runtime and renews its lease.
+  A pause during active work terminates the sandbox, then triggers `recoverRuntime` because the model stream cannot continue.
+  An unwanted paused runtime terminates without resuming.
+  E2B lease expiry can remove the sandbox. After a failed renewal, the next full reap checks status and recovers confirmed absence.
+  A running sandbox retains its tasks after a renewal transport error.
+- `recoverRuntime` serializes recovery for its runtime, then calls `markRuntimeTerminated`.
+  This marks the row offline, reconciles agent status, and revokes runtime and child tokens.
+  Revocation closes token-authenticated sockets. Subsequent worker calls receive 401.
+  Recovery reads sessions by `active_sessions.runtimeInstanceId` and applies the existing heartbeat decision to each in-progress task.
+  With runtime pools enabled, recovery also reads sessionless dispatches from `agent_tasks.runtime_instance_id` and `runtime_instances.task_id`.
+  Dispatch records each slot's task ownership within the claim transaction, before the worker registers its session.
+  Existing sessions determine ownership and exclude fallback recovery by a different runtime.
+  Guarded state updates preserve concurrent completion and prevent repeated recovery from creating duplicate resumes.
+  Recovery deletes sessions after remediation. Repeated recovery creates no additional resume.
+  A session error logs a scrubbed reason and does not block sibling recovery. A later tick retries the failed session.
+  Reachable sleeping pool agents remain valid resume targets after their last runtime becomes offline.
+- Provision errors and registration timeouts count as failures. A timeout terminates the runtime.
+  The agent row persists the failure count and retry deadline. Retries wait 30, 90, then 180 seconds.
+  Each tick counts at most one failure per agent toward retry attempts and the pool circuit, including simultaneous registration timeouts.
+  An agent with prior failures permits only one provision awaiting registration. Registration clears retry state and restores concurrent provisioning.
+  After `RUNTIME_PROVISION_MAX_ATTEMPTS`, the oldest ready pending task fails with a scrubbed provisioning reason.
+  The existing failure follow-up notifies the Lead. Task failure and first registration reset agent retry state.
+  A tick with no ready demand clears retry state. Reaching the attempt cap without a ready pending task also clears retry state.
+  Each failure stores scrubbed errors on the runtime, pool, and controller.
+- The supervisor provisions concurrently, bounded by `RUNTIME_PROVISION_CONCURRENCY` (default 8).
+  Started requests reserve demand within agent and pool caps. Each new request checks budget admission, backoff, and the circuit.
+  A failure preserves sibling requests and stops further requests for that agent during the tick.
+  An expired circuit still permits only one trial awaiting registration.
+- `RUNTIME_CIRCUIT_THRESHOLD` consecutive failures open the pool circuit for `RUNTIME_CIRCUIT_OPEN_MIN` minutes.
+  An open circuit blocks provisioning and tier-2 routing. Existing runtimes continue their tasks.
+  Opening the circuit clears retry state for its agents.
+  After expiry, one trial provision may await registration. First registration resets pool failures and closes the circuit.
+  Re-registration of a healthy runtime does not change the circuit.
+  Failure opens the circuit again.
+- The last push socket disconnect schedules a provider check after `RUNTIME_SOCKET_GRACE_SEC` seconds.
+  Reconnection cancels the check. A running provider runtime keeps its tasks. Confirmed death triggers recovery.
+- Within `RUNTIME_TOKEN_ROTATE_BEFORE_MIN` minutes of token expiry, an idle runtime drains first.
+  The next tick checks activity again and terminates it if it remains idle.
+  A busy runtime drains and accepts no new tasks. Demand can provision a replacement within the pool cap.
+  The supervisor terminates the drained runtime when its tasks finish.
+- A draining runtime cannot receive work through `/api/poll`. The supervisor drains idle runtimes before termination and checks activity again next tick.
+- The supervisor counts non-terminal task sessions as busy.
+  Taskless `unread_mentions`, `pool_tasks_available`, and `channel_activity` sessions also count while `lastHeartbeatAt` remains fresh.
+  `HEARTBEAT_STALE_CLEANUP_MIN` bounds taskless occupancy (default 30 minutes). Runtime pings do not extend this session deadline.
+  Each tick checks idle-lifecycle runtimes for terminal task sessions, missing task executions, and stale taskless sessions.
+  Each check remains scoped to the runtime being checked.
+  The supervisor issues DELETE only when that read finds a stale session.
+  A runtime's recorded `in_progress` or `reviewing` task also keeps it busy without a session row.
+  Workers delete sessions concurrently for each completed batch, with three one-second attempts and 100/200 ms backoffs.
+  Final failure logs a scrubbed warning and lets task completion continue.
+- Per-task runtimes preserve sessions and tokens after task completion so the runner can report cost, logs, and context.
+  Runner shutdown sends `/close` with `runtimeShutdown: true`, which retires the row and permits provider teardown.
+  Without shutdown, teardown waits `RUNTIME_PER_TASK_EXIT_GRACE_SEC` seconds from task completion (default 60).
+  The finished runtime still counts toward agent `maxTasks` and pool `maxRuntimes` during this grace.
+- E2B runtimes use the same drain path within `RUNTIME_ROTATE_BEFORE_SEC` seconds of their continuous runtime limit.
+  Demand can provision replacements within the pool cap. Busy runtimes finish their tasks before termination.
+  The limit comes from controller `E2B_MAX_CONTINUOUS_SEC`, then the deployment value, then 3600 seconds.
+  Pro deployments can configure 86400 seconds. Planned rotation never pauses a busy runtime.
+- Supervisor termination immediately marks the runtime offline, reconciles the agent status, and revokes runtime tokens. A surviving live runtime keeps its agent available.
+- Disabled pools stop provisioning and drain idle runtimes. The supervisor continues provider checks and orphan cleanup.
+  Existing runtimes use their recorded controller for listing, status, termination, and E2B renewal.
+  The pool's current placement applies only to new provisions.
+  Placement and provider-kind changes return 409 while the pool has non-offline runtimes.
+  Ordinary and forced deletion also return 409 until all pool runtimes are offline.
+  Operators must scale to zero or disable the pool and wait for teardown.
+  Agent binding changes return 409 while that agent has non-offline pool runtimes.
 - The whole mechanism is inert while the flag is off. After a rollback workers
   stop refreshing their rows, and expiring them would offline agents that are
   running fine under legacy semantics.
@@ -181,14 +283,30 @@ flowchart TD
   hook -->|"invalid modify"| keep["warn and keep<br/>the default action"]
   keep --> action
   action -->|"record"| record["record stalled task<br/>perform no remediation"]
-  action -->|"fail"| fail["fail task<br/>restore agent state"]
-  action -->|"supersede-resume"| resume["supersede task<br/>create crash-recovery resume"]
+  action -->|"fail or supersede-resume"| owned{"session on a<br/>provisionable pool?"}
+  owned -->|"yes"| lock["serialize with recoverRuntime"]
+  owned -->|"no"| cas
+  lock --> cas{"selected task CAS succeeds?<br/>expected lastUpdatedAt"}
+  cas -->|"no: progress or another remediation"| skip
+  cas -->|"yes, pooled"| fence["markRuntimeTerminated:<br/>offline + revoke tokens<br/>then terminate provider runtime"]
+  cas -->|"yes, static"| finish
+  fence --> finish["complete selected fail or resume<br/>clean session and restore agent state"]
+  finish --> siblings{"pooled runtime?"}
+  siblings -->|"yes"| recover["recover sibling sessions<br/>under the same recovery lock"]
+  siblings -->|"no"| done["remediation complete"]
+  recover --> done
 ```
 
 - Candidate set = `getStalledInProgressTasks(STALL_THRESHOLD_NO_SESSION_MIN)` → `status='in_progress' AND lastUpdatedAt > 5m`. Tasks in `pending`/`offered` are **not** seen by this sweep. A candidate with a pending steering message newer than `STEERING_STALL_GRACE_MIN` is deferred for that sweep; once the bounded grace expires, normal classification and remediation resume.
 - An **active_session** = one worker-*run* process for a task (`active_sessions`, `UNIQUE(taskId)`), created lazily *after* the provider process spawns, kept alive by two inputs to `active_sessions.lastHeartbeatAt`: **tool activity** (`PUT /api/active-sessions/heartbeat/{taskId}`, throttled ~5s worker-side) and **provider output** (`POST /api/session-logs` with a `taskId`: `refreshActiveSessionOnActivity` refreshes that task's own session row, at most once per 30s, via a `lastHeartbeatAt < cutoff` guard on the UPDATE). Provider output covers every harness and a long reasoning stream with no tool calls; it is task-scoped, so it never refreshes another task's session. The one wall-clock ping is scoped to background work: a Claude session (CLI or SDK transport) that has at least one non-ambient task in its latest `system/background_tasks_changed` set PUTs the heartbeat every 60s (`ClaudeBackgroundKeepalive`, `src/providers/claude-background-keepalive.ts`), so a turn that ended waiting on a `run_in_background` job stays live; the ping stops when the set empties, the session ends, or the session has emitted nothing for 2h. Any other silent worker (no tool call, no output, no background task) still goes stale. "No active session" is AND-gated with `lastUpdatedAt > 5m`, so it means *"no live run **and** no task progress in 5 min."* It can false-positive on a long-but-quiet live worker; the resume-generation budget (`MAX_RESUME_GENERATIONS`) bounds the blast radius.
 - The classifier emits `no-session`, `stale-session`, or `fresh-stalled` only after a task crosses its existing threshold. Extensions cannot change thresholds or classify a healthy task as stalled.
 - `decideRemediation` keeps the default recovery policy. It selects `fail` for workflow steps, excluded task types, existing resume children, and exhausted resume budgets. It otherwise selects `supersede-resume`. A fresh-session stall defaults to `record`.
+- For a selected remediation with a session on a provisionable pool, the classifier uses the same runtime lock as `recoverRuntime`.
+  A successful task CAS fences the runtime before session cleanup or resume creation. Provider termination follows the fence.
+  A failed CAS leaves the runtime unchanged. Progress after the candidate read cancels remediation and fencing.
+  The classifier completes the selected action, then recovers sibling sessions under the same lock.
+  Concurrent provider recovery waits for that action. Extension blocks and `record` actions leave the runtime unchanged.
+  Static workers retain their existing behavior.
 - `pre.heartbeat.remediate` receives the task, optional session, classification, proposed action, reason, and age values before any remediation write. An extension can select `supersede-resume`, `fail`, or `record`. A block records the stalled task and an `extensionSkipped` finding, then performs no remediation during that sweep. An invalid action logs a scrubbed warning and keeps the original proposal.
 - Thresholds (env-overridable): `STALL_THRESHOLD_NO_SESSION_MIN=5` (`HEARTBEAT_STALL_NO_SESSION_MIN`), `STALL_THRESHOLD_STALE_HEARTBEAT_MIN=15`, `STALL_THRESHOLD_MINUTES=30`, `STEERING_STALL_GRACE_MIN=5` (`HEARTBEAT_STEERING_GRACE_MIN`), `STALE_CLEANUP_THRESHOLD_MINUTES=30`.
 
@@ -212,16 +330,20 @@ The user MCP exposes no backlog actions.
 ```mermaid
 flowchart TD
   entry["supersedeTask(parent) → frees capacity,<br/>then createResumeFollowUp(crash_recovery<br/>or graceful_shutdown)"]
-  entry --> gate{"lead-only parent?<br/>worker source → current Lead;<br/>otherwise original row exists,<br/>status≠offline, hasCap?"}
+  entry --> gate{"lead-only parent?<br/>worker source → current Lead;<br/>otherwise original agent reachable,<br/>hasCap?"}
   gate -->|"yes (recoverable / restarting)"| pin["resume = PENDING, agentId = parent<br/>(reclaimed on the agent's next poll —<br/>never enters the pool)"]
-  gate -->|"no — offline / row gone / at capacity /<br/>pin kill-switch=0"| pool["resume = UNASSIGNED → pool<br/>(genuinely-gone / rollback path)"]
+  gate -->|"no: unreachable / at capacity /<br/>pin kill-switch=0"| pool["resume = UNASSIGNED → pool<br/>(unreachable / rollback path)"]
   pin --> reap{"reaper (every sweep, in cleanupStaleResources):<br/>still PENDING after<br/>HEARTBEAT_RESUME_PIN_GRACE_MIN?"}
   reap -->|"no — agent reclaimed it"| ok["runs on the original agent"]
   reap -->|"yes — never reclaimed"| esc["atomically cancel the pin, then<br/>createRerouteDecisionTask → Lead<br/>(over generation cap → fail, no decision)"]
   esc --> lead["Lead re-delegates via send-task(agentId=…)<br/>— explicit agent, never re-pooled"]
 ```
 
-**Heuristic (current):** `crash_recovery` and `graceful_shutdown` resumes are **pinned back to their own (stable-ID) agent**, except a structured `routingAffinity.leadOnly: true` task may only pin to a Lead. A legacy/misrouted worker parent is rerouted to the current Lead when available; otherwise its child remains unassigned (workers cannot claim it) and emits a `task_recovery_authorization` escalation event. `createResumeFollowUp` sets `agentId = parent.agentId` whenever the agent row still exists, is not `offline`, and has capacity — *regardless of the 30s `WORKER_LIVENESS_WINDOW_SECONDS` freshness*. The agent ID survives both crash recovery and deploy/SIGTERM graceful shutdown, so "stale" usually means "restarting", not "gone". The resume is `pending` and reclaimed on the agent's next poll; it **never enters the role-blind pool**, so no wrong-specialization worker can grab it (DES-523). It falls back to the pool only when the agent is genuinely gone (`offline`), its row is absent, capacity is full, or the reason-specific rollback switch is `0` (`HEARTBEAT_PIN_CRASH_RESUME` for crash recovery, `HEARTBEAT_PIN_GRACEFUL_RESUME` for graceful shutdown). Other reasons (`context_limits` / `manual_supersede`) still require `fresh`.
+`crash_recovery` and `graceful_shutdown` resumes prefer their original agent when that agent is reachable and has capacity.
+Reachability includes sleeping agents on enabled provisionable pools with closed circuits when runtime pools are enabled.
+The crash and graceful pin switches retain their existing behavior. Other resume reasons still require fresh activity.
+A Lead-only task can pin only to an eligible Lead. Recovery uses the current Lead when its original agent is a worker.
+The resume remains pending for its selected agent. It enters the pool only when recovery cannot select a valid target.
 
 A pin **never reclaimed within `HEARTBEAT_RESUME_PIN_GRACE_MIN`** (the agent that looked recoverable never returned) is escalated by the **reaper** (`escalateUnreclaimedResumes`, run inside `cleanupStaleResources` on *every* sweep, including the post-reboot sweep): it atomically cancels the still-`pending` resume (skipping if the agent reclaimed it in the gap — TOCTOU-safe) and creates a Lead-owned `task.reroute.decision` follow-up. The Lead re-delegates via `send-task` with an **explicit `agentId`** — the work is never re-pooled. A resume already at the generation cap (`MAX_RESUME_GENERATIONS`) is failed instead of escalated, bounding a flapping task. Net: protected pinned reasons touch the unassigned pool **zero times** unless a fail-open guard or rollback switch sends them there.
 
@@ -259,22 +381,32 @@ if extensionResult modifies to a valid action:
 if proposed.action == record:
     stalledTasks += task
     continue
+# For a pooled session, run this selected-action block under the same runtime
+# lock as recoverRuntime. Concurrent recovery waits until this block finishes.
 if proposed.action == fail:
-    failTask(task.id, proposed.reason, expectedLastUpdatedAt = task.lastUpdatedAt)
-    clean a stale active session when classification == stale-session
+    changed = failTask(task.id, proposed.reason, expectedLastUpdatedAt = task.lastUpdatedAt)
+else:
+    changed = supersedeTask(parent, expectedLastUpdatedAt = task.lastUpdatedAt)
+
+# Both writes compare against the candidate's lastUpdatedAt.
+# A progress write cancels remediation, fencing, and sibling recovery.
+if not changed:
+    continue
+if session belongs to a provisionable pool:
+    markRuntimeTerminated(runtime.id, proposed.reason)  # offline + token revoke
+    controller.terminate(runtime.handle, proposed.reason)
+if proposed.action == fail:
+    clean session when stale or pooled
     restore agent state
+    if pooled: recover sibling sessions under the same runtime lock
     continue
 
-# fail and supersede both compare-and-swap on the lastUpdatedAt this sweep read:
-# a progress write between the candidate read and the write cancels remediation.
-# proposed.action == supersede-resume:
-supersedeTask(parent, expectedLastUpdatedAt = task.lastUpdatedAt)   # frees the agent's in_progress slot
 promotePendingSteeringForTask(parent)       # pending rows → follow-up tasks, exactly once
 resume = createResumeFollowUp(parent, reason = crash_recovery | graceful_shutdown):
     preferredAgentId = undefined
     if parent.agentId:
         cand = getAgentById(parent.agentId)
-        if cand and cand.status != "offline" and activeCount(cand) < cand.maxTasks:
+        if cand and isAgentReachable(cand) and activeCount(cand) < cand.maxTasks:
             isCrash = (reason == crash_recovery) and HEARTBEAT_PIN_CRASH_RESUME
             isGraceful = (reason == graceful_shutdown) and HEARTBEAT_PIN_GRACEFUL_RESUME
             isFreshReason = (reason != graceful_shutdown) and (now - cand.lastActivityAt < 30s)
@@ -289,6 +421,19 @@ resume = createResumeFollowUp(parent, reason = crash_recovery | graceful_shutdow
 # supersedeTask(resumeTaskId = null) leaves dependents waiting on parent; they settle here:
 if resume created: backfillSupersedeTaskResumeTaskId(parent, resume)   # log entry + settle(parent, resume)
 else:              settleSupersededTaskDependents(parent, null); failTask(parent, resume_creation_skipped_<reason>)
+clean session when stale or pooled
+restore agent state
+if pooled: recover sibling sessions under the same runtime lock
+
+recoverRuntime(runtime.id, reason):
+    serialize under the same runtime lock:
+        markRuntimeTerminated(runtime.id, reason)
+        for session on runtime.id:
+            try:
+                if task is in_progress:
+                    remediateTaskForDeadRuntime(task, reason)  # existing default decision
+                else: delete the stale session
+            catch: log scrubbed error and continue with the next session
 
 settleSupersededTaskDependents(parent, resume):
     if resume:
@@ -372,7 +517,7 @@ The consumer cross-product has three distinct policies. Pool selection always ap
 | `acceptTask` / `claimOfferedTask` | Re-check invalid affinity and Lead-only authorization on the established offer |
 | `claimTask` / `assignUnassignedTaskPending` | Full eligibility before the atomic pool claim |
 | `getUnassignedTaskIdsForAgent` / HTTP poll | Filter by full eligibility and harness model compatibility inside the paginated scan, before budget admission and claim |
-| `autoAssignPoolTasks` | Select only idle, capable workers that pass full eligibility and can run the task's pinned model |
+| `routePoolTasks` / `autoAssignPoolTasks` | Apply eligibility and harness compatibility to live capacity first, then eligible wake demand when runtime pools are enabled |
 | `escalateStarvedPoolTasks` | Count only registered agents that pass full eligibility and can run the task's pinned model |
 | `resolveLeadOnlyRecoveryAssignment` | Full eligibility for the source candidate and replacement Lead |
 
@@ -386,10 +531,61 @@ Every consumer of the `unassigned` pool calls the **same** `isAgentEligibleForTa
 **Where a `routingAffinity` snapshot comes from** (`buildRoutingAffinityFromAgent(agentId)` snapshots an agent's current `role`/`harnessProvider`/`capabilities`; `createTaskExtended` auto-inherits a parent's `routingAffinity` on `parentTaskId` when the child doesn't set its own, except for the explicit control-plane opt-out above):
 
 1. **`createResumeFollowUp`** (§3) stamps a fresh snapshot from `parent.agentId` on **every** leg — pinned AND pool-fallback — so even a resume that falls to the pool (agent offline/gone/at-capacity, or a pin kill-switch off) is gated. Falls back to the parent's own inherited snapshot when the agent row is already gone.
-2. **`runRebootSweep`**'s retry-child creation (§1) now applies the *same* recoverability gate `createResumeFollowUp` uses for its same-agent pin (row exists, not `offline`, has capacity — via the shared `getPinCandidateAgent` helper) — a recoverable retry is pinned `pending` to the original agent and tagged `reboot-retry-pin`; otherwise it falls to the pool with the snapshot stamped anyway. `getStalePinnedResumes`'s reaper scope (§3) now also covers `reboot-retry-pin`, so an unreclaimed reboot pin escalates to the Lead exactly like a crash/graceful pin (retry children are fresh tasks with no `resume-generation` tag, so the generation budget is 0 at first escalation — expected).
+2. `runRebootSweep` uses `getPinCandidateAgent` and capacity checks to select the original agent, like `createResumeFollowUp`.
+   A reachable agent receives a pending retry tagged `reboot-retry-pin`. Otherwise, the retry enters the pool with its routing affinity.
+   The reaper also covers reboot pins and escalates unclaimed retries to the Lead.
 3. **`send-task`** / **`task-action create`** accept an optional `requiredCapabilities: string[]` — written into a fresh pool task's `routingAffinity` with `role` left unset. Per the predicate above, a capabilities-only snapshot (no `role`) is eligible for nobody but its declaring agent (n/a here — there is none), so such a task always ends up escalated to the Lead by §4's starvation check below; it's a way to *record* a requirement for the Lead's judgment, not to auto-route today.
 
 **Starvation escalation** (`escalateStarvedPoolTasks`, wired into `cleanupStaleResources` — runs every sweep): an `unassigned` task carrying a `routingAffinity`, queued longer than `POOL_AFFINITY_ESCALATION_MIN`, with **zero eligible registered agents** (eligible = passes the predicate **and** `poolTaskRunsOnHarness` for its harness; any status — an offline-but-matching agent still counts as "not starved"; this is "nobody of that role exists", not "everyone's busy right now") gets a Lead `task.pool.starved.decision` follow-up (`createPoolStarvationDecisionTask`, same `taskType: "reroute-decision"` discriminator and idempotency check as §3's `createRerouteDecisionTask` — no `staleResume`/generation budget since the task was never pinned).
+
+### Server routing for runtime pools
+
+`RUNTIME_POOLS_ENABLED` defaults to false. The heartbeat keeps its legacy routing when the flag is disabled.
+Pool routing also requires `MULTI_RUNTIME_ENABLED=true`. Otherwise, routing keeps the legacy behavior and logs one warning at boot.
+Listeners and the timer remain registered while the flag is off. They check both flags before each invocation.
+With both flags enabled, the API routes committed unassigned tasks immediately.
+The task creation listener reads the task because its event omits status and the offered recipient.
+The timer handles grace expiry and missed events independently of the heartbeat.
+Routing creates demand for the supervisor. Routing does not provision runtimes.
+
+```mermaid
+flowchart TD
+  trigger["Creation, release, rejection, timer, heartbeat"] --> flag{"Runtime pools and multi-runtime enabled?"}
+  flag -->|no| legacy["Heartbeat: legacy idle workers and polling gates"]
+  flag -->|yes| reroute["Release expired or circuit-blocked wakes<br/>Release unmarked pool assignments only without runtime, provision, or wakeable pool<br/>Keep human pins"]
+  reroute --> warm{"Eligible live worker with free capacity?"}
+  warm -->|yes| assign["CAS to pending<br/>Publish work nudge after commit"]
+  warm -->|no| grace{"Task age reaches wake grace?"}
+  grace -->|no| queued["Leave unassigned"]
+  grace -->|yes| wake["Enabled provisionable pool, closed circuit<br/>Nonzero runtime capacity and image<br/>Eligible worker with headroom<br/>Most headroom first, ties by name"]
+  wake --> budget{"Budget admission allows assignment?"}
+  budget -->|yes| mark["CAS to pending with pool_wake_at<br/>Supervisor sees demand"]
+  budget -->|no eligible candidate| queued
+```
+
+A busy worker can receive another task if it has an eligible runtime and spare physical and logical capacity.
+Warm runtimes must be active and fresh, with no draining flag or unavailable credentials.
+A null credential report remains eligible. Bound agents require an enabled pool.
+Completed per-task runtimes remain excluded during their exit grace.
+Occupied sessions consume physical slots. A runtime task in progress or review consumes one slot when its session is absent.
+Pending assignments reserve physical slots. Warm assignment checks capacity again within its write transaction.
+An open circuit permits warm routing to healthy runtimes.
+Both tiers apply `isAgentEligibleForTask` and `poolTaskRunsOnHarness`.
+Tier 2 also applies `canClaim`, including the task requester budget.
+A budget refusal skips that agent and tries the next eligible candidate because agent budgets can differ.
+Wake assignments use `pool_wake_at`. They retain the existing routing reason.
+The router releases marked pending wake assignments after the timeout or when their pool circuit opens.
+It also examines agents whose runtime rows record a previous pool, including after unbinding or pool deletion.
+It releases unmarked pending assignments only without an eligible runtime, a provision in progress, or a wakeable pool.
+This covers unbound agents and missing, disabled, or non-wakeable pools.
+Sleeping agents in wakeable pools retain explicit assignments, including between per-task runtimes and during provision backoff.
+The supervisor handles pending demand and its existing attempt-limit failure path.
+Busy eligible runtimes and provisions preserve unmarked assignments.
+The release guards pending status, recipient, wake marker, and human-pin exclusion, so a concurrent claim wins.
+Human pins remain assigned.
+The sweep excludes the released agent for that pass when another eligible wake candidate exists.
+It retries the same agent only when it is the sole candidate and its pool circuit is closed.
+Routing reads snapshots before writing. Each assignment CAS checks task state, agent state, pool state, and current capacity.
 
 ### Pseudocode (current)
 
@@ -418,7 +614,7 @@ failTask(task.id, cascadeDependents=false)                    # then create the 
 
 # reboot-sweep retry child (on each auto-failed in_progress task):
 preferredAgentId = undefined
-cand = getPinCandidateAgent(task.agentId)                   # row exists, not offline
+cand = getPinCandidateAgent(task.agentId)                   # reachable agent
 if cand and activeCount(cand) < cand.maxTasks:
     preferredAgentId = cand.id
 createTaskExtended(task.task, parentTaskId=task.id, agentId=preferredAgentId,
@@ -436,18 +632,45 @@ if retryTaskId:
         log task_dependency_repointed(dep, old=task.id, new=retryTaskId)
 cascadeFailDependents(task.id, "failed")   # whatever still depends on the swept task
 
-# autoAssignPoolTasks, per heartbeat sweep — paginated pool scan (PR #954 fix):
-assignedCount, offset = 0, 0
-while assignedCount < MAX_AUTO_ASSIGN_PER_SWEEP and offset < POOL_SCAN_CAP:
-    batch = getUnassignedPoolTasks(POOL_SCAN_BATCH_SIZE, offset)   # priority DESC, createdAt ASC, rowid ASC
-    if batch is empty: break
-    for task in batch:
-        if assignedCount >= MAX_AUTO_ASSIGN_PER_SWEEP: break
-        worker = first idle worker w/ capacity where isAgentEligibleForTask(w, task)
-                 and poolTaskRunsOnHarness(task, w.harnessProvider)     # pinned model runs here
-        if worker: assign(task, worker); assignedCount += 1        # else: leave queued, keep scanning
-    offset += len(batch)
-    if len(batch) < POOL_SCAN_BATCH_SIZE: break                    # pool exhausted
+# autoAssignPoolTasks calls routePoolTasks({}) each heartbeat sweep.
+# With RUNTIME_POOLS_ENABLED=false, keep the legacy idle-worker scan and gates.
+# With both flags enabled, task.created and task.unassigned request targeted routing.
+# With runtime pools enabled, releaseTask and rejectTask emit task.unassigned after commit.
+# A timer repeats routing every RUNTIME_ROUTING_INTERVAL_MS (default 5000).
+routePoolTasks(taskIds?, now):
+    read pools and agent snapshots without a write transaction
+    if no taskIds and both runtime pools and multi-runtime enabled:
+        for pending task with a wake marker or current/recorded pool agent, excluding human_pinned:
+            if marked wake age >= RUNTIME_WAKE_REROUTE_SEC (default 600)
+               or marked wake's pool circuit is open
+               or unmarked pool assignment has no eligible runtime, provision, or wakeable pool:
+                releaseTask(task, snapshot) if marked, else guarded UPDATE
+                # CAS pending recipient and wake marker, remember old agent
+    warm = non-Lead agents with eligible runtimes and pending + in_progress < maxTasks
+    eligible runtime = active, fresh, not draining, credentials ready or null, pool enabled if bound
+    exclude completed per-task runtimes during exit grace
+    require free physical slots after occupied sessions and pending reservations
+    if runtime pools disabled or multi-runtime disabled:
+        warm = legacy idle workers with capacity
+        require a live runtime only when multi-runtime mode is enabled
+    exclude offline and waiting_for_credentials from warm
+    exclude legacy warm agents at MAX_EMPTY_POLLS
+    scan unassigned tasks by priority, creation time, rowid within heartbeat limits:
+        worker = first warm agent passing eligibility and harness compatibility
+        if no worker and both flags enabled and task age >= RUNTIME_WAKE_GRACE_SEC (default 15):
+            wake = non-Lead agents bound to enabled provisionable pools with closed circuits
+            require maxRuntimes != 0 and an image or resolved image
+            exclude waiting_for_credentials and agents without headroom
+            filter by eligibility and harness compatibility
+            exclude released agent unless it is the only eligible wake candidate
+            order by headroom descending, then name
+            worker = first candidate allowed by canClaim(agent, now, requestedByUserId)
+            if worker: pool_wake_at = now
+        if worker:
+            transaction for warm assignment with both flags enabled, otherwise direct:
+                if warm with both flags: recheck eligible runtime slots minus pending reservations
+                assignUnassignedTaskPending(task, worker, snapshots) # CAS state and capacity
+            reserve one slot                         # pending assignments consume headroom
 
 # HTTP poll auto-claim (getUnassignedTaskIdsForAgent(agent, 5, accept)):
 accept = task -> poolTaskRunsOnHarness(task, agent.harnessProvider)
@@ -478,6 +701,18 @@ escalateStarvedPoolTasks():
 The function dispatches `pre.task.followUp` before it creates the follow-up task. An extension can block creation or modify the description, assignee, priority, and `followUpConfig`.
 
 The resulting task also dispatches `pre.task.create` with origin `followUp`. Both extension events run before any database transaction begins.
+
+### Reachability for sleeping agents
+
+`isAgentReachable(agent)` accepts agents whose status is not offline.
+With runtime pools enabled, it also accepts offline agents bound to enabled provisionable pools with closed circuits.
+Static pools, disabled pools, and pools with open circuits cannot wake sleeping agents.
+
+User MCP ingress can assign work to a reachable sleeping Lead.
+Slack thread follow-ups can return to reachable sleeping workers or a reachable sleeping Lead.
+Lead-only recovery and stale-resume escalation accept reachable sleeping Leads.
+Boot triage excludes pending and offered tasks held by reachable sleeping agents from its orphan list.
+With the flag disabled, these gates retain their previous behavior.
 
 ### `followUpConfig` inheritance
 
@@ -550,7 +785,7 @@ Notes:
 
 - The wait only covers tasks held by workers that pinged in the last 30s. A silent worker's tasks belong to the heartbeat sweep.
 - Workers older than this feature ignore the header, so the API waits the full cap when one holds a task.
-- The drain is opt-in. Enabled, it also fires on an API-only restart (pm2, a Helm roll of the API Deployment, `docker restart`): live workers supersede their in-flight tasks, which would otherwise keep running. Set it only where the API and the workers stop together.
+- The drain is opt-in. Enabled, it also fires on an API-only restart (a local restart, a Helm roll of the API Deployment, `docker restart`): live workers supersede their in-flight tasks, which would otherwise keep running. Set it only where the API and the workers stop together.
 - `API_DRAIN_MAX_MS` plus the API's close time must stay under the orchestrator's stop grace period for the API.
 
 ---
@@ -609,16 +844,12 @@ Notes:
 
 ## Quick reference: env knobs
 
-All of these are read **dynamically** — `heartbeat.ts` exposes them as getter
-functions (`stallThresholdMinutes()`, `maxAutoAssignPerSweep()`,
-`maxResumeGenerations()`, …) rather than module-level `const`s. Module-level
-capture ran before `loadGlobalConfigsIntoEnv()` hydrated `swarm_config` into
-`process.env`, so a value saved from the dashboard's Configuration page was
-ignored even across a restart. Because the sweep re-reads them, a config reload
-now applies immediately to every threshold below **except** the two that size
-the `setInterval` itself (`HEARTBEAT_INTERVAL_MS`, and `HEARTBEAT_DISABLE`
-which decides whether the interval is created at all) — those are read once in
-`src/http/index.ts` after hydration, so they need a restart.
+Heartbeat thresholds use getter functions such as `stallThresholdMinutes()`,
+`maxAutoAssignPerSweep()`, and `maxResumeGenerations()`.
+The sweep reads them dynamically after `loadGlobalConfigsIntoEnv()` hydrates stored configuration.
+Configuration reload applies those thresholds immediately.
+`HEARTBEAT_INTERVAL_MS` and `HEARTBEAT_DISABLE` require a restart because startup reads them when creating the timer.
+Runtime routing, supervisor timers, and controller seeding also require a restart where marked below.
 
 Rollback switches accept `0`/`false` interchangeably (both parse through
 `parseEnvFlag` in `src/utils/env-flag.ts`); `HEARTBEAT_PIN_CRASH_RESUME` and
@@ -632,9 +863,38 @@ Rollback switches accept `0`/`false` interchangeably (both parse through
 | Lead-escalation stall (Case C) | 30 min | `HEARTBEAT_STALL_THRESHOLD_MIN` |
 | Pending-steering stall grace | 5 min | `HEARTBEAT_STEERING_GRACE_MIN` |
 | Stale-resource cleanup | 30 min | `HEARTBEAT_STALE_CLEANUP_MIN` |
+| Runtime pools feature flag (restart to seed controllers) | off | `RUNTIME_POOLS_ENABLED` |
+| Default worker delivery | poll | `RUNTIME_DEFAULT_DELIVERY` |
+| Sleeping-agent wake grace | 15s | `RUNTIME_WAKE_GRACE_SEC` |
+| Pending wake reroute timeout | 600s | `RUNTIME_WAKE_REROUTE_SEC` |
+| Pool routing cadence (restart required) | 5s | `RUNTIME_ROUTING_INTERVAL_MS` |
+| Runtime supervisor cadence (restart required) | 5s | `RUNTIME_SUPERVISOR_INTERVAL_MS` |
+| Worker-reachable API URL | Public API URL | `RUNTIME_WORKER_API_URL` |
+| Seeded Docker socket (restart required) | `DOCKER_HOST` or local socket | `RUNTIME_DOCKER_HOST` |
+| Docker socket fallback | `unix:///var/run/docker.sock` | `DOCKER_HOST` |
+| Docker network fallback | unset | `DOCKER_NETWORK` |
+| Docker extra hosts fallback | unset | `DOCKER_EXTRA_HOSTS` |
+| E2B API endpoint fallback | SDK default | `E2B_API_BASE` |
+| Runtime token lifetime | 168h | `RUNTIME_TOKEN_TTL_HOURS` |
+| Remote controller token lifetime | 90 days | `RUNTIME_CONTROLLER_TOKEN_TTL_DAYS` |
+| Remote controller disconnect grace (§1a) | 120s | `RUNTIME_CONTROLLER_GRACE_SEC` |
+| Runtime registration timeout | 300s | `RUNTIME_PROVISION_TIMEOUT_SEC` |
+| Runtime provision concurrency | 8 | `RUNTIME_PROVISION_CONCURRENCY` |
+| Per-task runtime exit grace | 60s | `RUNTIME_PER_TASK_EXIT_GRACE_SEC` |
+| Runtime provision failure limit | 3 | `RUNTIME_PROVISION_MAX_ATTEMPTS` |
+| Pool circuit failure threshold | 5 | `RUNTIME_CIRCUIT_THRESHOLD` |
+| Pool circuit duration | 10 min | `RUNTIME_CIRCUIT_OPEN_MIN` |
+| Push socket grace | 60s | `RUNTIME_SOCKET_GRACE_SEC` |
+| Runtime token rotation window | 60 min | `RUNTIME_TOKEN_ROTATE_BEFORE_MIN` |
+| E2B lease renewal window | 300s | `RUNTIME_LEASE_RENEW_BEFORE_SEC` |
+| E2B template build timeout | 600s | `RUNTIME_E2B_BUILD_TIMEOUT_SEC` |
+| Continuous runtime rotation window | 600s | `RUNTIME_ROTATE_BEFORE_SEC` |
+| E2B continuous runtime limit | 3600s | `E2B_MAX_CONTINUOUS_SEC` |
 | Runtime liveness window (§1a) | 5 min | `RUNTIME_STALE_THRESHOLD_MIN` |
 | Same-agent liveness window | 30s | `WORKER_LIVENESS_WINDOW_SECONDS` |
 | Worker active-task reconcile cadence (worker env, read at worker start) | 30s | `RUNNER_TASK_RECONCILE_INTERVAL_MS` |
+| Worker delivery override (worker env) | Register response | `SWARM_DELIVERY_MODE` |
+| Push safety fetch cadence (worker env) | 30s | `RUNNER_PUSH_SAFETY_POLL_MS` |
 | Resume-generation cap | 3 | `HEARTBEAT_MAX_RESUME_GENERATIONS` |
 | Resume-pin grace, reaper (`0` = off) | 10 min | `HEARTBEAT_RESUME_PIN_GRACE_MIN` |
 | Same-agent crash pin, rollback (`0` = off) | on | `HEARTBEAT_PIN_CRASH_RESUME` |

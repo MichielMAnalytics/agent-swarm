@@ -11,7 +11,18 @@ test.describe("organization name onboarding", () => {
     await api.post("/api/config/reload", {});
   });
 
-  test.beforeEach(async ({ api }) => {
+  test.beforeEach(async ({ api, page, swarm, seed }) => {
+    const reset = await page.request.patch(`${swarm.apiUrl}/api/inbox-state`, {
+      headers: { Authorization: `Bearer ${swarm.apiKey}` },
+      data: {
+        userId: seed?.user.id,
+        itemType: "notification",
+        itemId: "organization_name",
+        status: "open",
+      },
+    });
+    expect(reset.ok()).toBe(true);
+    await api.put("/api/onboarding", { action: "dismiss" });
     await api.put("/api/config", {
       scope: "global",
       key: "SWARM_ORG_NAME",
@@ -58,10 +69,7 @@ test.describe("organization name onboarding", () => {
     await clean.assertClean();
   });
 
-  test("treats whitespace as unset and allows deferring until the next visit", async ({
-    page,
-    api,
-  }) => {
+  test("treats whitespace as unset and defers for this tab session", async ({ page, api }) => {
     await api.put("/api/config", {
       scope: "global",
       key: "SWARM_ORG_NAME",
@@ -79,7 +87,12 @@ test.describe("organization name onboarding", () => {
     await dialog.getByRole("button", { name: "Later" }).click();
     await expect(dialog).not.toBeVisible();
     await page.reload();
-    await expect(dialog).toBeVisible();
+    await expect(page.getByRole("link", { name: "Settings", exact: true })).toBeVisible();
+    await expect(dialog).not.toBeVisible();
+    const freshTab = await page.context().newPage();
+    await freshTab.goto("/");
+    await expect(freshTab.getByRole("dialog", { name: "Name your organization" })).toBeVisible();
+    await freshTab.close();
   });
 
   test("keeps an explicitly configured Swarm name", async ({ page, api, clean }) => {
@@ -126,6 +139,7 @@ test.describe("organization name onboarding", () => {
       await released;
       await route.continue();
     });
+    await page.evaluate(() => sessionStorage.clear());
     await page.reload();
     await expect(page.getByRole("link", { name: "Settings", exact: true })).toBeVisible();
     await expect(dialog).not.toBeVisible();
@@ -155,6 +169,89 @@ test.describe("organization name onboarding", () => {
       expect(errors).toEqual([]);
     });
   }
+
+  test("a fresh Home load asks for the name only with the dialog", async ({ page }) => {
+    await page.goto("/");
+    const dialog = page.getByRole("dialog", { name: "Name your organization" });
+    await expect(dialog).toBeVisible();
+    await expect(page.getByText("Name it to compare your swarm")).toHaveCount(0);
+    // Only the Slack invite counts while the dialog asks; the org item waits for Later.
+    const bell = page.locator('button[aria-label^="Notifications"]');
+    await expect(bell).toHaveAttribute("aria-label", "Notifications, 1 unread");
+    await dialog.getByRole("button", { name: "Later" }).click();
+    await expect(bell).toHaveAttribute("aria-label", "Notifications, 2 unread");
+    await expect(page.getByText("Name it to compare your swarm")).toHaveCount(0);
+  });
+
+  test("after Later the bell carries the org nudge, marks it read, and dismisses it", async ({
+    page,
+    api,
+    seed,
+  }) => {
+    await page.goto("/");
+    await page
+      .getByRole("dialog", { name: "Name your organization" })
+      .getByRole("button", { name: "Later" })
+      .click();
+    await page.getByRole("button", { name: "Notifications, 2 unread", exact: true }).click();
+    await expect(page.getByText("Add a name for your dashboard and messages.")).toBeVisible();
+    await expect
+      .poll(async () => {
+        const { items } = await api.get<{
+          items: Array<{ itemId: string; readAt: string | null }>;
+        }>(`/api/inbox-state?itemType=notification&userId=${seed?.user.id}`);
+        return items.find((item) => item.itemId === "organization_name")?.readAt;
+      })
+      .toBeTruthy();
+    await page.getByRole("link", { name: "Add name", exact: true }).click();
+    await expect(page).toHaveURL(/settings\/configuration\?search=SWARM_ORG_NAME/);
+    await expect(page.getByText("Add a name for your dashboard and messages.")).not.toBeVisible();
+    await page.getByRole("button", { name: /^Notifications/ }).click();
+    await page.getByRole("button", { name: "Dismiss", exact: true }).first().click();
+    await expect(page.getByText("Add a name for your dashboard and messages.")).not.toBeVisible();
+    await page.reload();
+    await page.getByRole("button", { name: /^Notifications/ }).click();
+    await expect(page.getByText("Add a name for your dashboard and messages.")).not.toBeVisible();
+  });
+
+  test("a fresh non-Home load shows the bell nudge without an automatic naming dialog", async ({
+    page,
+  }) => {
+    await page.goto("/tasks");
+    await page.getByRole("button", { name: /^Notifications/ }).click();
+    await expect(page.getByText("Add a name for your dashboard and messages.")).toBeVisible();
+    await expect(page.getByRole("dialog", { name: "Name your organization" })).not.toBeVisible();
+  });
+
+  test("members do not see an org notification", async ({ page }) => {
+    await page.route("**/api/users**", async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      await route.fulfill({
+        json: {
+          ...body,
+          users: body.users.map((user: Record<string, unknown>) => ({ ...user, role: "member" })),
+        },
+      });
+    });
+    await page.goto("/tasks");
+    await page.getByRole("button", { name: /^Notifications/ }).click();
+    await expect(page.getByText("Add a name for your dashboard and messages.")).not.toBeVisible();
+    await expect(page.getByRole("dialog", { name: "Name your organization" })).not.toBeVisible();
+  });
+
+  test("a configured name removes the notification", async ({ page, api }) => {
+    await api.put("/api/config", {
+      scope: "global",
+      key: "SWARM_ORG_NAME",
+      value: "Acme",
+      isSecret: false,
+    });
+    await api.post("/api/config/reload", {});
+    await page.goto("/tasks");
+    await page.getByRole("button", { name: /^Notifications/ }).click();
+    await expect(page.getByText("Add a name for your dashboard and messages.")).not.toBeVisible();
+  });
 
   test("save failure remains retryable and dismissible", async ({ page }) => {
     await page.route("**/api/config/reload", (route) =>

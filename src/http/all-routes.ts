@@ -21,7 +21,6 @@ import "./config";
 import "./context";
 import "./core";
 import "./db-query";
-import "./ecosystem";
 
 import "./api-keys";
 import "./events";
@@ -64,10 +63,16 @@ import "./stats";
 import "./status";
 import "./tasks";
 import "./task-templates";
+import "./telemetry-ui";
 import "./trackers/jira";
 import "./trackers/linear";
+import "./used-by";
+import "./fleet-benchmark";
 import "./users";
 import "./webhooks";
 import "./workflow-events";
 import "./workflows";
 import "./x";
+
+import "./runtime-pools";
+import "./controllers-connect";

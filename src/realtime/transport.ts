@@ -9,8 +9,14 @@ import { getApiKey } from "../utils/api-key";
 import { extractAndVerifyCookie } from "../utils/page-session";
 import type { HttpRequestAuth } from "../utils/request-auth-context";
 import { scrubSecrets } from "../utils/secret-scrubber";
+import { registerSessionTokenConnection } from "../utils/session-token-connections";
 import { authorizeRoomNamespace, resolveRoomNamespace } from "./auth";
 import { realtimeBus } from "./bus";
+import {
+  addWorkerSubscription,
+  channelTopic,
+  removeWorkerSubscription as unregisterWorkerSubscription,
+} from "./channels";
 import { RoomOperationSchema } from "./document";
 import {
   applyRoomUpdate,
@@ -22,6 +28,8 @@ import {
   roomView,
 } from "./rooms";
 import { redeemRealtimeTicket } from "./tickets";
+
+export { channelTopic, listSubscribedWorkerAgents } from "./channels";
 
 const nameSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/);
 const messageSchema = z.object({
@@ -61,7 +69,9 @@ type Viewer = { userId: string; name: string; kind: "user" | "guest" | "agent" }
 type AuthenticatedConnection = {
   identity: Identity;
   me: Viewer;
+  runtimeId?: string;
   expiresAt: number | undefined;
+  sessionToken?: { tokenId: string; check: () => Promise<void> };
 };
 
 function header(req: IncomingMessage, name: string): string | undefined {
@@ -73,12 +83,31 @@ function identityFromHttpAuth(
   req: IncomingMessage,
   auth: HttpRequestAuth,
 ): AuthenticatedConnection {
-  const agentId = auth.kind === "operator" ? header(req, "x-agent-id") : undefined;
+  if (auth.kind === "controller") throw new Error("Controller tokens cannot use realtime");
+  if (auth.kind === "agent") {
+    const agentId = header(req, "x-agent-id");
+    const runtimeId = header(req, "x-runtime-instance-id");
+    if (agentId !== undefined && agentId !== auth.agentId)
+      throw new Error("X-Agent-ID does not match token");
+    if (auth.runtimeId && runtimeId !== undefined && runtimeId !== auth.runtimeId)
+      throw new Error("X-Runtime-Instance-ID does not match token");
+  }
+  const agentId =
+    auth.kind === "agent"
+      ? auth.agentId
+      : auth.kind === "operator"
+        ? header(req, "x-agent-id")
+        : undefined;
   const guestId = `guest-${crypto.randomUUID()}`;
   return {
+    runtimeId:
+      auth.kind === "agent" && auth.runtimeId
+        ? auth.runtimeId
+        : header(req, "x-runtime-instance-id"),
     identity: {
       agentId,
-      sourceTaskId: header(req, "x-source-task-id"),
+      sourceTaskId:
+        auth.kind === "agent" ? (auth.taskId ?? undefined) : header(req, "x-source-task-id"),
       userId: auth.kind === "user" ? auth.userId : undefined,
       isOperator: auth.kind === "operator",
     } satisfies Identity,
@@ -87,11 +116,27 @@ function identityFromHttpAuth(
       name: auth.kind === "user" ? auth.user.name : (agentId ?? `Guest ${guestId.slice(-6)}`),
       kind: auth.kind === "user" ? "user" : agentId ? "agent" : "guest",
     } as Viewer,
-    expiresAt: undefined,
+    expiresAt: auth.kind === "agent" ? Date.parse(auth.expiresAt) : undefined,
+    ...(auth.kind === "agent"
+      ? {
+          sessionToken: {
+            tokenId: auth.tokenId,
+            check: async () => {
+              const current = await resolveHttpRequestAuth(req, getApiKey(), {
+                touchSessionToken: false,
+              });
+              if (current?.kind !== "agent" || current.tokenId !== auth.tokenId)
+                throw new Error("Session token revoked or expired");
+            },
+          },
+        }
+      : {}),
   };
 }
 
 async function authenticate(req: IncomingMessage): Promise<AuthenticatedConnection> {
+  const auth = await resolveHttpRequestAuth(req, getApiKey());
+  if (auth?.kind === "controller") throw new Error("Controller tokens cannot use realtime");
   const url = new URL(req.url ?? "/", "http://localhost");
   const ticket = url.searchParams.get("ticket");
   if (ticket) {
@@ -123,13 +168,8 @@ async function authenticate(req: IncomingMessage): Promise<AuthenticatedConnecti
       expiresAt: session ? session.exp * 1000 : undefined,
     };
   }
-  const auth = await resolveHttpRequestAuth(req, getApiKey());
   if (!auth) throw new Error("Authentication required");
   return identityFromHttpAuth(req, auth);
-}
-
-function channelTopic(namespace: string, name: string): string {
-  return `channel:${JSON.stringify([namespace, name])}`;
 }
 
 export function attachRealtimeTransport(server: Server): () => void {
@@ -139,6 +179,7 @@ export function attachRealtimeTransport(server: Server): () => void {
   // Authentication precedes upgrade on both direct and proxied paths.
   const onUpgrade = (req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer) => {
     const path = req.url?.split("?")[0];
+    if (path === "/api/controllers/connect") return;
     if (
       closing ||
       (path !== "/@swarm/realtime" && path !== "/api/realtime") ||
@@ -157,7 +198,7 @@ export function attachRealtimeTransport(server: Server): () => void {
           socket.destroy();
           return;
         }
-        return wss.handleUpgrade(req, socket, head, (ws) => connect(ws, auth));
+        return wss.handleUpgrade(req, socket, head, (ws) => connect(ws, auth, auth.runtimeId));
       }, rejectUpgrade)
       .catch(rejectUpgrade)
       .finally(() => {
@@ -176,7 +217,17 @@ export function attachRealtimeTransport(server: Server): () => void {
   };
 }
 
-function connect(ws: WebSocket, auth: Awaited<ReturnType<typeof authenticate>>): void {
+function connect(
+  ws: WebSocket,
+  auth: Awaited<ReturnType<typeof authenticate>>,
+  runtimeId?: string,
+): void {
+  const unregisterToken = auth.sessionToken
+    ? registerSessionTokenConnection(auth.sessionToken.tokenId, () =>
+        ws.close(1008, "Session token revoked"),
+      )
+    : undefined;
+  void auth.sessionToken?.check().catch(() => ws.close(1008, "Session token revoked or expired"));
   const rooms = new Map<string, { room: LiveRoom; version: number; stop: () => void }>();
   const channels = new Map<string, () => void>();
   const pending = new Map<number, number>();
@@ -187,6 +238,15 @@ function connect(ws: WebSocket, auth: Awaited<ReturnType<typeof authenticate>>):
   let queuedMessages = 0;
   let alive = true;
   let closed = false;
+  let workerAgentId: string | undefined;
+
+  const removeWorkerSubscription = () => {
+    if (!workerAgentId) return;
+    const agentId = workerAgentId;
+    workerAgentId = undefined;
+    unregisterWorkerSubscription(agentId, ws);
+    realtimeBus.publish("worker.socket.disconnected", { agentId, runtimeId });
+  };
 
   const send = (payload: Record<string, unknown>) => {
     if (ws.readyState !== WebSocket.OPEN) return;
@@ -215,7 +275,9 @@ function connect(ws: WebSocket, auth: Awaited<ReturnType<typeof authenticate>>):
     rooms.delete(key);
   };
   const checkSession = async () => {
-    if (auth.expiresAt && Date.now() >= auth.expiresAt) throw new Error("Page session expired");
+    await auth.sessionToken?.check();
+    if (auth.expiresAt && Date.now() >= auth.expiresAt)
+      throw new Error(auth.sessionToken ? "Session token expired" : "Page session expired");
     if (auth.identity.pageId && !(await getPage(auth.identity.pageId)))
       throw new Error("Page no longer exists");
     if (auth.identity.userId && (await findUserById(auth.identity.userId))?.status !== "active")
@@ -251,7 +313,7 @@ function connect(ws: WebSocket, auth: Awaited<ReturnType<typeof authenticate>>):
       if (namespace.startsWith("presence:comb:") && msg.name !== "default") {
         throw new Error("Comb presence uses the default room");
       }
-      const denied = await authorizeRoomNamespace(namespace, auth.identity, msg.op);
+      const denied = await authorizeRoomNamespace(namespace, auth.identity, msg.op, msg.name);
       if (denied) throw new Error(typeof denied === "string" ? denied : "Forbidden");
       if (closed) return;
       const key = roomTopic(namespace, msg.name);
@@ -265,11 +327,17 @@ function connect(ws: WebSocket, auth: Awaited<ReturnType<typeof authenticate>>):
               send({ type: "channel", name: msg.name, namespace, data }),
             ),
           );
+          if (namespace.startsWith("worker:")) {
+            workerAgentId = auth.identity.agentId!;
+            addWorkerSubscription(workerAgentId, ws);
+            realtimeBus.publish("worker.socket.connected", { agentId: workerAgentId, runtimeId });
+          }
         }
       } else if (msg.op === "unsubscribe") {
         const topic = channelTopic(namespace, msg.name);
         channels.get(topic)?.();
         channels.delete(topic);
+        if (namespace.startsWith("worker:")) removeWorkerSubscription();
       } else if (msg.op === "publish") {
         if (Buffer.byteLength(JSON.stringify(msg.data) ?? "null") > 64 * 1024)
           throw new Error("Channel payload exceeds 64 KiB");
@@ -411,13 +479,22 @@ function connect(ws: WebSocket, auth: Awaited<ReturnType<typeof authenticate>>):
   });
   ws.on("error", () => ws.close(1011, "Connection failed"));
   const timer = setInterval(() => {
-    if (!alive || (auth.expiresAt && Date.now() >= auth.expiresAt)) {
-      ws.close(1008, "Session expired or peer unavailable");
+    if (!alive) {
+      ws.close(1008, "Peer unavailable");
+      return;
+    }
+    if (auth.expiresAt && Date.now() >= auth.expiresAt) {
+      ws.close(1008, auth.sessionToken ? "Session token expired" : "Page session expired");
       return;
     }
     alive = false;
     ws.ping();
-    void checkSession().catch(() => ws.close(1008, "Session no longer valid"));
+    void checkSession().catch(() =>
+      ws.close(
+        1008,
+        auth.sessionToken ? "Session token revoked or expired" : "Session no longer valid",
+      ),
+    );
     for (const { room } of rooms.values()) {
       const meta = room.awareness.meta.get(clientId);
       if (meta) meta.lastUpdated = Date.now();
@@ -425,11 +502,13 @@ function connect(ws: WebSocket, auth: Awaited<ReturnType<typeof authenticate>>):
   }, 15_000);
   timer.unref();
   ws.on("close", () => {
+    unregisterToken?.();
     closed = true;
     clearInterval(timer);
     for (const key of rooms.keys()) leave(key);
     for (const stop of channels.values()) stop();
     channels.clear();
+    removeWorkerSubscription();
   });
   send({ type: "hello", me: auth.me });
 }

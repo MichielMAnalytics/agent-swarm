@@ -10,6 +10,7 @@
 
 import type { Agent, RuntimeInstance, RuntimeInstanceStatus, SwarmConfig } from "../types";
 import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
+import { scrubSecrets } from "../utils/secret-scrubber";
 import {
   getActiveTaskCount,
   getAgentById,
@@ -19,6 +20,7 @@ import {
   updateAgentStatus,
   upsertSwarmConfig,
 } from "./db";
+import { revokeRuntimeTokensForRuntime } from "./users";
 
 // ─── Logical task policy ─────────────────────────────────────────────────────
 
@@ -124,6 +126,16 @@ export async function upsertSwarmConfigWithPolicyMirror(
 interface RuntimeInstanceRow {
   id: string;
   agent_id: string;
+  pool_id: string | null;
+  controller_id: string | null;
+  external_handle: string | null;
+  provision_attempts: number;
+  provision_error: string | null;
+  provision_requested_at: string | null;
+  draining: number;
+  idle_since: string | null;
+  lease_expires_at: string | null;
+  task_id: string | null;
   status: string;
   reported_slots: number;
   credential_ready: number | null;
@@ -147,6 +159,16 @@ function rowToRuntimeInstance(row: RuntimeInstanceRow): RuntimeInstance {
   return {
     id: row.id,
     agentId: row.agent_id,
+    poolId: row.pool_id ?? null,
+    controllerId: row.controller_id ?? null,
+    externalHandle: row.external_handle ? JSON.parse(row.external_handle) : null,
+    provisionAttempts: row.provision_attempts ?? 0,
+    provisionError: row.provision_error ?? null,
+    provisionRequestedAt: row.provision_requested_at ?? null,
+    draining: row.draining === 1,
+    idleSince: row.idle_since ?? null,
+    leaseExpiresAt: row.lease_expires_at ?? null,
+    taskId: row.task_id ?? null,
     status: row.status as RuntimeInstanceStatus,
     reportedSlots: row.reported_slots,
     credentialReady: row.credential_ready === null ? null : row.credential_ready === 1,
@@ -188,8 +210,13 @@ export async function upsertRuntimeInstance(instance: {
   metadata?: Record<string, unknown> | null;
 }): Promise<RuntimeInstance | null> {
   const metadataJson = instance.metadata ? JSON.stringify(instance.metadata) : null;
-  const row = await getDbClient().get<RuntimeInstanceRow>(
-    `INSERT INTO runtime_instances (id, agent_id, status, reported_slots, metadata)
+  const row = await getDbClient().transaction(async (tx) => {
+    const provisioning = await tx.get<{ id: string }>(
+      "SELECT id FROM runtime_instances WHERE id = ? AND status = 'provisioning' AND agent_id = ?",
+      [instance.id, instance.agentId],
+    );
+    const row = await tx.get<RuntimeInstanceRow>(
+      `INSERT INTO runtime_instances (id, agent_id, status, reported_slots, metadata)
      VALUES (?, ?, 'active', ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        status = 'active',
@@ -199,8 +226,20 @@ export async function upsertRuntimeInstance(instance: {
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
      WHERE runtime_instances.agent_id = excluded.agent_id
      RETURNING *`,
-    [instance.id, instance.agentId, instance.reportedSlots, metadataJson],
-  );
+      [instance.id, instance.agentId, instance.reportedSlots, metadataJson],
+    );
+    if (row?.pool_id && provisioning) {
+      await tx.run(
+        "UPDATE agents SET runtime_provision_attempts = 0, runtime_provision_retry_at = NULL WHERE id = ?",
+        [row.agent_id],
+      );
+      await tx.run(
+        "UPDATE runtime_pools SET consecutive_failures = 0, circuit_open_until = NULL WHERE id = ?",
+        [row.pool_id],
+      );
+    }
+    return row;
+  });
   return row ? rowToRuntimeInstance(row) : null;
 }
 
@@ -210,6 +249,45 @@ export async function getRuntimeInstanceById(id: string): Promise<RuntimeInstanc
     [id],
   );
   return row ? rowToRuntimeInstance(row) : null;
+}
+
+export async function insertProvisioningRuntime(instance: {
+  id: string;
+  agentId: string;
+  poolId: string;
+  controllerId: string;
+  reportedSlots?: number;
+}): Promise<RuntimeInstance> {
+  const row = await getDbClient().get<RuntimeInstanceRow>(
+    `INSERT INTO runtime_instances (id, agent_id, pool_id, controller_id, status,
+       reported_slots, provision_requested_at)
+     VALUES (?, ?, ?, ?, 'provisioning', ?, ?) RETURNING *`,
+    [
+      instance.id,
+      instance.agentId,
+      instance.poolId,
+      instance.controllerId,
+      instance.reportedSlots ?? 1,
+      new Date().toISOString(),
+    ],
+  );
+  return rowToRuntimeInstance(row!);
+}
+
+export async function markRuntimeTerminated(id: string, reason: string): Promise<void> {
+  await getDbClient().transaction(async () => {
+    const runtime = await getRuntimeInstanceById(id);
+    if (!runtime) return;
+    await markRuntimeInstanceOffline(id, runtime.agentId);
+    if (runtime.status === "provisioning") {
+      await getDbClient().run("UPDATE runtime_instances SET provision_error = ? WHERE id = ?", [
+        scrubSecrets(reason),
+        id,
+      ]);
+    }
+    await reconcileAgentStatusFromRuntimes(runtime.agentId);
+    await revokeRuntimeTokensForRuntime(id);
+  });
 }
 
 /**
@@ -383,9 +461,8 @@ export async function agentsWithLiveRuntime(): Promise<Set<string>> {
  * refreshing their rows, and expiring them would offline agents that are
  * running perfectly well under legacy semantics.
  *
- * Deleting the retired rows rather than keeping them is deliberate. Runtime
- * identity is per boot, so retaining them would grow the table once per boot
- * per agent forever; nothing reads a runtime after it stops being live.
+ * Stale offline pool rows retain the existing pruning behavior. Active pooled
+ * rows and provisioning rows stay available for infrastructure reconciliation.
  *
  * Expiry deliberately does NOT touch active_sessions. Runtime liveness and
  * in-flight work liveness answer different questions: a stale runtime row is
@@ -414,15 +491,18 @@ export async function expireStaleRuntimeInstances(): Promise<{
     // work is dead is decided separately (see doc comment above).
     const stale = await tx.query<{ id: string; agent_id: string }>(
       `SELECT id, agent_id FROM runtime_instances
-       WHERE status = 'active' AND last_seen_at < ?`,
+       WHERE status = 'active' AND last_seen_at < ? AND pool_id IS NULL`,
       [cutoff],
     );
 
-    // Prune every row past the window, closed ones included. Runtime identity
-    // is per boot, so keeping them would add a row per boot per agent forever
-    // and nothing reads a runtime once it stops being live.
-    const pruned = (await tx.run("DELETE FROM runtime_instances WHERE last_seen_at < ?", [cutoff]))
-      .changes;
+    // Active pool rows retain handles for supervisor infrastructure reconciliation.
+    // Provisioning rows use the supervisor timeout rather than the ping cutoff.
+    const pruned = (
+      await tx.run(
+        "DELETE FROM runtime_instances WHERE last_seen_at < ? AND status != 'provisioning' AND (pool_id IS NULL OR status = 'offline')",
+        [cutoff],
+      )
+    ).changes;
 
     // Recompute every affected agent from what survived: losing the only
     // ready runtime has to park the agent even though a waiting sibling is
@@ -434,4 +514,13 @@ export async function expireStaleRuntimeInstances(): Promise<{
     }
     return { expired: stale.length, agentsOffline, pruned };
   });
+}
+
+export async function listRuntimeInstancesForPool(poolId: string): Promise<RuntimeInstance[]> {
+  return (
+    await getDbClient().query<RuntimeInstanceRow>(
+      "SELECT * FROM runtime_instances WHERE pool_id = ? ORDER BY created_at",
+      [poolId],
+    )
+  ).map(rowToRuntimeInstance);
 }

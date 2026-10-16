@@ -571,7 +571,8 @@ export async function handleHook(): Promise<void> {
     try {
       await fetch(`${getBaseUrl()}/close`, {
         method: "POST",
-        headers: mcpConfig.headers,
+        headers: { ...mcpConfig.headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ runtimeShutdown: false }),
       });
     } catch {
       // Silently fail
@@ -1335,32 +1336,6 @@ export async function handleHook(): Promise<void> {
       break;
 
     case "Stop":
-      // Clean up any artifact tunnels managed by PM2
-      try {
-        const pm2ListOutput = await Bun.$`pm2 jlist 2>/dev/null || echo "[]"`.text();
-        const pm2Processes = JSON.parse(pm2ListOutput.trim());
-        const artifactProcesses = (pm2Processes as { name?: string }[]).filter((p) =>
-          p.name?.startsWith("artifact-"),
-        );
-
-        for (const proc of artifactProcesses) {
-          try {
-            await Bun.$`pm2 delete ${proc.name!}`.quiet();
-          } catch {
-            // Process might already be stopped
-          }
-        }
-      } catch {
-        // Non-fatal: PM2 might not be available
-      }
-
-      // Save PM2 processes before shutdown (for container restart persistence)
-      try {
-        await Bun.$`pm2 save`.quiet();
-      } catch {
-        // PM2 not available or no processes - silently ignore
-      }
-
       // Sync CLAUDE.md (then restore its backup), identity files, and setup script back to database
       if (agentInfo?.id) {
         try {
@@ -1393,7 +1368,7 @@ export async function handleHook(): Promise<void> {
         );
       }
 
-      // Mark the agent as offline
+      // Close this session. The runner owns pooled runtime termination.
       await close();
       // NOTE: Task completion is NOT handled here intentionally.
       // The runner wrapper (src/commands/runner.ts) handles ensuring tasks are

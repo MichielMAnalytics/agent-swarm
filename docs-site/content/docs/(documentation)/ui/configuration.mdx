@@ -21,6 +21,15 @@ Each row shows a source chip when the underlying environment variable is set on 
 
 ## Groups
 
+### Runtime tokens
+
+The **Security & access** group includes `RUNTIME_TOKEN_TTL_HOURS`, with a default of `168` hours.
+The value must exceed zero and cannot exceed 168 hours.
+A change applies to newly minted runtime tokens without a restart.
+Runtime tokens can read their own resolved secrets and mint tokens for their assigned tasks.
+Task tokens cannot outlive their parent runtime token.
+Runtime revocation revokes its task tokens and closes their realtime sockets.
+
 ### Dev mode
 
 Set `SWARM_DEV_MODE=true` on the API server, or enable **Dev mode** under **Harness & tools**.
@@ -49,11 +58,13 @@ SDK selection is incompatible with an effective Claude Bridge or legacy bridge b
 | Harness & tools | `CLAUDE_TRUST_PRESEED`, `SCRIPTS_ONLY_MCP`, `TASK_TOOL_PRELOAD_ENABLED`, `PI_TOOL_DEFERRAL`, `PI_CODEMODE`, `CURSOR_NATIVE_SYSTEM_PROMPT`, `PI_CODEMODE_MODELS`, `TASK_TOOL_MANIFESTS`, `MULTI_RUNTIME_ENABLED`, `CAPABILITIES`, `SWARM_ENABLED_TOOLS`, `OPENROUTER_BASE_URL`, `OPENROUTER_APP_ATTRIBUTION`, `WORKER_API_READY_TIMEOUT_SECONDS`, `CONTEXT_PREAMBLE_MAX_TOKENS`, `MODEL_WINDOW_EXHAUSTED_POLICY`, `MODEL_LATEST_SOAK_DAYS`, `MODEL_AUTO_UPGRADE` |
 | Model tiers | `MODEL_TIER_<PROVIDER>_<TIER>` for every provider with a tier mapping |
 | Database | `DB_QUERY_BOUNDED_ENABLED`, `DB_QUERY_HTTP_BUDGET_MS`, `DB_QUERY_HTTP_MAX_ROWS`, `DB_QUERY_MCP_BUDGET_MS`, `DB_QUERY_MCP_MAX_ROWS`, `DB_QUERY_CONCURRENCY_CAP`, `SESSION_LOG_RETENTION_DAYS`, `AGENT_LOG_RETENTION_DAYS`, `EVENTS_RETENTION_DAYS`, `DB_RETENTION_DRY_RUN`, `DB_RETENTION_TICK_BUDGET_MS`, `DB_RETENTION_CATCHUP_INTERVAL_MS`, `DB_RETENTION_MAX_STATEMENT_MS` |
-| Integrations | `SLACK_MODE`, `SLACK_DISABLE`, `SLACK_ALLOW_DEV_SOCKET_MODE`, `SLACK_RENDER_V2`, `SLACK_RENDER_V2_DELEGATION`, `SLACK_CONCLUSION_SETTLE_SEC`, `SLACK_CONCLUSION_TIMEOUT_MIN`, `SLACK_TREE_STALL_MIN`, `GITHUB_DISABLE`, `LINEAR_DISABLE`, `SLACK_ALERTS_CHANNEL`, `AGENT_FS_REQUEST_TIMEOUT_MS`, `COMB_ENABLED`, `AGENT_FS_PUBLIC_URL`, `SLACK_REACTION_ACCEPTED`, `SLACK_REACTION_BUFFERED`, `SLACK_REACTION_NOW`, `SLACK_REACTION_STEERED`, `SLACK_REACTION_COMPLETED`, `SLACK_REACTION_FAILED` |
+| Integrations | `SLACK_MODE`, `SLACK_DISABLE`, `SLACK_ALLOW_DEV_SOCKET_MODE`, `SLACK_RENDER_V2`, `SLACK_RENDER_V2_DELEGATION`, `SLACK_CONCLUSION_SETTLE_SEC`, `SLACK_CONCLUSION_TIMEOUT_MIN`, `SLACK_TREE_STALL_MIN`, `GITHUB_DISABLE`, `LINEAR_DISABLE`, `SLACK_ALERTS_CHANNEL`, `SLACK_BLOCK_EXTERNAL_CHANNELS`, `AGENT_FS_REQUEST_TIMEOUT_MS`, `COMB_ENABLED`, `CHAT_SDK_ENABLED`, `CHAT_SDK_BUFFER_MS`, `AGENT_FS_PUBLIC_URL`, `SLACK_REACTION_ACCEPTED`, `SLACK_REACTION_BUFFERED`, `SLACK_REACTION_NOW`, `SLACK_REACTION_STEERED`, `SLACK_REACTION_COMPLETED`, `SLACK_REACTION_FAILED` |
 | Security & access | `RBAC_ENABLED`, `BUDGET_ADMISSION_DISABLED`, `EXTENSION_ALLOW_INLINE_INSTALL`, `MCP_OAUTH_ALLOW_PRIVATE_HOSTS`, `CORS_ALLOWED_ORIGINS` (custom list replaces hosted/dev defaults; unset or blank uses defaults) |
 | Workflows & scheduler | `WORKFLOW_MAX_ITERATIONS`, `SCHEDULER_INTERVAL_MS`, `SCRIPT_EXECUTOR`, `SCRIPT_QUICKJS_POOL_SIZE`, `SEED_AUTOMATIONS_ENABLED`, `EXTENSION_HANDLER_TIMEOUT_MS`, `EXTENSION_MAX_CONSECUTIVE_FAILURES` |
 | Telemetry & observability | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_EXPORT_API_LOGS`, `ANONYMIZED_TELEMETRY` |
-| Branding & URLs | `SWARM_ORG_NAME`, `SWARM_BRAND_COLOR`, `DASHBOARD_URL` |
+| Branding & URLs | `SWARM_ORG_NAME`, `SWARM_ORG_WEBSITE`, `SWARM_BRAND_COLOR`, `SWARM_ORG_LOGO_URL`, `DASHBOARD_URL`, and the "Show our logo on agent-swarm.dev" switch (`SWARM_USED_BY_CONSENT`) |
+
+`SWARM_ORG_WEBSITE` takes a website and stores its bare hostname (`https://www.example.com/about` saves as `example.com`). When `SWARM_ORG_LOGO_URL` is empty, saving a website fills it with that site's logo, served by the telemetry proxy (`https://proxy.desplega.sh/v1/logo?domain=<host>`) so no logo key ever reaches your install. A logo you set yourself is never replaced. The "Show our logo on agent-swarm.dev" switch sends your organization name and website to Desplega when you flip it, telemetry on or off, and a person approves each logo before it appears. Turning `ANONYMIZED_TELEMETRY` back on applies without a restart.
 
 Harness **provider and model selection are deliberately absent** from this page — they are configured per agent. A global value would silently become the default for every agent in the swarm, so those knobs live on each agent's own configuration instead. `OPENROUTER_BASE_URL` is a deployment-wide routing endpoint rather than a model choice, which is why it does belong here.
 
@@ -68,6 +79,22 @@ Settings with deeper behavior link out to the relevant guide (for example the [t
 `APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS` (default 7) sets how many days a pending approval request with no explicit timeout waits before the heartbeat sets it to `cancelled`. A request with an explicit timeout is never auto-cancelled; it becomes `timeout` when its deadline passes. `0` turns auto-cancellation off.
 
 ![Editing a configuration group](/ui/configuration-group.png)
+
+## Remote controllers
+
+`RUNTIME_CONTROLLER_TOKEN_TTL_DAYS` sets the lifetime for new remote controller tokens.
+The default is 90 days. Accepted values are 1 through 3650 whole days.
+Minting a token revokes the previous token and closes its connection.
+Changing this setting does not change existing tokens.
+
+`RUNTIME_CONTROLLER_GRACE_SEC` sets the grace after a remote controller disconnects.
+The default is 120 seconds. Accepted values are 0 through 86400 whole seconds.
+The API stops provisioning through the controller and preserves its runtimes during the grace.
+After expiry, the supervisor marks those runtimes offline, revokes their runtime tokens, and remediates their active tasks.
+Failed reconnect handshakes do not extend the disconnect grace.
+Both settings apply without an API restart.
+
+Controller credentials belong on the controller host. They are absent from the configuration catalog.
 
 ## Heartbeat checklist gate
 
@@ -251,6 +278,12 @@ Enabling or disabling a seeded workflow or schedule yourself is not an edit: lat
 updating it and keep your setting. Editing anything else, including its params, stops updates for
 that automation.
 
+## Chat SDK
+
+`CHAT_SDK_ENABLED` (boolean, default `false`, applies on save) starts the [Chat SDK channel](/docs/integrations/chat-sdk) for the adapters defined in `CHAT_SDK_ADAPTERS`. Edit `CHAT_SDK_ADAPTERS` (JSON, applies on save) on the Chat SDK card under **Settings → Integrations**, not on this page.
+
+`CHAT_SDK_BUFFER_MS` (number, default `10000`, 1 to 600000) is how long the channel waits for more messages in a thread before it creates one task from them. A message that starts with `!now` creates the task at once. A new value applies when no thread is waiting.
+
 ## Comb (beta)
 
 `COMB_ENABLED` (default `false`) turns on [Comb](/docs/ui/comb), the agent-fs review space in the dashboard. It needs agent-fs: the flag has no effect until `AGENT_FS_API_URL` is set. With the flag on, the sidebar shows a **Comb** item and `/file` opens the swarm drive. Each person connects their own agent-fs identity in the browser. The key stays in that browser and never reaches the swarm API. Saving the flag auto-reloads, and the dashboard picks it up on its next status poll (30 seconds at most).
@@ -264,6 +297,36 @@ and dashboard users can install an extension from a manifest and files sent in t
 from the predefined catalog. Workers stay catalog-only. The value is read on every request, so it needs no
 restart. An enabled extension is trusted code in the API process, and a lead can change this key, so
 read [inline install](/docs/guides/extensions#inline-install) before turning it on.
+
+## Config rows in agent env
+
+Every config row has an **Export to agent env** flag (`exportToEnv`). Workers copy a row into the
+environment their harness and its shell tools inherit only when the flag is on. A row with the flag
+off never appears in `env`, `printenv`, or `/proc/<pid>/environ` in an agent shell, and a copy set
+on the container itself is dropped too.
+
+- **Default.** New rows export. Rows that existed before the flag shipped kept exporting, except a
+  short deny list of keys only the API server reads (integration webhook and signing secrets, OAuth
+  client secrets, the API's own agent-fs key, script connection secrets).
+- **Always restricted.** Some keys can never export: `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET`,
+  `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITLAB_WEBHOOK_SECRET`,
+  `LINEAR_CLIENT_SECRET`, `LINEAR_SIGNING_SECRET`, `JIRA_CLIENT_SECRET`, `JIRA_WEBHOOK_TOKEN`,
+  `AZURE_DEVOPS_WEBHOOK_SECRET`, `AGENTMAIL_WEBHOOK_SECRET`, `API_AGENT_FS_API_KEY`, and every
+  `connection.<slug>.secret`. The config API rejects `exportToEnv: true` for them.
+- **Keep harness keys on.** Harness credentials (`CLAUDE_CODE_OAUTH_TOKEN`, `OPENROUTER_API_KEY`,
+  and the other providers), `GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`, `AZURE_DEVOPS_TOKEN`, and the
+  agent's own `AGENT_FS_API_KEY` are read from the environment by the harness, `gh`, `glab`, `az`,
+  and git. Turning them off breaks auth.
+- **When it applies.** Workers re-read the flag for every new task, so a change reaches the next
+  harness session without a restart. The worker process itself picks it up on its next restart.
+
+The flag controls the environment only. It does not change who may read the value through
+`get-config` or the API. An agent that needs a row kept out of its env uses it server-side: a script
+connection or a script credential binding sends the secret on the agent's behalf, so the value never
+enters the agent's context.
+
+Set the flag in the dashboard (the **Export to agent env** switch on a config entry), with
+`set-config` (`exportToEnv: false`), or with `PUT /api/config`.
 
 ## Access control
 
@@ -279,3 +342,102 @@ If you are contributing a new operator-facing environment variable to Agent Swar
 editable here. Set it to `false` in the API server environment and restart all
 API replicas to require operator/user authentication for extension enable,
 disable, and version activation. See [extension trust controls](/docs/guides/extensions#lead-activation-and-trust).
+
+## Runtime pools
+
+`RUNTIME_POOLS_ENABLED` enables runtime pool and controller configuration. It defaults to `false`.
+See the [runtime pools guide](/docs/guides/runtime-pools) for topology, lifecycle, controllers, and troubleshooting.
+Restart the API after enabling it to seed built-in controllers and the default static pool.
+Agents remain unbound until an operator assigns a pool.
+Pool routing requires `MULTI_RUNTIME_ENABLED=true`. Otherwise, the heartbeat uses legacy routing.
+The API checks the pool flag for each routing event and timer tick.
+
+| Setting | Default | Behavior |
+|---------|---------|----------|
+| `RUNTIME_WAKE_GRACE_SEC` | `15` | Seconds to wait for a live worker before selecting a sleeping pool agent. |
+| `RUNTIME_WAKE_REROUTE_SEC` | `600` | Seconds before the router releases a pending wake assignment and tries another eligible agent. |
+| `RUNTIME_ROUTING_INTERVAL_MS` | `5000` | Milliseconds between routing sweeps. Restart the API after changing this value. |
+| `RUNTIME_SUPERVISOR_INTERVAL_MS` | `5000` | Milliseconds between runtime demand and lifecycle checks. Restart the API after changing this value. |
+| `RUNTIME_PROVISION_CONCURRENCY` | `8` | Maximum simultaneous provisions. Pool caps, demand reservations, retry deadlines, and circuit checks still apply. |
+| `RUNTIME_PER_TASK_EXIT_GRACE_SEC` | `60` | Seconds after task completion before forced per-task teardown. Runner shutdown permits earlier teardown after cost, logs, and context reporting. |
+| `RUNTIME_PROVISION_TIMEOUT_SEC` | `300` | Seconds before registration timeout terminates the runtime and counts one failure. |
+| `RUNTIME_PROVISION_MAX_ATTEMPTS` | `3` | Provision failures before the oldest ready pending task fails and notifies the Lead. |
+| `RUNTIME_CIRCUIT_THRESHOLD` | `5` | Consecutive provision failures before the pool stops provisioning. |
+| `RUNTIME_CIRCUIT_OPEN_MIN` | `10` | Minutes before the pool permits one trial provision. Failure opens the circuit again. |
+| `RUNTIME_SOCKET_GRACE_SEC` | `60` | Seconds after the last push socket disconnect before a provider check. Running runtimes keep their tasks. |
+| `RUNTIME_TOKEN_ROTATE_BEFORE_MIN` | `60` | Minutes before token expiry to drain busy runtimes or terminate idle runtimes. |
+| `RUNTIME_LEASE_RENEW_BEFORE_SEC` | `300` | Seconds before E2B lease expiry to renew wanted runtimes. |
+| `RUNTIME_E2B_BUILD_TIMEOUT_SEC` | `600` | Maximum E2B template build duration in seconds. Builds run independently of supervisor ticks. |
+| `RUNTIME_ROTATE_BEFORE_SEC` | `600` | Seconds before the continuous runtime limit to drain E2B runtimes. |
+| `E2B_MAX_CONTINUOUS_SEC` | `3600` | E2B continuous limit in seconds. Use `3600` for Hobby or `86400` for Pro. Controller configuration overrides this default. |
+
+Retries wait 30, 90, then 180 seconds. Agent rows persist retry counts and deadlines across API restarts.
+First registration resets the agent retry state and closes the pool circuit.
+Healthy re-registration leaves the circuit unchanged. No ready demand or an open circuit clears agent retry state.
+The supervisor stores scrubbed errors on the runtime, pool, and controller.
+The circuit blocks provisioning and assignments to sleeping pool agents. Existing runtimes continue their tasks.
+After the circuit expires, one provision may await registration. Registration closes the circuit. Failure opens the circuit again.
+The supervisor starts provisions with bounded concurrency. A failure preserves sibling provisions and prevents further requests for that agent during the tick.
+Per-task runtimes preserve their sessions and tokens until runner shutdown or the exit grace deadline.
+Task completion starts the grace period. It does not immediately terminate the runtime.
+Token rotation drains runtimes before termination. A later tick checks activity again before terminating an idle runtime.
+Demand can create replacements within the pool cap. The supervisor terminates drained runtimes after their tasks finish.
+The failure settings accept positive integers. Socket grace also accepts zero for an immediate provider check.
+These settings apply after configuration reload. The supervisor interval requires a restart.
+
+E2B pools provision with pool `ttlSec` or a 900-second lease, bounded by provider limits.
+Renewal stores E2B's actual expiry. If the API stops, the lease bounds sandbox lifetime.
+Continuous rotation uses the same drain path as token rotation. Busy runtimes finish their tasks before termination.
+An unplanned pause resumes a wanted idle runtime. A pause during active work triggers task recovery and sandbox termination.
+E2B requires `E2B_API_KEY` and an HTTPS worker URL. Controller readiness records configuration failures.
+Pool creation succeeds with a warning while the builtin E2B controller remains unready.
+Plain images name E2B templates. A `docker://` image builds and caches a template during first provision.
+Custom images must extend the slim or full Agent Swarm worker image. Changing the image clears the template cache.
+Per-task pools pay for the boot sequence on every sandbox start.
+See the [runtime provider runbook](https://github.com/desplega-ai/agent-swarm/blob/main/runbooks/runtime-providers.md#e2b) for details.
+
+The routing and wake settings accept nonnegative integers. Zero permits an immediate wake or reroute.
+For the routing interval, zero uses the default. Positive values below 500 use 500 milliseconds.
+Negative or invalid deployment values use the default interval.
+
+The **Harness & tools** group also exposes these API settings for provisioned workers:
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `RUNTIME_WORKER_API_URL` | Public API URL | API URL reachable by provisioned workers. Controller `WORKER_API_URL` overrides it. |
+| `RUNTIME_DOCKER_HOST` | `DOCKER_HOST` or local socket | Unix socket stored when seeding the built-in Docker controller. Restart required. Existing controller configuration takes precedence. |
+| `E2B_API_BASE` | SDK default | Custom E2B API endpoint. Controller configuration overrides this fallback. |
+| `DOCKER_HOST` | `unix:///var/run/docker.sock` | Unix socket for built-in Docker controllers. Restart the API to seed a new controller. |
+| `DOCKER_NETWORK` | Unset | Docker network for provisioned workers. |
+| `DOCKER_EXTRA_HOSTS` | Unset | Comma-separated `host:address` entries. Docker also includes `host.docker.internal:host-gateway`. |
+
+Stored global settings override deployment environment values after configuration reload.
+Built-in controllers read the API process environment as their Docker fallback.
+Public controller configuration overrides this fallback. Encrypted controller configuration overrides public controller configuration.
+Worker URLs use controller `WORKER_API_URL`, then `RUNTIME_WORKER_API_URL`, then the public API URL.
+At startup, Docker seeding checks `RUNTIME_DOCKER_HOST`, then `DOCKER_HOST`, then `/var/run/docker.sock`.
+An explicit `RUNTIME_DOCKER_HOST` seeds a controller even when Docker is offline.
+Otherwise, the selected Docker host must identify an existing Unix socket.
+Seeding stores `RUNTIME_DOCKER_HOST` as controller configuration, so it overrides the `DOCKER_HOST` fallback.
+
+`RUNTIME_DEFAULT_DELIVERY` selects `poll` or `push` for pools without an explicit delivery mode.
+It also applies to agents without a bound pool. The API returns `poll` while runtime pools are disabled.
+Workers receive the resolved mode during registration. Pool changes apply at the next registration.
+
+Set these variables in the worker environment:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SWARM_DELIVERY_MODE` | Registration response | Override delivery with `poll` or `push`. |
+| `RUNNER_PUSH_SAFETY_POLL_MS` | `30000` | Positive interval in milliseconds between safety fetches for push delivery. |
+| `RUNNER_FINISH_RETRY_MAX_SEC` | `300` | Positive limit in seconds for final progress and finish retries after network errors or HTTP 5xx. HTTP 4xx are not retried. |
+
+Push workers fetch work on nudges and safety ticks. They also fetch current state after reconnecting.
+They retain a 30-second ping interval and temporarily use poll delivery after 60 seconds without a socket.
+A lead uses poll delivery when the API enables `LEAD_MONITOR_CHANNELS=true`.
+The runner honors this restriction, including when a worker override requests push, and logs a warning.
+Workers log their active delivery mode at startup and whenever it changes.
+The log identifies the registration response or the worker override that selected the mode.
+
+`RUNTIME_DEFAULT_DELIVERY` defaults to `poll`. A pool's explicit mode takes precedence.
+Controller credentials remain encrypted in the controller record. Workers do not receive them through global configuration.

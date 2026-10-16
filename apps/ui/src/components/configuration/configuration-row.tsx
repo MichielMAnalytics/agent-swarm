@@ -1,5 +1,6 @@
 import { ExternalLink, RotateCcw } from "lucide-react";
 import { useEffect, useState } from "react";
+import { ImagePreview } from "@/components/shared/image-preview";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -67,9 +68,13 @@ export interface ConfigurationRowProps {
   entry: ConfigCatalogEntry;
   /** Whether the key is currently present in the API server's `process.env`. */
   inEnv: boolean;
+  /** Rewrite a typed value before it is saved (e.g. a URL to its bare hostname). */
+  normalize?: (value: string) => string;
+  /** Called after a value is sent for saving. */
+  onSave?: (value: string) => void;
 }
 
-export function ConfigurationRow({ entry, inEnv }: ConfigurationRowProps) {
+export function ConfigurationRow({ entry, inEnv, normalize, onSave }: ConfigurationRowProps) {
   const { config, value: savedValue, save, reset, isSaving, isLoading } = useSwarmConfig(entry.key);
   const inputId = `config-${entry.key}`;
   const isPending = isSaving || isLoading;
@@ -133,7 +138,10 @@ export function ConfigurationRow({ entry, inEnv }: ConfigurationRowProps) {
   }, [config]);
 
   function handleSave(value: string) {
-    save(value, { description: entry.description });
+    const next = normalize ? normalize(value) : value;
+    save(next, { description: entry.description });
+    if (next !== value) setDraft(next);
+    onSave?.(next);
   }
 
   function cancelOverride() {
@@ -177,6 +185,19 @@ export function ConfigurationRow({ entry, inEnv }: ConfigurationRowProps) {
     </Tooltip>
   ) : (
     <span aria-hidden="true" className="hidden h-8 w-8 shrink-0 sm:block" />
+  );
+
+  const textInput = (
+    <Input
+      id={inputId}
+      type={entry.kind === "number" ? "number" : "text"}
+      step={entry.kind === "number" ? "any" : undefined}
+      value={draft}
+      placeholder={entry.placeholder ?? entry.defaultValue}
+      disabled={isPending}
+      onChange={(event) => setDraft(event.target.value)}
+      className="min-w-0 w-full font-mono text-xs"
+    />
   );
 
   return (
@@ -412,16 +433,14 @@ export function ConfigurationRow({ entry, inEnv }: ConfigurationRowProps) {
                     className="w-10 shrink-0 p-1"
                   />
                 )}
-                <Input
-                  id={inputId}
-                  type={entry.kind === "number" ? "number" : "text"}
-                  step={entry.kind === "number" ? "any" : undefined}
-                  value={draft}
-                  placeholder={entry.placeholder ?? entry.defaultValue}
-                  disabled={isPending}
-                  onChange={(event) => setDraft(event.target.value)}
-                  className="min-w-0 w-full font-mono text-xs"
-                />
+                {entry.preview === "image" ? (
+                  <div className="flex w-full min-w-0 items-center gap-2">
+                    <ImagePreview src={draft} label={entry.label} />
+                    {textInput}
+                  </div>
+                ) : (
+                  textInput
+                )}
               </>
             )}
             <Button

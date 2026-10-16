@@ -72,12 +72,6 @@ export const DEFERRED_TOOLS = new Set([
   "retry-workflow-run",
   "cancel-workflow-run",
 
-  // Services (4)
-  "register-service",
-  "unregister-service",
-  "list-services",
-  "update-service-status",
-
   // Config (7)
   "set-config",
   "list-config",
@@ -126,6 +120,14 @@ export const DEFERRED_TOOLS = new Set([
   "unregister-kapso-number",
   "send-whatsapp-message",
   "reply-whatsapp-message",
+
+  // Chat SDK (6)
+  "chat-reply",
+  "chat-post",
+  "chat-open-dm",
+  "chat-read-thread",
+  "register-chat-channel",
+  "unregister-chat-channel",
 
   // Tracker (7)
   "tracker-status",
@@ -214,6 +216,12 @@ export const DEFERRED_TOOLS = new Set([
   "extension-catalog",
   "extension-install",
   "extension-list",
+  "runtime-pool-list",
+  "runtime-pool-upsert",
+  "runtime-pool-delete",
+  "runtime-pool-bind-agent",
+  "runtime-pool-create-agent",
+  "runtime-controller-list",
 
   // External command routes (1)
   "swarm_x",

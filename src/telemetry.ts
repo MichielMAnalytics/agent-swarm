@@ -24,6 +24,8 @@ import {
 } from "./telemetry-context";
 import type { PropsFor, TelemetryEventName } from "./telemetry-contract";
 import { isEnvFlagEnabled } from "./utils/env-flag";
+import { getNodeEnv } from "./utils/node-env";
+import { normalizeOrgWebsite } from "./utils/org-website";
 import { getCurrentRequestUserId } from "./utils/request-auth-context";
 
 export type { TelemetryActor } from "./telemetry-context";
@@ -45,6 +47,22 @@ const TIMEOUT_MS = 5_000;
 
 let installationId: string | null = null;
 let installedAt: string | null = null;
+/** An event the ingest endpoint answered with 2xx. */
+export interface TelemetryIngested {
+  installationId: string;
+  occurredAt: string;
+}
+let ingestObserver: ((ingested: TelemetryIngested) => void) | null = null;
+
+/**
+ * Called after each event the ingest endpoint accepted from this process.
+ * The API server registers it to record the proxy's observation start.
+ */
+export function setTelemetryIngestObserver(
+  observer: ((ingested: TelemetryIngested) => void) | null,
+): void {
+  ingestObserver = observer;
+}
 /** Org ID resolved at init (env, then `telemetry_org_id`). `SWARM_ORG_ID` is re-read per event. */
 let cachedOrgId: string | undefined;
 /** Email domain of the org's admin, set by the API server (`setTelemetryOrgDomain`). */
@@ -571,7 +589,7 @@ function getTelemetryEnvironment(): string {
 
   // Do not default from NODE_ENV: shipped Bun/npm installs can report
   // "development" even when the operator did not choose a telemetry cohort.
-  if (process.env.NODE_ENV === "test") return "test";
+  if (getNodeEnv() === "test") return "test";
   return "production";
 }
 
@@ -591,18 +609,35 @@ export function track<E extends SwarmEventName>(options: TrackOptions<E>): void 
   );
 }
 
+/**
+ * Relay an event the dashboard asked the API to send (`POST /api/telemetry/ui-event`).
+ * The route validates the name and properties against the catalog first, so this
+ * takes them untyped. `emitter` is the catalog `source` of the event (`ui` for
+ * most), so the envelope names the surface the event happened on.
+ */
+export function trackRelayed(
+  event: string,
+  properties: Record<string, unknown>,
+  options: { actor?: TelemetryActor; emitter: string },
+): void {
+  emit(event, properties, undefined, options.actor, options.emitter);
+}
+
 /** The untyped sender behind `track` and the typed `telemetry.*` wrappers. */
 function emit(
   event: string,
   properties: Record<string, unknown>,
   metadata?: Record<string, unknown>,
   actor?: TelemetryActor,
+  emitter: string = source,
 ): void {
   if (!isTelemetryEnabled() || !installationId) return;
   maybeRefreshOrgIdentity();
   const orgId = currentOrgId();
   if (!orgId) return;
   try {
+    const occurredAt = new Date().toISOString();
+    const sentFor = installationId;
     const isCloud = cachedIsCloud || isCloudDeployment();
     const orgIdentity = getOrgIdentity();
     const userId = actor?.userId?.trim() || undefined;
@@ -610,14 +645,15 @@ function emit(
       schema_version: 2 as const,
       product: PRODUCT,
       event,
-      occurred_at: new Date().toISOString(),
-      source,
+      occurred_at: occurredAt,
+      source: emitter,
       actor_mode: "anonymous" as const,
       actor_anonymous_id: installationId,
       context: buildContext({
         orgId,
         orgName: orgIdentity.organization_name,
         orgDomain: cachedOrgDomain,
+        orgWebsite: normalizeOrgWebsite(process.env.SWARM_ORG_WEBSITE),
         installationId,
         actor: userId ? { userId, role: actor?.role ?? roleResolver?.(userId) ?? null } : undefined,
         isCloud,
@@ -677,7 +713,11 @@ function emit(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(TIMEOUT_MS),
-    }).catch(() => {});
+    })
+      .then((response) => {
+        if (response.ok) ingestObserver?.({ installationId: sentFor, occurredAt });
+      })
+      .catch(() => {});
   } catch {
     // Never throw
   }
@@ -690,6 +730,7 @@ function emit(
 export function _resetTelemetryStateForTests(): void {
   installationId = null;
   installedAt = null;
+  ingestObserver = null;
   source = "unknown";
   cachedIsCloud = false;
   cachedIsE2b = false;

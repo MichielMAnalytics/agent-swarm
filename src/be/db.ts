@@ -136,6 +136,13 @@ import {
   CODEX_AUTH_WATCH_NAMESPACE,
   codexAuthBenchMarkerKey,
 } from "../utils/codex-auth-failure";
+import {
+  defaultExportToEnv,
+  effectiveExportToEnv,
+  envExportRestrictedError,
+  isEnvExportRestrictedKey,
+} from "../utils/config-env-export";
+import { MASKED_SECRET_VALUE } from "../utils/config-secrets";
 import { deriveProviderFromKeyType } from "../utils/credentials";
 import type { RateLimitWindowTelemetry } from "../utils/error-tracker";
 import { extractGitHubPullRequestUrls } from "../utils/github-pull-request";
@@ -147,6 +154,7 @@ import {
 } from "../utils/identity-field-budget";
 import { activeModelBlock, type ModelFamily } from "../utils/model-rate-limit-windows";
 import { getCurrentRequestUserId } from "../utils/request-auth-context";
+import { isRuntimePoolsEnabled } from "../utils/runtime-pools-flag";
 import {
   registerSensitiveKeyName,
   type ScrubbedText,
@@ -203,8 +211,14 @@ import { scrubJsonValue } from "./scrub-json";
 import { openSealedJson, sealedJsonForDisplay, sealJson } from "./sealed-json";
 import { configSecretName, registerStoredSecret } from "./secret-registry";
 import { promotePendingSteeringForTask } from "./steering";
-import { isInternalConfigKey, isReservedConfigKey, reservedKeyError } from "./swarm-config-guard";
+import {
+  isInternalConfigKey,
+  isReservedConfigKey,
+  reservedKeyError,
+  teamsSdkEnvKeysSql,
+} from "./swarm-config-guard";
 import { emitTaskStarted } from "./task-lifecycle-events";
+import { publishWorkerConfigNudge, publishWorkerNudge } from "./worker-nudges";
 import { defineWorkflowPayload, type WorkflowPayloadView } from "./workflow-replay";
 
 export {
@@ -289,17 +303,21 @@ export {
   findTaskByGitHub,
   findTaskByVcs,
   getAgentCurrentTask,
+  getAgentWorkingOnContextKey,
   getAgentWorkingOnThread,
   getAllTasks,
   getChildTasks,
   getCompletedSlackTasks,
   getInProgressSlackTasks,
   getInProgressTasksByContextKey,
+  getLatestActiveTaskByContextKey,
   getLatestActiveTaskInThread,
+  getLatestLeadTaskByContextKey,
   getLatestLeadTaskInThread,
   getLatestScriptRunStepTaskByContextKey,
   getLatestTaskByContextKey,
   getMostRecentTaskInThread,
+  getPendingChatRelayTasks,
   getPendingSlackRelayTasks,
   getRecentlyFinishedWorkerTasks,
   getSlackTasksMissingTree,
@@ -310,13 +328,19 @@ export {
   getTasksByAgentId,
   getTasksByStatus,
   getTasksCount,
+  giveUpStaleChatRelays,
   hasNonTerminalRerouteDecisionChild,
   hasNonTerminalResumeChild,
   isLinearTrackerContextKey,
+  markChatRelayAttempted,
+  markChatRelayDelivered,
+  markChatRelayGivenUp,
   markFinalizedSlackRelaysDelivered,
   markSlackRelayAttempted,
   markSlackRelayDelivered,
   markTasksNotified,
+  type PendingChatRelay,
+  recordChatRelayError,
   resetTasksNotified,
   type TaskFilters,
 } from "./db/tasks/read";
@@ -779,7 +803,8 @@ export async function getSlackOutcomeMessage(taskId: string): Promise<SlackMessa
  *
  * The join is `agent_tasks.parentTaskId` — `defer-task` sets it on the
  * schedule and `createStandaloneScheduleTask` passes it through, so the
- * wake-up task points back at the task whose card announced the wait.
+ * wake-up task points back at the task whose card announced the wait. Follow
+ * subsequent re-defers to the latest wake, keeping the original card open.
  * `deferredAt` (not the `deferred` tag) identifies the deferring task,
  * because the wake-up task inherits the tag.
  */
@@ -787,15 +812,30 @@ export async function getResolvableDeferralOutcomes(
   limit = 50,
 ): Promise<{ card: SlackMessageRecord; deferredTaskId: string; wakeTaskId: string }[]> {
   const rows = await getDbClient().query<SlackMessageRow & { wake_task_id: string }>(
-    `SELECT card.*, wake.id AS wake_task_id
-       FROM slack_messages card
-       JOIN agent_tasks deferred ON deferred.id = card.task_id
-       JOIN agent_tasks wake ON wake.parentTaskId = deferred.id AND wake.taskType = 'deferred'
+    `WITH RECURSIVE chain(card_id, task_id) AS (
+         SELECT card.id, deferred.id FROM slack_messages card
+         JOIN agent_tasks deferred ON deferred.id = card.task_id
+         WHERE card.kind = 'outcome' AND deferred.deferredAt IS NOT NULL
+           AND card.deferral_resolved_at IS NULL AND card.finalized_at IS NOT NULL
+           AND card.ts NOT LIKE 'pending:%'
+         UNION
+         SELECT chain.card_id, wake.id FROM chain
+         JOIN agent_tasks parent ON parent.id = chain.task_id AND parent.deferredAt IS NOT NULL
+         JOIN agent_tasks wake ON wake.parentTaskId = parent.id AND wake.taskType = 'deferred'
+       )
+       SELECT card.*, wake.id AS wake_task_id
+       FROM chain
+       JOIN slack_messages card ON card.id = chain.card_id
+       JOIN agent_tasks wake ON wake.id = chain.task_id AND wake.id != card.task_id
        WHERE card.kind = 'outcome'
          AND card.finalized_at IS NOT NULL
          AND card.deferral_resolved_at IS NULL
          AND card.ts NOT LIKE 'pending:%'
-         AND deferred.deferredAt IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM agent_tasks child
+           WHERE child.parentTaskId = wake.id AND child.taskType = 'deferred'
+         )
+         AND (wake.deferredAt IS NULL OR wake.finishedAt > card.updated_at)
          AND wake.status IN ('completed', 'failed', 'cancelled')
        ORDER BY wake.finishedAt ASC
        LIMIT ?`,
@@ -1966,6 +2006,11 @@ export async function createSteeringMessage(
   );
   if (!row) throw new Error("Failed to create steering message");
 
+  getDbClient().afterCommit(async () => {
+    const task = await getTaskById(args.taskId);
+    if (task?.agentId) publishWorkerNudge(task.agentId, { kind: "steer", taskId: args.taskId });
+  });
+
   try {
     await createLogEntry({
       eventType: "task_steering",
@@ -3017,17 +3062,26 @@ export async function claimTask(taskId: string, agentId: string): Promise<AgentT
   return result;
 }
 
-export async function releaseTask(taskId: string): Promise<AgentTask | null> {
-  const task = await getTaskById(taskId);
+export async function releaseTask(
+  taskId: string,
+  wakeSnapshot?: AgentTask,
+): Promise<AgentTask | null> {
+  const task = wakeSnapshot ?? (await getTaskById(taskId));
   if (!task) return null;
   // Allow releasing both 'pending' (directly assigned) and 'in_progress' (pool-claimed) tasks
   if (task.status !== "pending" && task.status !== "in_progress") return null;
 
   const now = new Date().toISOString();
   const row = await getDbClient().get<AgentTaskRow>(
-    `UPDATE agent_tasks SET agentId = NULL, status = 'unassigned', lastUpdatedAt = ?
-       WHERE id = ? AND status IN ('pending', 'in_progress') RETURNING *`,
-    [now, taskId],
+    `UPDATE agent_tasks SET agentId = NULL, status = 'unassigned', lastUpdatedAt = ?, pool_wake_at = NULL
+       WHERE id = ? AND status IN ('pending', 'in_progress')
+       ${wakeSnapshot ? "AND status = 'pending' AND agentId = ? AND pool_wake_at = ? AND COALESCE(routing_reason, '') != 'human_pinned'" : ""}
+       RETURNING *`,
+    [
+      now,
+      taskId,
+      ...(wakeSnapshot ? [wakeSnapshot.agentId ?? null, wakeSnapshot.poolWakeAt ?? null] : []),
+    ],
   );
 
   if (row) {
@@ -3040,6 +3094,15 @@ export async function releaseTask(taskId: string): Promise<AgentTask | null> {
         newValue: "unassigned",
       });
     } catch {}
+    // The sweep routes released wakes itself, preserving its exclusion of the old agent.
+    if (isRuntimePoolsEnabled() && !wakeSnapshot)
+      getDbClient().afterCommit(() => {
+        void import("../workflows/event-bus")
+          .then(({ workflowEventBus }) => workflowEventBus.emit("task.unassigned", { taskId }))
+          .catch((error) =>
+            console.error("[db] Routing event failed:", scrubSecrets(String(error))),
+          );
+      });
   }
 
   return row ? rowToAgentTask(row) : null;
@@ -3091,6 +3154,7 @@ export async function acceptTask(taskId: string, agentId: string): Promise<Agent
         newValue: "pending",
       });
     } catch {}
+    getDbClient().afterCommit(() => publishWorkerNudge(agentId, { kind: "work", taskId }));
   }
 
   return row ? rowToAgentTask(row) : null;
@@ -3111,7 +3175,7 @@ export async function rejectTask(
   const row = await getDbClient().get<AgentTaskRow>(
     `UPDATE agent_tasks SET
         status = 'unassigned', offeredTo = NULL, offeredAt = NULL,
-        rejectionReason = ?, lastUpdatedAt = ?
+        rejectionReason = ?, lastUpdatedAt = ?, pool_wake_at = NULL
        WHERE id = ? AND status IN ('offered', 'reviewing') RETURNING *`,
     [reason ?? null, now, taskId],
   );
@@ -3127,6 +3191,14 @@ export async function rejectTask(
         metadata: reason ? { reason } : undefined,
       });
     } catch {}
+    if (isRuntimePoolsEnabled())
+      getDbClient().afterCommit(() => {
+        void import("../workflows/event-bus")
+          .then(({ workflowEventBus }) => workflowEventBus.emit("task.unassigned", { taskId }))
+          .catch((error) =>
+            console.error("[db] Routing event failed:", scrubSecrets(String(error))),
+          );
+      });
   }
 
   return row ? rowToAgentTask(row) : null;
@@ -3306,19 +3378,30 @@ export async function releaseStaleReviewingTasks(timeoutMinutes: number = 30): P
  * matters — `runtimeStaleThresholdMinutes()` / `RUNTIME_STALE_THRESHOLD_MIN`
  * for multi-runtime expiry, or immediate for an explicit close — so no
  * separate timeout knob is introduced here.
+ * When runtime pools are enabled, the supplied reachability predicate preserves
+ * offers to wakeable or provisioning agents without a DB import of runtime-pools.
  */
-export async function releaseStaleOfferedTasksForOfflineAgents(): Promise<number> {
+export async function releaseStaleOfferedTasksForOfflineAgents(
+  isReachable?: (agent: Agent) => Promise<boolean>,
+): Promise<number> {
   const now = new Date().toISOString();
+  const reachable: string[] = [];
+  if (isRuntimePoolsEnabled() && isReachable) {
+    for (const agent of await getAllAgents()) {
+      if (agent.status === "offline" && (await isReachable(agent))) reachable.push(agent.id);
+    }
+  }
 
   const result = await getDbClient().run(
     `UPDATE agent_tasks
      SET status = 'unassigned', offeredTo = NULL, offeredAt = NULL, lastUpdatedAt = ?
      WHERE status = 'offered'
        AND offeredTo IS NOT NULL
+       ${reachable.length ? `AND offeredTo NOT IN (${reachable.map(() => "?").join(",")})` : ""}
        AND NOT EXISTS (
          SELECT 1 FROM agents WHERE agents.id = agent_tasks.offeredTo AND agents.status != 'offline'
        )`,
-    [now],
+    [now, ...reachable],
   );
 
   return result.changes;
@@ -3935,6 +4018,12 @@ export async function postMessage(
     }
   }
 
+  getDbClient().afterCommit(() => {
+    for (const mentionedAgentId of new Set(targetMentions)) {
+      publishWorkerNudge(mentionedAgentId, { kind: "work" });
+    }
+  });
+
   // Only create tasks when /task prefix is used
   if (isTaskMessage && targetMentions.length > 0) {
     const sender = agentId ? await getAgentById(agentId) : null;
@@ -4307,7 +4396,8 @@ export async function releaseStaleMentionProcessing(timeoutMinutes: number = 30)
 }
 
 // ============================================================================
-// Service Operations (PM2/background services)
+// Service Operations (removed PM2 service registry; the table and these
+// accessors stay until a drop migration lands)
 // ============================================================================
 
 type ServiceRow = {
@@ -4752,6 +4842,7 @@ function rowToSessionCost(row: SessionCostRow): SessionCost {
 }
 
 export interface CreateSessionCostInput {
+  id?: string;
   sessionId: string;
   taskId?: string;
   agentId: string;
@@ -4787,7 +4878,7 @@ export interface CreateSessionCostInput {
 }
 
 export async function createSessionCost(input: CreateSessionCostInput): Promise<SessionCost> {
-  const id = crypto.randomUUID();
+  const id = input.id ?? crypto.randomUUID();
   const costSource: SessionCostSource = input.costSource ?? "harness";
   const reasoningOutputTokens = input.reasoningOutputTokens ?? 0;
   const thinkingTokens = input.thinkingTokens ?? 0;
@@ -4801,7 +4892,8 @@ export async function createSessionCost(input: CreateSessionCostInput): Promise<
          costSource, harnessCostUsd, cacheWrite5mTokens, cacheWrite1hTokens,
          modelBreakdown, createdAt
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+       ON CONFLICT(id) DO NOTHING`,
     [
       id,
       input.sessionId,
@@ -4826,29 +4918,11 @@ export async function createSessionCost(input: CreateSessionCostInput): Promise<
     ],
   );
 
-  return {
+  const row = await getDbClient().get<SessionCostRow>("SELECT * FROM session_costs WHERE id = ?", [
     id,
-    sessionId: input.sessionId,
-    taskId: input.taskId,
-    agentId: input.agentId,
-    totalCostUsd: input.totalCostUsd,
-    inputTokens: input.inputTokens ?? 0,
-    outputTokens: input.outputTokens ?? 0,
-    cacheReadTokens: input.cacheReadTokens ?? 0,
-    cacheWriteTokens: input.cacheWriteTokens ?? 0,
-    reasoningOutputTokens,
-    thinkingTokens,
-    durationMs: input.durationMs,
-    numTurns: input.numTurns,
-    model: input.model,
-    isError: input.isError ?? false,
-    costSource,
-    harnessCostUsd: input.harnessCostUsd ?? null,
-    cacheWrite5mTokens: input.cacheWrite5mTokens ?? null,
-    cacheWrite1hTokens: input.cacheWrite1hTokens ?? null,
-    modelBreakdown: input.modelBreakdown ?? null,
-    createdAt: new Date().toISOString(),
-  };
+  ]);
+  if (!row) throw new Error("Session cost record is missing after insertion.");
+  return rowToSessionCost(row);
 }
 
 export async function getSessionCostsByTaskId(taskId: string, limit = 500): Promise<SessionCost[]> {
@@ -6290,6 +6364,7 @@ type SwarmConfigRow = {
   createdAt: string;
   lastUpdatedAt: string;
   encrypted: number; // SQLite boolean: 0 = plaintext, 1 = AES-256-GCM ciphertext
+  exportToEnv?: number; // SQLite boolean; absent only on pre-215 test schemas
 };
 
 type SwarmConfigLookupRow = {
@@ -6318,6 +6393,7 @@ function rowToSwarmConfig(row: SwarmConfigRow): SwarmConfig {
       createdAt: row.createdAt,
       lastUpdatedAt: row.lastUpdatedAt,
       encrypted: isEncrypted,
+      exportToEnv: effectiveExportToEnv(row.key, row.exportToEnv !== 0),
     };
   }
 
@@ -6344,6 +6420,7 @@ function rowToSwarmConfig(row: SwarmConfigRow): SwarmConfig {
     createdAt: row.createdAt,
     lastUpdatedAt: row.lastUpdatedAt,
     encrypted: isEncrypted,
+    exportToEnv: effectiveExportToEnv(row.key, row.exportToEnv !== 0),
   };
 }
 
@@ -6415,7 +6492,7 @@ export function autoEncryptLegacyPlaintextSecrets(
  * Mask secret values in config entries for API responses.
  */
 export function maskSecrets(configs: SwarmConfig[]): SwarmConfig[] {
-  return configs.map((c) => (c.isSecret ? { ...c, value: "********" } : c));
+  return configs.map((c) => (c.isSecret ? { ...c, value: MASKED_SECRET_VALUE } : c));
 }
 
 /**
@@ -6498,7 +6575,7 @@ export async function getInjectableGlobalConfigs(): Promise<SwarmConfig[]> {
   const rows = await getDbClient().query<SwarmConfigRow>(
     `SELECT * FROM swarm_config
        WHERE scope = 'global'
-         AND UPPER(key) NOT IN ('API_KEY', 'SECRETS_ENCRYPTION_KEY', 'CORS_ALLOW_ANY_ORIGIN', 'EXTENSION_ALLOW_LEAD_ACTIVATION')
+         AND UPPER(key) NOT IN ('API_KEY', 'SECRETS_ENCRYPTION_KEY', 'CORS_ALLOW_ANY_ORIGIN', 'EXTENSION_ALLOW_LEAD_ACTIVATION', 'CHAT_SDK_API_URL_OVERRIDES', ${teamsSdkEnvKeysSql()})
        ORDER BY key ASC`,
   );
   return rows.filter((row) => !isInternalConfigKey(row.key)).map(rowToSwarmConfig);
@@ -6552,10 +6629,16 @@ export async function upsertSwarmConfig(data: {
   isSecret?: boolean;
   envPath?: string | null;
   description?: string | null;
+  /** Omitted: an update keeps the stored flag; an insert uses `defaultExportToEnv`. */
+  exportToEnv?: boolean;
 }): Promise<SwarmConfig> {
   if (isReservedConfigKey(data.key)) {
     throw reservedKeyError(data.key);
   }
+  if (data.exportToEnv === true && isEnvExportRestrictedKey(data.key)) {
+    throw new Error(envExportRestrictedError(data.key));
+  }
+  const restricted = isEnvExportRestrictedKey(data.key);
 
   const now = new Date().toISOString();
   const scopeId = data.scope === "global" ? null : (data.scopeId ?? null);
@@ -6589,17 +6672,30 @@ export async function upsertSwarmConfig(data: {
           );
 
     if (existing) {
+      // COALESCE keeps the stored flag when the caller did not send one.
       return await getDbClient().get<SwarmConfigRow>(
-        `UPDATE swarm_config SET value = ?, isSecret = ?, envPath = ?, description = ?, encrypted = ?, lastUpdatedAt = ?
+        `UPDATE swarm_config SET value = ?, isSecret = ?, envPath = ?, description = ?, encrypted = ?, lastUpdatedAt = ?,
+           exportToEnv = CASE WHEN ? THEN 0 ELSE COALESCE(?, exportToEnv) END
          WHERE id = ? RETURNING *`,
-        [storedValue, isSecret, envPath, description, encryptedFlag, now, existing.id],
+        [
+          storedValue,
+          isSecret,
+          envPath,
+          description,
+          encryptedFlag,
+          now,
+          restricted ? 1 : 0,
+          data.exportToEnv === undefined ? null : data.exportToEnv ? 1 : 0,
+          existing.id,
+        ],
       );
     }
 
     const id = crypto.randomUUID();
+    const exportToEnv = restricted ? 0 : (data.exportToEnv ?? defaultExportToEnv(data.key)) ? 1 : 0;
     return await getDbClient().get<SwarmConfigRow>(
-      `INSERT INTO swarm_config (id, scope, scopeId, key, value, isSecret, envPath, description, createdAt, lastUpdatedAt, encrypted)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      `INSERT INTO swarm_config (id, scope, scopeId, key, value, isSecret, envPath, description, createdAt, lastUpdatedAt, encrypted, exportToEnv)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       [
         id,
         data.scope,
@@ -6612,6 +6708,7 @@ export async function upsertSwarmConfig(data: {
         now,
         now,
         encryptedFlag,
+        exportToEnv,
       ],
     );
   });
@@ -6635,6 +6732,8 @@ export async function upsertSwarmConfig(data: {
     registerStoredSecret(config.value, configSecretName(config.key));
     registerSensitiveKeyName(config.key);
   }
+
+  getDbClient().afterCommit(() => publishWorkerConfigNudge(config.scope, config.scopeId));
 
   return config;
 }
@@ -6660,8 +6759,12 @@ export async function emitBuiltInIntegrationConnectedOnce(
  * predate hardening must remain removable through remediation paths.
  */
 export async function deleteSwarmConfig(id: string): Promise<boolean> {
-  const result = await getDbClient().run("DELETE FROM swarm_config WHERE id = ?", [id]);
-  return result.changes > 0;
+  const row = await getDbClient().get<Pick<SwarmConfigRow, "scope" | "scopeId">>(
+    "DELETE FROM swarm_config WHERE id = ? RETURNING scope, scopeId",
+    [id],
+  );
+  if (row) getDbClient().afterCommit(() => publishWorkerConfigNudge(row.scope, row.scopeId));
+  return row !== null;
 }
 
 /**
@@ -6698,7 +6801,11 @@ export async function deleteSwarmConfigByKey(
  * Scope resolution: repo > agent > global (most-specific wins).
  * Returns one entry per unique key with the most-specific scope winning.
  */
-export async function getResolvedConfig(agentId?: string, repoId?: string): Promise<SwarmConfig[]> {
+export async function getResolvedConfig(
+  agentId?: string,
+  repoId?: string,
+  options: { includeRepoSecrets?: boolean } = {},
+): Promise<SwarmConfig[]> {
   // Start with global configs
   const configMap = new Map<string, SwarmConfig>();
 
@@ -6719,6 +6826,7 @@ export async function getResolvedConfig(agentId?: string, repoId?: string): Prom
   if (repoId) {
     const repoConfigs = await getSwarmConfigs({ scope: "repo", scopeId: repoId });
     for (const config of repoConfigs) {
+      if (config.isSecret && options.includeRepoSecrets === false) continue;
       configMap.set(config.key, config);
     }
   }
@@ -7704,6 +7812,7 @@ function rowToWorkflowRun(row: WorkflowRunRow, view: WorkflowPayloadView = "repl
     startedAt: normalizeDateRequired(row.startedAt),
     lastUpdatedAt: normalizeDateRequired(row.lastUpdatedAt),
     finishedAt: normalizeDate(row.finishedAt) ?? undefined,
+    parentStepId: row.parentStepId ?? undefined,
   };
   return defineWorkflowPayload(run, "context", row.context, row.context_replay, view, {
     runId: row.id,

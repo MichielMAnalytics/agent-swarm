@@ -33,7 +33,9 @@ import {
   listAgentsWithCredStatusByProvider,
   NOT_EXTENSION_AGENT_SQL,
 } from "../be/db";
+import { getInstanceFeedbackSignals } from "../be/db/instance-signals";
 import { getEmbeddingProvider } from "../be/memory";
+import { runtimeSupervisorStatus } from "../be/runtime-pools/supervisor";
 import { getCombServiceUserId } from "../comb/agent-fs";
 import { getCombConfig } from "../comb/config";
 import { getFileStorageProvider } from "../fs/registry";
@@ -41,6 +43,7 @@ import { getSlackConfiguration } from "../slack/config";
 import { getSlackConnectionState } from "../slack/connection-state";
 import { isTelemetryEnabled } from "../telemetry";
 import { type AgentCredStatus, AutomationIntegrationIdSchema, ProviderNameSchema } from "../types";
+import { isRuntimePoolsEnabled } from "../utils/runtime-pools-flag";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
@@ -142,6 +145,19 @@ export const StatusTelemetrySchema = z.object({
 });
 export type StatusTelemetry = z.infer<typeof StatusTelemetrySchema>;
 
+/**
+ * Counts the dashboard's feedback pop-up decides on. `first_seen_at` is the
+ * oldest agent registration: the install-age anchor when telemetry is off
+ * and `telemetry_installed_at` does not exist.
+ */
+export const StatusInstanceSchema = z.object({
+  first_seen_at: z.string().nullable(),
+  tasks_completed: z.number().int().nonnegative(),
+  tasks_failed: z.number().int().nonnegative(),
+  workflow_runs_completed: z.number().int().nonnegative(),
+});
+export type StatusInstance = z.infer<typeof StatusInstanceSchema>;
+
 export const StatusAgentFsSchema = z.object({
   configured: z.boolean(),
   base_url: z.string().nullable(),
@@ -188,7 +204,10 @@ export type AutomationStatus = z.infer<typeof AutomationStatusSchema>;
 export const StatusHealthSchema = z.enum(["ok", "degraded", "broken"]);
 export type StatusHealth = z.infer<typeof StatusHealthSchema>;
 
+export const StatusRuntimePoolsSchema = z.object({ enabled: z.boolean(), supervisor: z.string() });
+
 export const StatusResponseSchema = z.object({
+  runtime_pools: StatusRuntimePoolsSchema,
   identity: StatusIdentitySchema,
   setup: z.array(SetupMilestoneSchema),
   activity: StatusActivitySchema,
@@ -198,6 +217,8 @@ export const StatusResponseSchema = z.object({
   health: StatusHealthSchema,
   /** Additive: absent on servers that predate it, so consumers treat missing as enabled. */
   telemetry: StatusTelemetrySchema.optional(),
+  /** Additive: absent on servers that predate it. */
+  instance: StatusInstanceSchema.optional(),
 });
 export type StatusResponse = z.infer<typeof StatusResponseSchema>;
 
@@ -713,7 +734,9 @@ export async function buildStatusPayload(): Promise<StatusResponse> {
     .map((automation) => toStatus(preflightAutomation(automation, automationSetup)))
     .sort((a, b) => a.name.localeCompare(b.name) || a.kind.localeCompare(b.kind));
   const activity = await getInstanceActivity();
+  const instance = await getInstanceFeedbackSignals();
   return {
+    runtime_pools: { enabled: isRuntimePoolsEnabled(), supervisor: runtimeSupervisorStatus() },
     identity: buildIdentity(),
     setup,
     activity,
@@ -726,6 +749,7 @@ export async function buildStatusPayload(): Promise<StatusResponse> {
     automations,
     health: computeHealth(setup),
     telemetry: { enabled: isTelemetryEnabled() },
+    instance,
   };
 }
 
@@ -804,7 +828,7 @@ export async function handleStatus(
   if (getStatus.match(req.method, pathSegments)) {
     try {
       const payload = await buildStatusPayload();
-      json(res, payload);
+      getStatus.respond(res, 200, payload);
     } catch (err) {
       jsonError(res, err instanceof Error ? err.message : "Failed to build status", 500);
     }

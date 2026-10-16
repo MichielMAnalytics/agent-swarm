@@ -3,7 +3,7 @@ import { getPage } from "../be/db";
 import {
   findUserById,
   fingerprintApiKey,
-  resolveBySessionToken,
+  resolveSessionToken,
   resolveUserByToken,
 } from "../be/users";
 import type { User } from "../types";
@@ -13,8 +13,7 @@ import type { HttpRequestAuth } from "../utils/request-auth-context";
 function extractBearer(req: IncomingMessage): string | null {
   const raw = req.headers.authorization;
   const header = Array.isArray(raw) ? raw[0] : raw;
-  if (!header?.startsWith("Bearer ")) return null;
-  return header.slice("Bearer ".length).trim();
+  return header?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? null;
 }
 
 function singleHeader(req: IncomingMessage, name: string): string | null {
@@ -26,6 +25,7 @@ function singleHeader(req: IncomingMessage, name: string): string | null {
 export async function resolveHttpRequestAuth(
   req: IncomingMessage,
   apiKey: string | undefined,
+  options: { touchSessionToken?: boolean } = {},
 ): Promise<HttpRequestAuth | null> {
   const bearer = extractBearer(req);
   if (!bearer) return null;
@@ -61,10 +61,7 @@ export async function resolveHttpRequestAuth(
   }
 
   if (bearer.startsWith("aseph_")) {
-    const principal = await resolveBySessionToken(bearer);
-    if (principal) {
-      return { kind: "agent", agentId: principal.agentId, taskId: principal.taskId };
-    }
+    return await resolveSessionToken(bearer, { touch: options.touchSessionToken });
   }
 
   return null;

@@ -3,6 +3,7 @@ import { getConfig } from "@/lib/config";
 import { DASHBOARD_USER_HEADER, dashboardUserIdFor } from "../lib/dashboard-user";
 import type {
   AcpRuntimeConfig,
+  Agent,
   AgentAvatar,
   AgentMcpServersResponse,
   AgentRuntimeInstancesResponse,
@@ -32,6 +33,8 @@ import type {
   BudgetsResponse,
   ChannelMessage,
   ChannelsResponse,
+  ChatSdkStatusResponse,
+  ChatSdkTelegramWebhookResponse,
   ClaudeRuntimeConfig,
   CombReviewBatchInput,
   CombReviewBatchResult,
@@ -54,6 +57,7 @@ import type {
   FavoriteSetResponse,
   FavoritesResponse,
   FeedbackInput,
+  FleetBenchmarkResponse,
   IdentitiesResponse,
   IdentityEvent,
   IdentityEventsResponse,
@@ -96,6 +100,13 @@ import type {
   PromptTemplateHistory,
   ReasoningEffortLevel,
   ResolveUnmappedInput,
+  RuntimeController,
+  RuntimeControllerInput,
+  RuntimeControllerToken,
+  RuntimePool,
+  RuntimePoolCreateAgentInput,
+  RuntimePoolInput,
+  RuntimePoolRuntime,
   ScheduledTask,
   ScheduledTasksResponse,
   ScriptApiAuthMode,
@@ -114,7 +125,6 @@ import type {
   ScriptsResponse,
   ScriptTypeDefs,
   ScriptVersion,
-  ServicesResponse,
   SessionCostsResponse,
   SessionDetailResponse,
   SessionListItem,
@@ -160,6 +170,7 @@ import type {
   WhoamiResponse,
   Workflow,
   WorkflowRun,
+  WorkflowRunParent,
   WorkflowRunStep,
   WorkflowRunSummary,
   WorkflowRunsPage,
@@ -281,6 +292,31 @@ export class ExtensionInstallError extends Error {
     this.name = "ExtensionInstallError";
     this.diagnostics = diagnostics;
   }
+}
+
+/**
+ * A failed runtime pool or controller request. `status` lets the pool delete
+ * dialog offer a forced delete on 409 (the pool still has bound agents).
+ */
+export class RuntimePoolApiError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "RuntimePoolApiError";
+    this.status = status;
+  }
+}
+
+/** Parse a runtime pool route response or throw a `RuntimePoolApiError`. */
+async function runtimePoolResponse<T>(res: Response, label: string): Promise<T> {
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string; message?: string };
+    throw new RuntimePoolApiError(
+      body.error || body.message || `${label} (${res.status})`,
+      res.status,
+    );
+  }
+  return (await res.json()) as T;
 }
 
 /** Unwrap the `{ extension }` envelope every extension lifecycle route answers with. */
@@ -985,22 +1021,6 @@ class ApiClient {
     return res.json();
   }
 
-  async fetchServices(filters?: {
-    status?: string;
-    agentId?: string;
-    name?: string;
-  }): Promise<ServicesResponse> {
-    const params = new URLSearchParams();
-    if (filters?.status) params.set("status", filters.status);
-    if (filters?.agentId) params.set("agentId", filters.agentId);
-    if (filters?.name) params.set("name", filters.name);
-    const queryString = params.toString();
-    const url = `${this.getBaseUrl()}/api/services${queryString ? `?${queryString}` : ""}`;
-    const res = await fetch(url, { headers: this.getHeaders() });
-    if (!res.ok) throw new Error(`Failed to fetch services: ${res.status}`);
-    return res.json();
-  }
-
   async fetchSessionCosts(filters?: {
     agentId?: string;
     taskId?: string;
@@ -1211,6 +1231,7 @@ class ApiClient {
     isSecret?: boolean;
     envPath?: string | null;
     description?: string | null;
+    exportToEnv?: boolean;
   }): Promise<SwarmConfig> {
     const url = `${this.getBaseUrl()}/api/config?includeSecrets=true`;
     const cleaned = Object.fromEntries(Object.entries(data).filter(([_, v]) => v !== null));
@@ -1433,9 +1454,13 @@ class ApiClient {
     const url = `${this.getBaseUrl()}/api/workflow-runs/${id}`;
     const res = await fetch(url, { headers: this.getHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch workflow run: ${res.status}`);
-    const data = (await res.json()) as { run: WorkflowRun; steps: WorkflowRunStep[] };
-    // Reshape { run, steps } into WorkflowRunWithSteps
-    return { ...data.run, steps: data.steps };
+    const data = (await res.json()) as {
+      run: WorkflowRun;
+      steps: WorkflowRunStep[];
+      parent?: WorkflowRunParent;
+    };
+    // Reshape { run, steps, parent } into WorkflowRunWithSteps
+    return { ...data.run, steps: data.steps, parent: data.parent };
   }
 
   async fetchWorkflowVersions(workflowId: string): Promise<WorkflowVersion[]> {
@@ -1686,6 +1711,165 @@ class ApiClient {
       body: JSON.stringify({ version }),
     });
     return extractExtension(res, "Failed to activate extension version");
+  }
+
+  // ── Runtime pools ──
+
+  async fetchRuntimePools(): Promise<RuntimePool[]> {
+    const url = `${this.getBaseUrl()}/api/runtime-pools`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    const data = await runtimePoolResponse<{ pools: RuntimePool[] }>(
+      res,
+      "Failed to fetch runtime pools",
+    );
+    return data.pools;
+  }
+
+  async fetchRuntimePool(id: string): Promise<RuntimePool> {
+    const url = `${this.getBaseUrl()}/api/runtime-pools/${encodeURIComponent(id)}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    const data = await runtimePoolResponse<{ pool: RuntimePool }>(
+      res,
+      "Failed to fetch runtime pool",
+    );
+    return data.pool;
+  }
+
+  async createRuntimePool(input: RuntimePoolInput): Promise<RuntimePool> {
+    const url = `${this.getBaseUrl()}/api/runtime-pools`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify(input),
+    });
+    const data = await runtimePoolResponse<{ pool: RuntimePool }>(
+      res,
+      "Failed to create runtime pool",
+    );
+    return data.pool;
+  }
+
+  async updateRuntimePool(id: string, input: Partial<RuntimePoolInput>): Promise<RuntimePool> {
+    const url = `${this.getBaseUrl()}/api/runtime-pools/${encodeURIComponent(id)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: this.getHeaders(),
+      body: JSON.stringify(input),
+    });
+    const data = await runtimePoolResponse<{ pool: RuntimePool }>(
+      res,
+      "Failed to update runtime pool",
+    );
+    return data.pool;
+  }
+
+  /** `force` unbinds the pool's agents first; without it a bound pool answers 409. */
+  async deleteRuntimePool(id: string, force = false): Promise<void> {
+    const suffix = force ? "?force=true" : "";
+    const url = `${this.getBaseUrl()}/api/runtime-pools/${encodeURIComponent(id)}${suffix}`;
+    const res = await fetch(url, { method: "DELETE", headers: this.getHeaders() });
+    await runtimePoolResponse<{ deleted: true }>(res, "Failed to delete runtime pool");
+  }
+
+  async fetchRuntimePoolRuntimes(id: string): Promise<RuntimePoolRuntime[]> {
+    const url = `${this.getBaseUrl()}/api/runtime-pools/${encodeURIComponent(id)}/runtimes`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    const data = await runtimePoolResponse<{ runtimes: RuntimePoolRuntime[] }>(
+      res,
+      "Failed to fetch pool runtimes",
+    );
+    return data.runtimes;
+  }
+
+  /** Create an offline agent that is already bound to the pool. */
+  async createRuntimePoolAgent(id: string, input: RuntimePoolCreateAgentInput): Promise<Agent> {
+    const url = `${this.getBaseUrl()}/api/runtime-pools/${encodeURIComponent(id)}/agents`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify(input),
+    });
+    const data = await runtimePoolResponse<{ agent: Agent }>(res, "Failed to create agent");
+    return data.agent;
+  }
+
+  /** Bind an agent to a pool, or unbind it with `poolId: null`. */
+  async bindAgentRuntimePool(agentId: string, poolId: string | null): Promise<Agent> {
+    const url = `${this.getBaseUrl()}/api/agents/${encodeURIComponent(agentId)}/runtime-pool`;
+    const res = await fetch(url, {
+      method: "PUT",
+      headers: this.getHeaders(),
+      body: JSON.stringify({ poolId }),
+    });
+    const data = await runtimePoolResponse<{ agent: Agent }>(res, "Failed to bind agent");
+    return data.agent;
+  }
+
+  async fetchRuntimeControllers(): Promise<RuntimeController[]> {
+    const url = `${this.getBaseUrl()}/api/runtime-controllers`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    const data = await runtimePoolResponse<{ controllers: RuntimeController[] }>(
+      res,
+      "Failed to fetch runtime controllers",
+    );
+    return data.controllers;
+  }
+
+  async fetchRuntimeController(id: string): Promise<RuntimeController> {
+    const url = `${this.getBaseUrl()}/api/runtime-controllers/${encodeURIComponent(id)}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    const data = await runtimePoolResponse<{ controller: RuntimeController }>(
+      res,
+      "Failed to fetch runtime controller",
+    );
+    return data.controller;
+  }
+
+  async createRuntimeController(input: RuntimeControllerInput): Promise<RuntimeController> {
+    const url = `${this.getBaseUrl()}/api/runtime-controllers`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify(input),
+    });
+    const data = await runtimePoolResponse<{ controller: RuntimeController }>(
+      res,
+      "Failed to create runtime controller",
+    );
+    return data.controller;
+  }
+
+  async updateRuntimeController(
+    id: string,
+    input: RuntimeControllerInput,
+  ): Promise<RuntimeController> {
+    const url = `${this.getBaseUrl()}/api/runtime-controllers/${encodeURIComponent(id)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: this.getHeaders(),
+      body: JSON.stringify(input),
+    });
+    const data = await runtimePoolResponse<{ controller: RuntimeController }>(
+      res,
+      "Failed to update runtime controller",
+    );
+    return data.controller;
+  }
+
+  async deleteRuntimeController(id: string): Promise<void> {
+    const url = `${this.getBaseUrl()}/api/runtime-controllers/${encodeURIComponent(id)}`;
+    const res = await fetch(url, { method: "DELETE", headers: this.getHeaders() });
+    await runtimePoolResponse<{ deleted: true }>(res, "Failed to delete runtime controller");
+  }
+
+  /** Mint a remote controller token. Revokes the previous token. The plaintext comes back once. */
+  async mintRuntimeControllerToken(id: string): Promise<RuntimeControllerToken> {
+    const url = `${this.getBaseUrl()}/api/runtime-controllers/${encodeURIComponent(id)}/token`;
+    const res = await fetch(url, { method: "POST", headers: this.getHeaders() });
+    return await runtimePoolResponse<RuntimeControllerToken>(
+      res,
+      "Failed to mint controller token",
+    );
   }
 
   // ── Script connections ──
@@ -3052,6 +3236,23 @@ class ApiClient {
     return data.user;
   }
 
+  async getChatSdkStatus(): Promise<ChatSdkStatusResponse> {
+    const url = `${this.getBaseUrl()}/api/integrations/chat/status`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch Chat SDK status: ${res.status}`);
+    return (await res.json()) as ChatSdkStatusResponse;
+  }
+
+  async registerChatSdkTelegramWebhook(): Promise<ChatSdkTelegramWebhookResponse> {
+    const url = `${this.getBaseUrl()}/api/integrations/chat/telegram/register-webhook`;
+    const res = await fetch(url, { method: "POST", headers: this.getHeaders(), body: "{}" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "" }));
+      throw new Error(err.error || `Failed to register the Telegram webhook: ${res.status}`);
+    }
+    return (await res.json()) as ChatSdkTelegramWebhookResponse;
+  }
+
   async getMcpUserConfig(): Promise<McpUserConfigResponse> {
     const url = `${this.getBaseUrl()}/api/integrations/mcp-user/config`;
     const res = await fetch(url, { headers: this.getHeaders() });
@@ -3168,6 +3369,54 @@ class ApiClient {
     }
     const data = (await res.json()) as InboxStateUpsertResponse;
     return data.item;
+  }
+
+  // ─── Dashboard telemetry ──────────────────────────────────────────────────
+
+  /** Relay one catalogued dashboard event. The API drops it when telemetry is off. */
+  async sendUiEvent(event: string, properties: Record<string, unknown>): Promise<void> {
+    const url = `${this.getBaseUrl()}/api/telemetry/ui-event`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify({ event, properties }),
+    });
+    if (!res.ok) throw new Error(`Failed to send telemetry event: ${res.status}`);
+  }
+
+  /** Turn telemetry on and apply it to the running server. */
+  async enableTelemetry(via: "banner" | "settings"): Promise<{ enabled: boolean }> {
+    const url = `${this.getBaseUrl()}/api/telemetry/enable`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify({ via }),
+    });
+    if (!res.ok) throw new Error(`Failed to turn telemetry on: ${res.status}`);
+    return (await res.json()) as { enabled: boolean };
+  }
+
+  /** Grant or revoke the "used by" logo consent. */
+  async setUsedByConsent(granted: boolean): Promise<{ granted: boolean; changedAt: string }> {
+    const url = `${this.getBaseUrl()}/api/used-by`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify({ granted }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "" }));
+      throw new Error(err.error || `Failed to update the consent: ${res.status}`);
+    }
+    return (await res.json()) as { granted: boolean; changedAt: string };
+  }
+
+  /** This swarm against similar swarms (fleet percentiles from the telemetry proxy). */
+  async getFleetBenchmark(): Promise<FleetBenchmarkResponse> {
+    const url = `${this.getBaseUrl()}/api/fleet-benchmark`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load the fleet benchmark: ${res.status}`);
+    return (await res.json()) as FleetBenchmarkResponse;
   }
 
   // ─── Credential-Missing Agents (Phase 6 ≥1.76.0) ──────────────────────────

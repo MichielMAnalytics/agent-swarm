@@ -11,7 +11,14 @@ import {
   withSpan,
   withSpanContext,
 } from "../otel.ts";
-import { type BasePromptArgs, getBasePrompt } from "../prompts/base-prompt.ts";
+import {
+  type BasePromptArgs,
+  getBasePrompt,
+  getTaskContextPrompt,
+  type RepoContext,
+  type SlackTaskContext,
+  type TaskContextPromptArgs,
+} from "../prompts/base-prompt.ts";
 import {
   generateDefaultClaudeMd,
   generateDefaultIdentityMd,
@@ -40,6 +47,7 @@ import {
   type ProviderSession,
   type ProviderSessionConfig,
 } from "../providers/index.ts";
+import { effectiveReasoningEffort } from "../providers/reasoning-effort.ts";
 import {
   createSkillInvokeTracker,
   isSkillLoaderCall,
@@ -47,9 +55,12 @@ import {
   skillFromToolArgs,
 } from "../providers/skill-invoke.ts";
 import type { SteerDeliveryResult } from "../providers/types.ts";
+import { WorkerRealtimeClient } from "../realtime/worker-client";
+import { resumedTaskModelSelection, type TaskModelPinFields } from "../tasks/model-pin.ts";
 import { initTelemetry, telemetry } from "../telemetry.ts";
 import { mapTriggerSurface } from "../telemetry-context.ts";
 import {
+  type DeliveryMode,
   isTerminalTaskStatus,
   type ModelTierOverrides,
   type ProviderName,
@@ -64,11 +75,14 @@ import { getApiKey } from "../utils/api-key.ts";
 import { computeBudgetBackoffMs } from "../utils/budget-backoff.ts";
 import { ensure, initialize } from "../utils/business-use";
 import { isCodexAuthFailureReason } from "../utils/codex-auth-failure.ts";
+import { isEnvExportRestrictedKey } from "../utils/config-env-export.ts";
+import { MASKED_SECRET_VALUE } from "../utils/config-secrets.ts";
 import { getMcpBaseUrl } from "../utils/constants.ts";
 import { getContextWindowSize } from "../utils/context-window.ts";
 import {
   type CredentialSelection,
   ModelWindowExhaustedError,
+  normalizeProviderKeyAliases,
   resolveCredentialPools,
 } from "../utils/credentials.ts";
 import { resolveCodexCreditsExhaustedCooldownMs } from "../utils/error-tracker.ts";
@@ -78,7 +92,11 @@ import { prettyPrintLine, prettyPrintStderr } from "../utils/pretty-print.ts";
 import { terminateRegisteredProcessGroups } from "../utils/process-group.ts";
 import { refreshRuntimeModelCatalog } from "../utils/runtime-model-catalog.ts";
 import { resolveScriptsOnlyMode } from "../utils/scripts-only-mode.ts";
-import { registerSensitiveKeyName, scrubSecrets } from "../utils/secret-scrubber.ts";
+import {
+  registerEnvSecrets,
+  registerSensitiveKeyName,
+  scrubSecrets,
+} from "../utils/secret-scrubber.ts";
 import { refreshSkillsIfChanged } from "../utils/skills-refresh.ts";
 import { guardSpawnModel } from "../utils/spawn-model-guard.ts";
 import { isSteeringEnabled } from "../utils/steering-enabled.ts";
@@ -110,6 +128,7 @@ import {
   prependProfileSyncRejectionBanner,
   resolveClaudeMdPath,
   syncProfileFilesToServer,
+  WORKSPACE_CLAUDE_MD_PATH,
   writeIdentityBaselines,
   writeProfileFileFromDb,
 } from "./profile-sync.ts";
@@ -121,6 +140,13 @@ import {
   reportLatestModel,
   sendCredStatusReport,
 } from "./provider-credentials.ts";
+import {
+  RunnerPushDelivery,
+  shouldRunDeliveryLoop,
+  taskReconciliation,
+  updateWorkerDeliveryMode,
+  type WorkerRegistration,
+} from "./push-delivery";
 import {
   type ResumeSessionCandidate,
   type ResumeSessionResolution,
@@ -168,17 +194,6 @@ function scheduleRunnerGc(reason: string): boolean {
   }, 0);
   timer.unref?.();
   return true;
-}
-
-/** Save PM2 process list for persistence across container restarts */
-async function savePm2State(role: string): Promise<void> {
-  try {
-    console.log(`[${role}] Saving PM2 process list...`);
-    await Bun.$`pm2 save`.quiet();
-    console.log(`[${role}] PM2 state saved`);
-  } catch {
-    // PM2 not available or no processes - silently ignore
-  }
 }
 
 /** Fetch repo config for a task's vcsRepo (e.g., "desplega-ai/agent-swarm") */
@@ -777,12 +792,29 @@ async function closeAgent(config: ApiConfig, role: string): Promise<void> {
     console.log(`[${role}] Marking agent as offline...`);
     await fetch(`${config.apiUrl}/close`, {
       method: "POST",
-      headers,
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ runtimeShutdown: true }),
     });
     console.log(`[${role}] Agent marked as offline`);
   } catch {
     // Silently fail - server might not be running
   }
+}
+
+export function resolveExitAfterTasks(env: NodeJS.ProcessEnv = process.env): number | null {
+  const raw = env.SWARM_EXIT_AFTER_TASKS?.trim();
+  const value = Number(raw);
+  return raw && Number.isInteger(value) && value > 0 ? value : null;
+}
+
+export async function exitAfterTasksIfFinished(
+  state: RunnerState,
+  limit: number | null,
+  shutdown: (signal: string) => Promise<void>,
+): Promise<boolean> {
+  if (limit === null || state.tasksProcessed < limit || state.activeTasks.size > 0) return false;
+  await shutdown("SWARM_EXIT_AFTER_TASKS");
+  return true;
 }
 
 /**
@@ -818,6 +850,19 @@ const deploymentMemoryRaters = process.env.MEMORY_RATERS;
  */
 const rowOverriddenBootEnv = new Map<string, string | undefined>();
 
+let lastWithheldEnvKeys = "";
+
+/** Names only, and only when the set changes, so per-spawn reloads stay quiet. */
+function logWithheldEnvKeys(keys: string[]): void {
+  const summary = [...keys].sort().join(", ");
+  if (summary === lastWithheldEnvKeys) return;
+  lastWithheldEnvKeys = summary;
+  if (!summary) return;
+  console.log(
+    `[env-reload] Kept ${keys.length} config entries with exportToEnv=false out of the harness env: ${summary}`,
+  );
+}
+
 export async function fetchResolvedEnv(
   apiUrl: string,
   apiKey: string,
@@ -826,6 +871,7 @@ export async function fetchResolvedEnv(
   taskModel?: string,
   sessionContext?: {
     repoId?: string;
+    taskId?: string;
     provider?: ProviderName;
     modelTier?: string;
     /**
@@ -857,6 +903,7 @@ export async function fetchResolvedEnv(
     try {
       const headers: Record<string, string> = { "X-Agent-ID": agentId };
       if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+      if (sessionContext?.taskId) headers["X-Source-Task-Id"] = sessionContext.taskId;
 
       const url = `${apiUrl}/api/config/resolved?agentId=${encodeURIComponent(agentId)}&includeSecrets=true${repoId ? `&repoId=${encodeURIComponent(repoId)}` : ""}`;
       const response = await fetch(url, { headers });
@@ -865,7 +912,12 @@ export async function fetchResolvedEnv(
         console.warn(`[env-reload] Failed to fetch config: ${response.status}`);
       } else {
         const data = (await response.json()) as {
-          configs: Array<{ key: string; value: string; isSecret?: boolean }>;
+          configs: Array<{
+            key: string;
+            value: string;
+            isSecret?: boolean;
+            exportToEnv?: boolean;
+          }>;
         };
 
         // A deleted row restores the deployment value (including unset), while
@@ -880,10 +932,33 @@ export async function fetchResolvedEnv(
         }
 
         if (data.configs?.length) {
+          const skippedSecretKeys: string[] = [];
           scriptsOnlyConfigValue = data.configs.find(
             (config) => config.key === "SCRIPTS_ONLY_MCP",
           )?.value;
+          const withheldEnvKeys: string[] = [];
           for (const config of data.configs) {
+            // Every harness and its shell tool inherit this env. A row with
+            // exportToEnv=false stays out of it, and so does a copy of it in
+            // the base env (container env, or an older entrypoint's export).
+            // Checked before the masked-value fallback so a masked response
+            // can never keep a withheld boot value alive. An API without the
+            // field (pre-215) leaves it undefined, which keeps exporting.
+            if (config.exportToEnv === false || isEnvExportRestrictedKey(config.key)) {
+              if (config.isSecret) registerSensitiveKeyName(config.key);
+              delete env[config.key];
+              // Several adapters build the child env as
+              // `{ ...process.env, ...config.env }`, so a boot-time export
+              // revoked later must leave process.env too. It stays out until
+              // the worker restarts, even if the row is deleted afterwards.
+              if (baseEnv === process.env) delete process.env[config.key];
+              withheldEnvKeys.push(config.key);
+              continue;
+            }
+            if (config.isSecret && config.value === MASKED_SECRET_VALUE) {
+              skippedSecretKeys.push(config.key);
+              continue;
+            }
             // Read on demand via codex-oauth/storage.ts; see env-keys.ts.
             if (isCodexOAuthConfigKey(config.key)) continue;
             // Lets the scrubber redact `KEY=value` dumps of secret rows whose
@@ -917,6 +992,12 @@ export async function fetchResolvedEnv(
             }
             env[config.key] = config.value;
           }
+          if (skippedSecretKeys.length) {
+            console.warn(
+              scrubSecrets(`[env-reload] Skipped masked secrets: ${skippedSecretKeys.join(", ")}`),
+            );
+          }
+          logWithheldEnvKeys(withheldEnvKeys);
           console.log(`[env-reload] Loaded ${data.configs.length} config entries from API`);
         }
         // Non-secret stand-in for the pool rows skipped above, so credential
@@ -928,6 +1009,16 @@ export async function fetchResolvedEnv(
       console.warn(`[env-reload] Could not fetch config, using current env: ${error}`);
     }
   }
+
+  // Registry key aliases (`HELMCODE_API_NAN` for `NAN_API_KEY`) are copied
+  // into their canonical var once here, so pooling, credential checks, pi's
+  // runtime key and the opencode key splice only ever read the canonical
+  // name. An explicit canonical value wins.
+  normalizeProviderKeyAliases(env);
+  // Rows admitted after boot and pool members live only in this env, never in
+  // process.env, so the scrubber's env pass cannot see them. Register them
+  // before any adapter can echo one into a log or failure reason.
+  registerEnvSecrets(env);
 
   // A task already has an adapter. Repository configuration must not select
   // credentials or configure hooks for a different harness.
@@ -1315,11 +1406,6 @@ const SWARM_TOOL_LABELS: Record<string, string | null> = {
   "create-channel": "📢 Creating channel",
   "list-channels": "📢 Listing channels",
   "delete-channel": "📢 Deleting channel",
-  // Services
-  "register-service": "🔌 Registering service",
-  "list-services": "🔌 Listing services",
-  "unregister-service": "🔌 Unregistering service",
-  "update-service-status": "🔌 Updating service status",
   // Reusable scripts
   "script-search": "📜 Searching scripts",
   "script-run": "📜 Running script",
@@ -1699,6 +1785,43 @@ function jsonOutputCandidates(text: string): string[] {
   return [...new Set(candidates)];
 }
 
+function finalUpdateDeadline(): number {
+  const maxSec = Number(process.env.RUNNER_FINISH_RETRY_MAX_SEC);
+  return Date.now() + (Number.isFinite(maxSec) && maxSec > 0 ? maxSec : 300) * 1000;
+}
+
+async function postWithRetry(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, string> | CostData,
+  deadline: number,
+  label: string,
+): Promise<Response> {
+  let delay = 1000;
+  for (;;) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(Math.max(1, Math.min(30_000, deadline - Date.now()))),
+      });
+      if (response.status < 500) return response;
+      throw new Error(
+        `HTTP ${response.status}: ${scrubSecrets(await response.text()).slice(0, 300)}`,
+      );
+    } catch (error) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw error;
+      const wait = Math.min(delay, remaining);
+      console.warn(scrubSecrets(`[runner] ${label} failed. Retry in ${wait}ms: ${error}`));
+      await Bun.sleep(wait);
+      if (Date.now() >= deadline) throw error;
+      delay = Math.min(30_000, delay * 2);
+    }
+  }
+}
+
 export async function ensureTaskFinished(
   config: ApiConfig,
   role: string,
@@ -1713,6 +1836,8 @@ export async function ensureTaskFinished(
    */
   provider?: ProviderName,
   failureDiagnostics?: string,
+  finalProgress?: string,
+  retryDeadline?: number,
 ): Promise<void> {
   const headers: Record<string, string> = {
     "X-Agent-ID": config.agentId,
@@ -1797,11 +1922,27 @@ export async function ensureTaskFinished(
   }
 
   try {
-    const response = await fetch(`${config.apiUrl}/api/tasks/${taskId}/finish`, {
-      method: "POST",
+    const deadline = retryDeadline ?? finalUpdateDeadline();
+    if (finalProgress) {
+      const progress = await postWithRetry(
+        `${config.apiUrl}/api/tasks/${taskId}/progress`,
+        headers,
+        { progress: scrubSecrets(finalProgress) },
+        deadline,
+        "Final task progress POST",
+      );
+      if (progress.status === 401) {
+        console.warn(`[${role}] Final task update rejected: HTTP 401`);
+        return;
+      }
+    }
+    const response = await postWithRetry(
+      `${config.apiUrl}/api/tasks/${taskId}/finish`,
       headers,
-      body: JSON.stringify(body),
-    });
+      body,
+      deadline,
+      "Final task finish POST",
+    );
 
     if (response.ok) {
       const result = (await response.json()) as {
@@ -1817,24 +1958,34 @@ export async function ensureTaskFinished(
           `[${role}] Runner marked task ${taskId.slice(0, 8)} as ${status} (exit code: ${exitCode})`,
         );
       }
+    } else if (response.status === 401) {
+      console.warn(
+        scrubSecrets(
+          `[${role}] Task ${taskId.slice(0, 8)}: runtime token revoked or expired; giving up on finish`,
+        ),
+      );
     } else if (response.status === 409) {
       const error = await response.text();
       // The agent may have completed through store-progress before the runner
       // wrapper posts its fallback result. Preserve the first terminal write,
       // surface the discarded wrapper result, and let session teardown finish.
       console.warn(
-        `[${role}] Runner result for task ${taskId.slice(0, 8)} was discarded because the task is already terminal; continuing: ${error}`,
+        scrubSecrets(
+          `[${role}] Runner result for task ${taskId.slice(0, 8)} was discarded because the task is already terminal; continuing: ${error}`,
+        ),
       );
     } else if (response.status === 404) {
       console.log(`[${role}] Task ${taskId.slice(0, 8)} already finalized (not found), skipping`);
     } else {
       const error = await response.text();
       console.warn(
-        `[${role}] Failed to finish task ${taskId.slice(0, 8)}: ${response.status} ${error}`,
+        scrubSecrets(
+          `[${role}] Failed to finish task ${taskId.slice(0, 8)}: ${response.status} ${error}`,
+        ),
       );
     }
   } catch (err) {
-    console.warn(`[${role}] Error finishing task ${taskId.slice(0, 8)}: ${err}`);
+    console.warn(scrubSecrets(`[${role}] Error finishing task ${taskId.slice(0, 8)}: ${err}`));
   }
 }
 
@@ -2238,6 +2389,7 @@ export async function getPausedTasksFromAPI(config: ApiConfig): Promise<
     output?: string;
     status?: string;
     contextKey?: string;
+    requestedBy?: Trigger["requestedBy"];
   }>
 > {
   const headers: Record<string, string> = {
@@ -2274,6 +2426,7 @@ export async function getPausedTasksFromAPI(config: ApiConfig): Promise<
         finishedAt?: string;
         output?: string;
         status?: string;
+        requestedBy?: Trigger["requestedBy"];
       }>;
     };
     return data.tasks || [];
@@ -2343,15 +2496,17 @@ export async function buildResumePrompt(
 }
 
 /** Setup signal handlers for graceful shutdown */
-function setupShutdownHandlers(
+export function setupShutdownHandlers(
   role: string,
   apiConfig?: ApiConfig,
   getRunnerState?: () => RunnerState | undefined,
-): void {
+  onShutdown?: () => void,
+): (signal: string, exitCode?: number) => Promise<void> {
   let shutdownInProgress = false;
   const shutdown = async (signal: string, exitCode = 0) => {
     if (shutdownInProgress) return;
     shutdownInProgress = true;
+    onShutdown?.();
     console.log(`\n[${role}] Received ${signal}, shutting down...`);
 
     // Wait for active tasks with timeout
@@ -2430,20 +2585,18 @@ function setupShutdownHandlers(
       });
       await closeAgent(apiConfig, role);
     }
-    await savePm2State(role);
     process.exit(exitCode);
   };
 
-  const beginShutdown = (signal: string, exitCode = 0) => {
-    void shutdown(signal, exitCode).catch(async (error) => {
+  const beginShutdown = (signal: string, exitCode = 0) =>
+    shutdown(signal, exitCode).catch(async (error) => {
       console.error(`[${role}] Shutdown failed after ${signal}:`, error);
       await terminateRegisteredProcessGroups();
       process.exit(1);
     });
-  };
 
-  process.on("SIGINT", () => beginShutdown("SIGINT"));
-  process.on("SIGTERM", () => beginShutdown("SIGTERM"));
+  process.on("SIGINT", () => void beginShutdown("SIGINT"));
+  process.on("SIGTERM", () => void beginShutdown("SIGTERM"));
   let fatalShutdownInProgress = false;
   const fatalShutdown = (kind: string, error: unknown) => {
     if (fatalShutdownInProgress) return;
@@ -2457,6 +2610,7 @@ function setupShutdownHandlers(
   process.on("unhandledRejection", (reason) => {
     fatalShutdown("Unhandled rejection", reason);
   });
+  return beginShutdown;
 }
 
 /** Configuration for a runner role (worker or lead) */
@@ -2534,6 +2688,8 @@ export interface RunningTask {
    * adapter's `ProviderResult.output` is empty (see `trackAssistantText`).
    */
   assistantText?: { value?: string };
+  /** Last progress value, retained until the final API writes settle. */
+  finalProgress?: { value?: string };
   /** Last time `reconcileActiveTasks` read this task's server-side status. */
   lastReconcileAt?: number;
   /** When the runner asked the session to abort (cancel or reconcile). */
@@ -2552,6 +2708,8 @@ export interface RunningTask {
 
 /** Runner state for tracking concurrent tasks */
 export interface RunnerState {
+  /** Older callers without a mode retain poll delivery. */
+  deliveryMode?: DeliveryMode;
   activeTasks: Map<string, RunningTask>;
   maxConcurrent: number;
   startedAt: number;
@@ -2649,7 +2807,12 @@ async function flushLogBuffer(
 }
 
 /** Save session cost data to the API */
-async function saveCostData(cost: CostData, apiUrl: string, apiKey: string): Promise<void> {
+async function saveCostData(
+  cost: CostData,
+  apiUrl: string,
+  apiKey: string,
+  deadline: number,
+): Promise<void> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Agent-ID": cost.agentId,
@@ -2659,17 +2822,22 @@ async function saveCostData(cost: CostData, apiUrl: string, apiKey: string): Pro
   }
 
   try {
-    const response = await fetch(`${apiUrl}/api/session-costs`, {
-      method: "POST",
+    const body = { ...cost, id: crypto.randomUUID() };
+    const response = await postWithRetry(
+      `${apiUrl}/api/session-costs`,
       headers,
-      body: JSON.stringify(cost),
-    });
+      body,
+      deadline,
+      "Session cost POST",
+    );
 
-    if (!response.ok) {
+    if (response.status === 401) {
+      console.warn("[runner] Cost data: runtime token revoked or expired. Cost saving stopped.");
+    } else if (!response.ok) {
       console.warn(`[runner] Failed to save cost data: ${response.status}`);
     }
   } catch (error) {
-    console.warn(`[runner] Error saving cost data: ${error}`);
+    console.warn(scrubSecrets(`[runner] Error saving cost data: ${error}`));
   }
 }
 
@@ -2684,10 +2852,13 @@ async function saveProviderSessionId(
   model?: string,
   harnessVariant?: string,
   harnessVariantMeta?: Record<string, unknown>,
+  effort?: ReasoningEffort | null,
 ): Promise<void> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
   const body: Record<string, unknown> = { claudeSessionId };
+  // Devin's body variant has no effort field.
+  if (effort !== undefined && provider !== "devin") body.effort = effort;
   if (provider !== undefined) body.provider = provider;
   if (providerMeta !== undefined) body.providerMeta = providerMeta;
   if (model !== undefined && model !== "") body.model = model;
@@ -2952,17 +3123,30 @@ async function registerActiveSession(
   }
 }
 
-/** Remove an active session by taskId (fire-and-forget) */
+/** Remove an active session by taskId with a bounded retry. */
 async function removeActiveSession(config: ApiConfig, taskId: string): Promise<void> {
   const headers: Record<string, string> = { "X-Agent-ID": config.agentId };
   if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
-  try {
-    await fetch(`${config.apiUrl}/api/active-sessions/by-task/${taskId}`, {
-      method: "DELETE",
-      headers,
-    });
-  } catch {
-    // Non-blocking
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(`${config.apiUrl}/api/active-sessions/by-task/${taskId}`, {
+        method: "DELETE",
+        headers,
+        signal: AbortSignal.timeout(1_000),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return;
+    } catch (error) {
+      if (attempt === 3) {
+        console.warn(
+          scrubSecrets(
+            `[runner] Active-session removal failed for task ${taskId} after 3 attempts: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
+      } else {
+        await Bun.sleep(attempt * 100);
+      }
+    }
   }
 }
 
@@ -3102,6 +3286,10 @@ export interface PollOptions {
   runtimeInstanceId?: string;
   pollInterval: number;
   pollTimeout: number;
+  /** Push scheduling fetches once, then returns control to the runner. */
+  singlePoll?: boolean;
+  /** Distinguishes a failed fetch from an empty successful response. */
+  onPollFailure?: () => void;
   since?: string; // Optional: for filtering finished tasks
   /** Live harness provider; keys the MODEL_TIER_* overrides sent with the poll. */
   harnessProvider?: ProviderName;
@@ -3146,6 +3334,64 @@ export async function buildRequesterProfilePrompt(
   return result.skipped ? "" : result.text.trim();
 }
 
+/**
+ * Warning appended to the task prompt when the task's `dir` was requested but
+ * the session could not start there. Shared by the fresh and resume paths so
+ * both send the model the same text.
+ */
+export function missingTaskDirWarning(
+  taskDir: string | undefined,
+  effectiveCwd: string | undefined,
+): string | undefined {
+  return taskDir && !effectiveCwd
+    ? `Note: The task requested working directory "${taskDir}" but it does not exist. Falling back to default directory.`
+    : undefined;
+}
+
+/** Per-task context that rides in the task prompt, never the system prompt. */
+export type TaskSessionContext = Omit<TaskContextPromptArgs, keyof BasePromptArgs> & {
+  requestedBy?: RequesterProfile;
+  /** Set when the task's `dir` does not exist and the session falls back. */
+  cwdWarning?: string;
+};
+
+/**
+ * The two prompts of one task session. The system prompt depends only on the
+ * agent (profile, harness, deployment), so it is byte-identical across that
+ * agent's sessions and the provider reads it from cache instead of re-writing
+ * it. Everything that varies per task (repository block, scripts-only Slack
+ * note, requester profile, cwd warning) is appended to the task prompt.
+ */
+export async function buildTaskSessionPrompts(input: {
+  basePromptArgs: BasePromptArgs;
+  additionalSystemPrompt?: string;
+  taskPrompt: string;
+  context: TaskSessionContext;
+}): Promise<{ systemPrompt: string; prompt: string }> {
+  const { basePromptArgs, additionalSystemPrompt, context } = input;
+  const basePrompt = await getBasePrompt(basePromptArgs);
+  const systemPrompt = additionalSystemPrompt
+    ? `${basePrompt}\n\n${additionalSystemPrompt}`
+    : basePrompt;
+
+  const taskContext = [
+    await getTaskContextPrompt({
+      ...basePromptArgs,
+      repoContext: context.repoContext,
+      slackContext: context.slackContext,
+    }),
+    await buildRequesterProfilePrompt(context.requestedBy),
+    context.cwdWarning?.trim(),
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join("\n\n");
+
+  return {
+    systemPrompt,
+    prompt: taskContext ? `${input.taskPrompt}\n\n${taskContext}` : input.taskPrompt,
+  };
+}
+
 /** A non-2xx answer from `POST /api/agents`; carries the status for retry triage. */
 export class AgentRegistrationHttpError extends Error {
   readonly status: number;
@@ -3188,7 +3434,7 @@ const REGISTRATION_RETRY_MAX_DELAY_MS = 30_000;
  * the caller still exits and a restart policy can take over.
  */
 export async function registerAgentWithRetry(
-  register: () => Promise<{ serverCapabilities?: string[] }>,
+  register: () => Promise<WorkerRegistration>,
   opts: {
     label: string;
     budgetMs?: number;
@@ -3197,7 +3443,7 @@ export async function registerAgentWithRetry(
     sleep?: (ms: number) => Promise<void>;
     now?: () => number;
   },
-): Promise<{ serverCapabilities?: string[] }> {
+): Promise<WorkerRegistration> {
   const budgetMs = opts.budgetMs ?? REGISTRATION_RETRY_BUDGET_MS;
   const baseDelayMs = opts.baseDelayMs ?? REGISTRATION_RETRY_BASE_DELAY_MS;
   const maxDelayMs = opts.maxDelayMs ?? REGISTRATION_RETRY_MAX_DELAY_MS;
@@ -3244,7 +3490,7 @@ export async function registerAgent(opts: {
    */
   harnessProvider?: ProviderName;
   runtimeInstanceId?: string;
-}): Promise<{ serverCapabilities?: string[] }> {
+}): Promise<WorkerRegistration> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Agent-ID": opts.agentId,
@@ -3290,11 +3536,22 @@ export async function registerAgent(opts: {
   // MCP tool groups it registers). Older servers omit the field — callers must
   // treat `undefined` as "unknown" and fall back to legacy prompt behavior.
   try {
-    const body = (await response.json()) as { enabledCapabilities?: unknown };
+    const body = (await response.json()) as {
+      enabledCapabilities?: unknown;
+      deliveryMode?: unknown;
+      pollRequired?: unknown;
+    };
+    const deliveryMode =
+      body.deliveryMode === "push" || body.deliveryMode === "poll" ? body.deliveryMode : undefined;
+    const mode: WorkerRegistration = {
+      ...(deliveryMode ? { deliveryMode } : {}),
+      ...(typeof body.pollRequired === "boolean" ? { pollRequired: body.pollRequired } : {}),
+    };
     const caps = body.enabledCapabilities;
     if (Array.isArray(caps) && caps.every((c) => typeof c === "string")) {
-      return { serverCapabilities: caps };
+      return { serverCapabilities: caps, ...mode };
     }
+    return mode;
   } catch {
     // Non-JSON / unexpected body — ignore, registration itself succeeded.
   }
@@ -3362,6 +3619,8 @@ async function pollForTriggerOnce(opts: PollOptions): Promise<Trigger | null> {
 
       if (!response.ok) {
         console.warn(`[runner] Poll request failed: ${response.status}`);
+        opts.onPollFailure?.();
+        if (opts.singlePoll) return null;
         await Bun.sleep(opts.pollInterval);
         continue;
       }
@@ -3376,9 +3635,11 @@ async function pollForTriggerOnce(opts: PollOptions): Promise<Trigger | null> {
       // A draining API dispatches nothing: end the window so the loop can hand off.
       if (draining) return null;
     } catch (error) {
-      console.warn(`[runner] Poll request error: ${error}`);
+      console.warn(scrubSecrets(`[runner] Poll request error: ${error}`));
+      opts.onPollFailure?.();
     }
 
+    if (opts.singlePoll) return null;
     await Bun.sleep(opts.pollInterval);
   }
 
@@ -3767,6 +4028,21 @@ export function resolveSessionTelemetryEvent(
 }
 
 /**
+ * Env handed to a harness session. An API an agent boots from its own shell
+ * (`bun run start:http`, `bun src/http.ts`) is a throwaway QA boot, so the
+ * session defaults DESPLEGA_TELEMETRY_ENV to `test` and those boots stop
+ * reporting as production installs. A non-blank value already in the env
+ * wins. Returns a copy: the runner's own env, and with it the runner's own
+ * telemetry, keeps its environment.
+ */
+export function withHarnessTelemetryEnv(
+  env: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  if (env.DESPLEGA_TELEMETRY_ENV?.trim()) return { ...env };
+  return { ...env, DESPLEGA_TELEMETRY_ENV: "test" };
+}
+
+/**
  * Entry shape for the `activeToolSpans` map maintained by `runWithSession`.
  * Exported for unit tests that exercise `implicitCloseActiveToolSpans`.
  */
@@ -3868,6 +4144,7 @@ async function spawnProviderProcess(
       opts.resolvedModel || opts.model,
       {
         repoId: sessionRepo?.id,
+        taskId: realTaskId,
         provider: adapter.name as ProviderName,
         modelTier: opts.modelTier,
         localBlocks: opts.localBlocks,
@@ -3959,6 +4236,9 @@ async function spawnProviderProcess(
   }
   if (spawnModel.warning) console.warn(spawnModel.warning);
   const model = spawnModel.model;
+  // Recorded on the task at session start, like the model: what the adapter
+  // applies, not just what was asked for.
+  const sessionEffort = effectiveReasoningEffort(adapter.name, model, reasoningEffortOverride);
 
   // Resolve Codex OAuth pool slot BEFORE building ProviderSessionConfig so we
   // can pass codexSlot through and the adapter writes token refreshes back to
@@ -4024,7 +4304,7 @@ async function spawnProviderProcess(
     additionalArgs: opts.additionalArgs,
     resumeSessionId: opts.resumeSessionId,
     iteration: opts.iteration,
-    env: freshEnv as Record<string, string>,
+    env: withHarnessTelemetryEnv(freshEnv) as Record<string, string>,
     // Propagate the selected OAuth slot so the adapter refreshes back to the
     // correct pool key. Undefined for non-codex providers and single-cred
     // deploys — only a real pool slot (isPoolBacked) may set this, otherwise
@@ -4193,6 +4473,7 @@ async function spawnProviderProcess(
   // Shared holder mutated by `onEvent`'s "message" case, read back after the
   // session promise resolves (see `trackAssistantText`).
   const assistantTextHolder: { value?: string } = {};
+  const finalProgressHolder: { value?: string } = {};
 
   // Context usage throttle: max 1 snapshot per 30 seconds
   let lastContextPostTime = 0;
@@ -4261,6 +4542,7 @@ async function spawnProviderProcess(
               model,
               event.harnessVariant,
               event.harnessVariantMeta,
+              sessionEffort,
             ).catch((err) => console.warn(`[runner] Failed to save session ID: ${err}`));
           } else {
             // Pool task: save provider session ID on active session so it can be
@@ -4333,8 +4615,9 @@ async function spawnProviderProcess(
 
           // Auto-progress: report tool activity as task progress (throttled)
           const now = Date.now();
+          const progress = toolCallToProgress(event.toolName, event.args);
+          if (progress) finalProgressHolder.value = scrubSecrets(progress);
           if (effectiveTaskId && opts.apiUrl && now - lastProgressTime >= PROGRESS_THROTTLE_MS) {
-            const progress = toolCallToProgress(event.toolName, event.args);
             if (progress) {
               lastProgressTime = now;
               updateProgressViaAPI(opts.apiUrl, opts.apiKey, effectiveTaskId, progress).catch(
@@ -4523,6 +4806,7 @@ async function spawnProviderProcess(
           break;
 
         case "progress": {
+          finalProgressHolder.value = scrubSecrets(event.message);
           if (effectiveTaskId && opts.apiUrl) {
             const now = Date.now();
             if (now - lastProgressTime >= PROGRESS_THROTTLE_MS) {
@@ -4604,8 +4888,9 @@ async function spawnProviderProcess(
           }
         }
 
-        // Save cost data (awaited to ensure it completes before container exits)
+        // Retain cost data for the concurrent final API writes.
         if (result.cost) {
+          result.cost = { ...result.cost, taskId: realTaskId, sessionId: opts.runnerSessionId };
           sessionSpan.setAttributes({
             "gen_ai.response.model": result.cost.model,
             "gen_ai.usage.input_tokens": result.cost.inputTokens ?? 0,
@@ -4634,15 +4919,6 @@ async function spawnProviderProcess(
             },
             { userId: opts.requestedByUserId ?? null },
           );
-          try {
-            await saveCostData(
-              { ...result.cost, taskId: realTaskId, sessionId: opts.runnerSessionId },
-              opts.apiUrl,
-              opts.apiKey,
-            );
-          } catch (err) {
-            console.warn(`[runner] Failed to save cost: ${err}`);
-          }
         }
 
         // Post completion context usage snapshot
@@ -4768,6 +5044,7 @@ async function spawnProviderProcess(
     hasLocalEnvironment: adapter.traits.hasLocalEnvironment,
     model: model || undefined,
     assistantText: assistantTextHolder,
+    finalProgress: finalProgressHolder,
   };
   runningTaskForSessionInit = runningTask;
   if (pendingHarnessVariant !== undefined) {
@@ -4813,6 +5090,10 @@ export interface ReconcileActiveTasksOptions {
   intervalMs: number;
   abortGraceMs?: number;
   now?: () => number;
+  /** In push mode, fetch cancellation only for these tasks. Abort settlement still runs. */
+  cancelTaskIds?: ReadonlySet<string>;
+  /** In push mode, fetch terminal status on safety ticks. */
+  checkStatus?: boolean;
 }
 
 function requestSessionAbort(task: RunningTask, reason: string, at: number): void {
@@ -4906,7 +5187,10 @@ export async function reconcileActiveTasks(
   for (const [taskId, task] of state.activeTasks) {
     if (task.result !== null) continue;
 
-    if (!opts.cancelledSignaled.has(taskId)) {
+    if (
+      !opts.cancelledSignaled.has(taskId) &&
+      (!opts.cancelTaskIds || opts.cancelTaskIds.has(taskId))
+    ) {
       try {
         if (await opts.isCancelled(taskId)) {
           console.log(
@@ -4920,7 +5204,7 @@ export async function reconcileActiveTasks(
       }
     }
 
-    if (task.abortRequestedAt === undefined) {
+    if (task.abortRequestedAt === undefined && opts.checkStatus !== false) {
       const lastCheck = task.lastReconcileAt ?? task.startTime.getTime();
       if (now() - lastCheck >= opts.intervalMs) {
         task.lastReconcileAt = now();
@@ -4994,6 +5278,7 @@ export async function checkCompletedProcesses(
     model?: string;
     durationMs: number;
     assistantText?: RunningTask["assistantText"];
+    finalProgress?: RunningTask["finalProgress"];
     serverTerminalStatus?: string;
   }> = [];
 
@@ -5019,211 +5304,247 @@ export async function checkCompletedProcesses(
         model: task.model,
         durationMs: Date.now() - task.startTime.getTime(),
         assistantText: task.assistantText,
+        finalProgress: task.finalProgress,
         serverTerminalStatus: task.serverTerminalStatus,
       });
     }
   }
 
   // Remove completed tasks from the map and ensure they're marked as finished
-  for (const {
-    taskId,
-    result,
-    triggerSurface,
-    requestedByUserId,
-    cursorUpdates,
-    workingDir,
-    credentialInfo,
-    harnessProvider,
-    harnessVariant,
-    harnessVariantMeta,
-    model,
-    durationMs,
-    assistantText,
-    serverTerminalStatus,
-  } of completedTasks) {
-    state.activeTasks.delete(taskId);
-    vcsDetectedTasks.delete(taskId);
-    vcsCheckTimestamps.delete(taskId);
-    cancelledSignaled?.delete(taskId);
-
-    if (apiConfig) {
-      removeActiveSession(apiConfig, taskId).catch((err) =>
-        console.error(
-          "[runner] active-session removal failed:",
-          scrubSecrets(err instanceof Error ? err.message : String(err)),
-        ),
-      );
-    }
-
-    // The server finished this task without the session (heartbeat sweep,
-    // another writer). Its result stands: no finish call, and no credential
-    // or model outcome built from the abort this runner forced.
-    if (serverTerminalStatus) {
-      console.log(
-        `[${role}] Task ${taskId.slice(0, 8)} was already ${serverTerminalStatus} server-side — slot released, server result kept`,
-      );
-      state.tasksProcessed += 1;
-      continue;
-    }
-
-    // Detect VCS before finishing — last chance to link a PR
-    if (apiConfig && workingDir && !vcsDetectedTasks.has(taskId)) {
-      await detectVcsForTask(apiConfig.apiUrl, apiConfig.apiKey, taskId, workingDir);
-    }
-
-    // Call the finish API to ensure task status is updated
-    // This is idempotent - if the agent already marked it, this is a no-op
-    if (apiConfig) {
-      let failureReason: string | undefined;
-      if (result.exitCode !== 0 && result.failureReason) {
-        failureReason = result.failureReason;
-        console.log(`[${role}] Detected error for task ${taskId.slice(0, 8)}: ${failureReason}`);
-      }
-
-      // Record whether this worker's CLI accepts the model (harness_model_support).
-      void reportHarnessModelOutcome({
-        apiUrl: apiConfig.apiUrl,
-        apiKey: apiConfig.apiKey,
-        agentId: apiConfig.agentId,
-        harness: harnessProvider,
+  let credentialReports = Promise.resolve();
+  const completions = await Promise.allSettled(
+    completedTasks.map(
+      async ({
+        taskId,
+        result,
+        triggerType,
+        triggerSurface,
+        requestedByUserId,
+        cursorUpdates,
+        workingDir,
+        credentialInfo,
+        harnessProvider,
+        harnessVariant,
+        harnessVariantMeta,
         model,
-        exitCode: result.exitCode,
-        failureReason,
-      });
-
-      if (credentialInfo) {
-        await reportKeyCompletionOutcome({
-          apiUrl: apiConfig.apiUrl,
-          apiKey: apiConfig.apiKey,
-          credential: credentialInfo,
-          taskId,
-          exitCode: result.exitCode,
-          failureReason,
+        durationMs,
+        assistantText,
+        finalProgress,
+        serverTerminalStatus,
+      }) => {
+        const deadline = finalUpdateDeadline();
+        // Cost and finish share one budget, including sessions aborted after task completion.
+        const costSave =
+          apiConfig && result.cost
+            ? saveCostData(result.cost, apiConfig.apiUrl, apiConfig.apiKey, deadline)
+            : Promise.resolve();
+        const credentialReport = credentialReports.then(async () => {
+          if (apiConfig && credentialInfo && !serverTerminalStatus) {
+            await reportKeyCompletionOutcome({
+              apiUrl: apiConfig.apiUrl,
+              apiKey: apiConfig.apiKey,
+              credential: credentialInfo,
+              taskId,
+              exitCode: result.exitCode,
+              failureReason: result.exitCode !== 0 ? result.failureReason : undefined,
+            });
+          }
         });
-      }
-      let bridgeDiagnostics: Awaited<ReturnType<typeof getBridgeFailureDiagnostics>> | undefined;
-      if (result.exitCode !== 0 && harnessProvider === "claude" && workingDir) {
-        bridgeDiagnostics = await getBridgeFailureDiagnostics(workingDir);
-        if (bridgeDiagnostics?.artifactPath && result.sessionId) {
-          console.log(`[${role}] Bridge failure artifact found: ${bridgeDiagnostics.artifactPath}`);
-          updateHarnessVariantMeta(apiConfig.apiUrl, apiConfig.apiKey, taskId, result.sessionId, {
-            failureArtifact: bridgeDiagnostics.artifactPath,
-          }).catch((err) => console.warn(`[runner] Failed to update harness variant meta: ${err}`));
-        }
-      }
-      const bridgeFailureDiagnostics =
-        bridgeDiagnostics?.paneTail != null
-          ? `Claude bridge final tmux pane tail (${bridgeDiagnostics.artifactPath}):\n${bridgeDiagnostics.paneTail}`
-          : undefined;
-      // Reports that gate admission on other workers (a seat mismatch, a
-      // model window rejection) land before the task finishes.
-      await reportCredentialOutcomeThenFinish(
-        {
-          apiUrl: apiConfig.apiUrl,
-          apiKey: apiConfig.apiKey,
-          credentialInfo,
-          result,
-          failureReason,
-          model,
-          codexCreditsExhaustedCooldownMs: state.codexCreditsExhaustedCooldownMs,
-          modelWindowBlocks: state.modelWindowBlocks,
-        },
-        () =>
-          ensureTaskFinished(
-            apiConfig,
-            role,
-            taskId,
-            result.exitCode,
-            failureReason,
-            // Runner-buffered last assistant text is a harness-agnostic fallback
-            // for adapters that never populate `ProviderResult.output` (Codex
-            // today, any future adapter). Empty buffer -> `undefined`, byte
-            // identical to pre-fix behavior.
-            resolveProviderOutput(result, assistantText),
-            harnessProvider,
-            bridgeFailureDiagnostics,
-          ),
-      );
-
-      const sessionTriggerSurface = workerTriggerSurface(triggerSurface);
-      const sessionActor = { userId: requestedByUserId ?? null };
-      telemetry.taskEvent(
-        "session_completed",
-        {
-          taskId,
-          trigger_surface: sessionTriggerSurface,
-          agentId: apiConfig.agentId,
-          provider: result.cost?.provider ?? harnessProvider,
-          model: result.cost?.model ?? model ?? "unknown",
-          harnessVariant,
-          harnessVersion:
-            typeof harnessVariantMeta?.version === "string" ||
-            typeof harnessVariantMeta?.version === "number"
-              ? String(harnessVariantMeta.version)
-              : undefined,
-          exitCode: result.exitCode,
-          isError: result.exitCode !== 0,
-          durationMs,
-        },
-        sessionActor,
-      );
-      const sessionTelemetryEvent = resolveSessionTelemetryEvent(result);
-      if (sessionTelemetryEvent) {
-        telemetry.session(
-          sessionTelemetryEvent,
-          {
-            agentId: apiConfig.agentId,
-            taskId,
-            trigger_surface: sessionTriggerSurface,
-            errorCategory: normalizeSessionErrorCategory(result.errorCategory),
-            provider: result.cost?.provider ?? harnessProvider,
-            model: result.cost?.model ?? model ?? "unknown",
-            durationMs: result.cost?.durationMs ?? durationMs,
-            wasRateLimited: result.rateLimitResetAt != null,
-          },
-          sessionActor,
-        );
-      }
-      state.tasksProcessed += 1;
-
-      ensure({
-        id: "worker_process_finished",
-        flow: "task",
-        runId: taskId,
-        depIds: ["worker_process_spawned"],
-        data: {
-          taskId,
-          agentId: apiConfig.agentId,
-          role,
-          exitCode: result.exitCode,
-          success: result.exitCode === 0,
-          failureReason,
-        },
-        validator: (data) => data.exitCode === 0,
-        // biome-ignore lint/correctness/noEmptyPattern: data unused, ctx needed
-        filter: ({}, ctx) => ctx.deps.length > 0,
-        conditions: [{ timeout_ms: 3_600_000 }], // 1 hour: process runtime
-      });
-
-      // Commit channel activity cursors after successful processing
-      // If the task failed, cursors stay uncommitted so messages are re-seen on next poll
-      if (cursorUpdates && cursorUpdates.length > 0 && result.exitCode === 0) {
+        credentialReports = credentialReport.catch(() => {});
         try {
-          const headers: Record<string, string> = { "Content-Type": "application/json" };
-          if (apiConfig.apiKey) headers.Authorization = `Bearer ${apiConfig.apiKey}`;
-          await fetch(`${apiConfig.apiUrl}/api/channel-activity/commit-cursors`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({ cursorUpdates }),
-          });
-          console.log(
-            `[${role}] Committed ${cursorUpdates.length} channel activity cursor(s) for task ${taskId.slice(0, 8)}`,
-          );
-        } catch (err) {
-          console.warn(`[${role}] Failed to commit channel activity cursors: ${err}`);
+          vcsDetectedTasks.delete(taskId);
+          vcsCheckTimestamps.delete(taskId);
+          cancelledSignaled?.delete(taskId);
+          // The server finished this task without the session (heartbeat sweep,
+          // another writer). Its result stands: no finish call, and no credential
+          // or model outcome built from the abort this runner forced.
+          if (serverTerminalStatus) {
+            console.log(
+              `[${role}] Task ${taskId.slice(0, 8)} was already ${serverTerminalStatus} server-side — slot released, server result kept`,
+            );
+            return;
+          }
+
+          // Detect VCS before finishing — last chance to link a PR
+          if (apiConfig && workingDir && !vcsDetectedTasks.has(taskId)) {
+            await detectVcsForTask(apiConfig.apiUrl, apiConfig.apiKey, taskId, workingDir);
+          }
+
+          // Call the finish API to ensure task status is updated
+          // This is idempotent - if the agent already marked it, this is a no-op
+          if (apiConfig) {
+            let failureReason: string | undefined;
+            if (result.exitCode !== 0 && result.failureReason) {
+              failureReason = result.failureReason;
+              console.log(
+                `[${role}] Detected error for task ${taskId.slice(0, 8)}: ${failureReason}`,
+              );
+            }
+
+            // Record whether this worker's CLI accepts the model (harness_model_support).
+            void reportHarnessModelOutcome({
+              apiUrl: apiConfig.apiUrl,
+              apiKey: apiConfig.apiKey,
+              agentId: apiConfig.agentId,
+              harness: harnessProvider,
+              model,
+              exitCode: result.exitCode,
+              failureReason,
+            });
+
+            await credentialReport;
+            let bridgeDiagnostics:
+              | Awaited<ReturnType<typeof getBridgeFailureDiagnostics>>
+              | undefined;
+            if (result.exitCode !== 0 && harnessProvider === "claude" && workingDir) {
+              bridgeDiagnostics = await getBridgeFailureDiagnostics(workingDir);
+              if (bridgeDiagnostics?.artifactPath && result.sessionId) {
+                console.log(
+                  `[${role}] Bridge failure artifact found: ${bridgeDiagnostics.artifactPath}`,
+                );
+                updateHarnessVariantMeta(
+                  apiConfig.apiUrl,
+                  apiConfig.apiKey,
+                  taskId,
+                  result.sessionId,
+                  {
+                    failureArtifact: bridgeDiagnostics.artifactPath,
+                  },
+                ).catch((err) =>
+                  console.warn(`[runner] Failed to update harness variant meta: ${err}`),
+                );
+              }
+            }
+            const bridgeFailureDiagnostics =
+              bridgeDiagnostics?.paneTail != null
+                ? `Claude bridge final tmux pane tail (${bridgeDiagnostics.artifactPath}):\n${bridgeDiagnostics.paneTail}`
+                : undefined;
+            // Reports that gate admission on other workers (a seat mismatch, a
+            // model window rejection) land before the task finishes.
+            await reportCredentialOutcomeThenFinish(
+              {
+                apiUrl: apiConfig.apiUrl,
+                apiKey: apiConfig.apiKey,
+                credentialInfo,
+                result,
+                failureReason,
+                model,
+                codexCreditsExhaustedCooldownMs: state.codexCreditsExhaustedCooldownMs,
+                modelWindowBlocks: state.modelWindowBlocks,
+              },
+              () =>
+                ensureTaskFinished(
+                  apiConfig,
+                  role,
+                  taskId,
+                  result.exitCode,
+                  failureReason,
+                  // Runner-buffered last assistant text is a harness-agnostic fallback
+                  // for adapters that never populate `ProviderResult.output` (Codex
+                  // today, any future adapter). Empty buffer -> `undefined`, byte
+                  // identical to pre-fix behavior.
+                  resolveProviderOutput(result, assistantText),
+                  harnessProvider,
+                  bridgeFailureDiagnostics,
+                  finalProgress?.value,
+                  deadline,
+                ),
+            );
+
+            const sessionTriggerSurface = workerTriggerSurface(triggerSurface);
+            const sessionActor = { userId: requestedByUserId ?? null };
+            telemetry.taskEvent(
+              "session_completed",
+              {
+                taskId,
+                trigger_surface: sessionTriggerSurface,
+                agentId: apiConfig.agentId,
+                provider: result.cost?.provider ?? harnessProvider,
+                model: result.cost?.model ?? model ?? "unknown",
+                harnessVariant,
+                harnessVersion:
+                  typeof harnessVariantMeta?.version === "string" ||
+                  typeof harnessVariantMeta?.version === "number"
+                    ? String(harnessVariantMeta.version)
+                    : undefined,
+                exitCode: result.exitCode,
+                isError: result.exitCode !== 0,
+                durationMs,
+              },
+              sessionActor,
+            );
+            const sessionTelemetryEvent = resolveSessionTelemetryEvent(result);
+            if (sessionTelemetryEvent) {
+              telemetry.session(
+                sessionTelemetryEvent,
+                {
+                  agentId: apiConfig.agentId,
+                  taskId,
+                  trigger_surface: sessionTriggerSurface,
+                  errorCategory: normalizeSessionErrorCategory(result.errorCategory),
+                  provider: result.cost?.provider ?? harnessProvider,
+                  model: result.cost?.model ?? model ?? "unknown",
+                  durationMs: result.cost?.durationMs ?? durationMs,
+                  wasRateLimited: result.rateLimitResetAt != null,
+                },
+                sessionActor,
+              );
+            }
+            ensure({
+              id: "worker_process_finished",
+              flow: "task",
+              runId: taskId,
+              depIds: ["worker_process_spawned"],
+              data: {
+                taskId,
+                agentId: apiConfig.agentId,
+                role,
+                exitCode: result.exitCode,
+                success: result.exitCode === 0,
+                failureReason,
+              },
+              validator: (data) => data.exitCode === 0,
+              // biome-ignore lint/correctness/noEmptyPattern: data unused, ctx needed
+              filter: ({}, ctx) => ctx.deps.length > 0,
+              conditions: [{ timeout_ms: 3_600_000 }], // 1 hour: process runtime
+            });
+
+            // Commit channel activity cursors after successful processing
+            // If the task failed, cursors stay uncommitted so messages are re-seen on next poll
+            if (cursorUpdates && cursorUpdates.length > 0 && result.exitCode === 0) {
+              try {
+                const headers: Record<string, string> = { "Content-Type": "application/json" };
+                if (apiConfig.apiKey) headers.Authorization = `Bearer ${apiConfig.apiKey}`;
+                await fetch(`${apiConfig.apiUrl}/api/channel-activity/commit-cursors`, {
+                  method: "POST",
+                  headers,
+                  body: JSON.stringify({ cursorUpdates }),
+                });
+                console.log(
+                  `[${role}] Committed ${cursorUpdates.length} channel activity cursor(s) for task ${taskId.slice(0, 8)}`,
+                );
+              } catch (err) {
+                console.warn(`[${role}] Failed to commit channel activity cursors: ${err}`);
+              }
+            }
+          }
+        } finally {
+          try {
+            await costSave;
+            if (apiConfig) await removeActiveSession(apiConfig, taskId);
+          } finally {
+            state.activeTasks.delete(taskId);
+            if (triggerType === "task_assigned" || triggerType === "task_resumed") {
+              state.tasksProcessed += 1;
+            }
+          }
         }
-      }
-    }
+      },
+    ),
+  );
+  for (const completion of completions) {
+    if (completion.status === "rejected")
+      console.warn(scrubSecrets(`[${role}] Task completion failed: ${completion.reason}`));
   }
 
   // Harness-agnostic FS → DB profile sync at session end.
@@ -5481,17 +5802,13 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   let agentSkillsSummary: { name: string; description: string }[] | undefined;
   let agentMcpServers: string[] | undefined;
 
-  // Per-task repo context — set when processing a task with githubRepo
-  let currentRepoContext: BasePromptArgs["repoContext"] | undefined;
-  // Slack context for current task (gates Slack instructions in prompt)
-  let currentTaskSlackContext: BasePromptArgs["slackContext"] | undefined;
-
   // Generate base prompt (identity fields injected after profile fetch below).
   // Traits are read fresh on each call so a live adapter swap (Section 4)
-  // produces a prompt matching the new provider's capabilities.
-  const buildSystemPrompt = async () => {
+  // produces a prompt matching the new provider's capabilities. Per-task
+  // context never enters it; see buildTaskSessionPrompts.
+  const basePromptArgs = (): BasePromptArgs => {
     const { traits } = adapter;
-    return getBasePrompt({
+    return {
       role,
       agentId,
       capabilities,
@@ -5502,19 +5819,18 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       name: agentProfileName,
       description: agentDescription,
       // SOUL.md is the persona and travels to every provider. base-prompt
-      // gates IDENTITY.md (inject when edited) and CLAUDE.md (local
-      // non-claude providers, inject when edited) itself.
+      // gates IDENTITY.md and CLAUDE.md (inject when edited) itself.
       soulMd: agentSoulMd,
       identityMd: agentIdentityMd,
       claudeMd: agentClaudeMd,
-      repoContext: currentRepoContext,
-      slackContext: currentTaskSlackContext,
       ...(traits.hasMcp && {
         skillsSummary: agentSkillsSummary,
         mcpServers: agentMcpServers,
       }),
-    });
+    };
   };
+
+  const buildSystemPrompt = async () => getBasePrompt(basePromptArgs());
 
   let basePrompt = await buildSystemPrompt();
 
@@ -5604,12 +5920,14 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   const defaultMaxTasks = isLead ? 2 : 1;
   const templateMaxTasks = cachedTemplate?.config.agentDefaults?.maxTasks;
   const maxConcurrent = resolveMaxConcurrent(process.env, templateMaxTasks, defaultMaxTasks);
-  console.log(`[${role}] Mode: runner-level polling`);
+  const exitAfterTasks = resolveExitAfterTasks();
+  console.log(`[${role}] Mode: runner-level delivery`);
   console.log(`[${role}] Max concurrent tasks: ${maxConcurrent}`);
 
   // Initialize runner state for parallel execution
   const state: RunnerState = {
     activeTasks: new Map(),
+    deliveryMode: "poll",
     maxConcurrent,
     startedAt: Date.now(),
     tasksProcessed: 0,
@@ -5646,7 +5964,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
 
   // Fresh per boot and shared by registration, ping, and close: a restarted
   // process is a new runtime, but one process presents one identity.
-  const runtimeInstanceId = crypto.randomUUID();
+  const runtimeInstanceId = process.env.SWARM_RUNTIME_INSTANCE_ID || crypto.randomUUID();
 
   // Session MCP configs are built in provider adapters, which read this to
   // stamp the runtime identity onto worker tool calls.
@@ -5655,8 +5973,51 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   // Create API config for ping/close
   const apiConfig: ApiConfig = { apiUrl, apiKey, agentId, runtimeInstanceId };
 
+  const pushDelivery = new RunnerPushDelivery(
+    new WorkerRealtimeClient({ apiUrl, apiKey, agentId, runtimeInstanceId }),
+  );
+  let shuttingDown = false;
+  let lastPushPingAt = 0;
+  let pushPingTimer: ReturnType<typeof setInterval> | undefined;
+  let lastLoggedDeliveryMode: DeliveryMode | undefined;
+  const applyDeliveryMode = (registration: WorkerRegistration) => {
+    const mode = updateWorkerDeliveryMode(
+      lastLoggedDeliveryMode,
+      registration,
+      isLead,
+      process.env,
+    );
+    lastLoggedDeliveryMode = mode;
+    if (mode !== state.deliveryMode) {
+      state.deliveryMode = mode;
+      pushDelivery.wakeWork();
+      clearInterval(pushPingTimer);
+      if (mode === "push") {
+        pushDelivery.client.start();
+        lastPushPingAt = Date.now();
+        // Budget backoff and provider startup must not interrupt runtime liveness.
+        pushPingTimer = setInterval(() => {
+          lastPushPingAt = Date.now();
+          void pingServer(apiConfig, role).then((draining) =>
+            applyApiDrainSignal(state, role, draining),
+          );
+        }, 30_000);
+        pushPingTimer.unref();
+      } else pushDelivery.client.stop();
+    }
+  };
+
   // Setup graceful shutdown handlers with API config and runner state access
-  setupShutdownHandlers(role, apiConfig, () => state);
+  const shutdown = setupShutdownHandlers(
+    role,
+    apiConfig,
+    () => state,
+    () => {
+      shuttingDown = true;
+      clearInterval(pushPingTimer);
+      pushDelivery.client.stop();
+    },
+  );
 
   // Register agent before starting
   const agentName =
@@ -5790,6 +6151,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     });
     lastServerCapsRefreshAt = Date.now();
     await applyServerCapabilities(reg.serverCapabilities);
+    applyDeliveryMode(reg);
   };
 
   /**
@@ -5826,6 +6188,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     // registration (serverCapabilities unknown), and the later identity
     // rebuild only happens when the profile fetch succeeds.
     await applyServerCapabilities(reg.serverCapabilities);
+    applyDeliveryMode(reg);
     console.log(`[${role}] Registered as "${agentName}" (ID: ${agentId})`);
   } catch (error) {
     console.error(`[${role}] Failed to register: ${error}`);
@@ -6194,10 +6557,13 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     }
   }
 
-  // Write CLAUDE.md to workspace (agent-level instructions)
+  // Write CLAUDE.md to workspace (agent-level instructions) for every harness:
+  // a live provider swap can start a non-Claude session in this container.
+  // Claude sessions exclude this copy (claude-flag-settings.ts) and read
+  // ~/.claude/CLAUDE.md instead.
   if (agentClaudeMd) {
     try {
-      const backupPath = await writeProfileFileFromDb("/workspace/CLAUDE.md", agentClaudeMd);
+      const backupPath = await writeProfileFileFromDb(WORKSPACE_CLAUDE_MD_PATH, agentClaudeMd);
       if (backupPath) console.warn(`[${role}] Archived differing CLAUDE.md at ${backupPath}`);
       console.log(`[${role}] Wrote CLAUDE.md to workspace`);
     } catch (err) {
@@ -6398,7 +6764,8 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           }
         }
 
-        if (!resumeCwd && task.vcsRepo && apiUrl) {
+        let resumeRepoContext: RepoContext | undefined;
+        if (task.vcsRepo && apiUrl) {
           const repoConfig = await fetchRepoConfig(apiUrl, apiKey, task.vcsRepo);
           const effectiveConfig = repoConfig ?? {
             url: task.vcsRepo,
@@ -6409,10 +6776,33 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           // This is the paused-task-resume-after-restart path — never a first
           // kickoff, so never force-reset the base branch here.
           const repoContext = await ensureRepoForTask(effectiveConfig, role, false);
-          if (repoContext?.clonePath) {
+          resumeRepoContext = { ...repoContext, guidelines: repoConfig?.guidelines ?? null };
+          if (!resumeCwd && repoContext?.clonePath) {
             resumeCwd = repoContext.clonePath;
           }
         }
+
+        // Same split as the main task path: stable system prompt, per-task
+        // context (repository, scripts-only Slack note, requester profile,
+        // cwd warning) in the task prompt.
+        const resumeSlackChannelId = (task as { slackChannelId?: string }).slackChannelId;
+        const resumeSession = await buildTaskSessionPrompts({
+          basePromptArgs: basePromptArgs(),
+          additionalSystemPrompt,
+          taskPrompt: resumePrompt,
+          context: {
+            repoContext: resumeRepoContext,
+            slackContext: resumeSlackChannelId
+              ? {
+                  channelId: resumeSlackChannelId,
+                  threadTs: (task as { slackThreadTs?: string }).slackThreadTs,
+                }
+              : undefined,
+            requestedBy: task.requestedBy,
+            cwdWarning: missingTaskDirWarning(task.dir, resumeCwd),
+          },
+        });
+        resumePrompt = resumeSession.prompt;
 
         // Per-task runner session ID so session logs are scoped to this task
         const resumeRunnerSessionId = crypto.randomUUID();
@@ -6434,7 +6824,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             {
               prompt: resumePrompt,
               logFile,
-              systemPrompt: resolvedSystemPrompt,
+              systemPrompt: resumeSession.systemPrompt,
               additionalArgs: opts.additionalArgs,
               // Native resume deprecated: always undefined. Follow-up continuity flows through
               // the context preamble injected above (see context-preamble.ts).
@@ -6447,10 +6837,11 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
               runnerSessionId: resumeRunnerSessionId,
               iteration,
               taskId: task.id,
-              model: (task as { model?: string }).model,
+              // Only the task's own pin carries over. `model` and the claim
+              // record describe the run before the pause; without a pin the
+              // resumed run resolves from the agent's current config.
+              ...resumedTaskModelSelection(task as TaskModelPinFields),
               modelTier: (task as { modelTier?: string }).modelTier,
-              resolvedModel: (task as { resolvedModel?: string }).resolvedModel,
-              modelSource: (task as { modelSource?: string }).modelSource,
               effort: (task as { effort?: ReasoningEffort }).effort,
               harnessProvider: state.harnessProvider,
               cwd: resumeCwd,
@@ -6516,17 +6907,22 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   const ORPHAN_RECOVERY_INTERVAL_MS = 60_000;
   const taskReconcileIntervalMs = resolveTaskReconcileIntervalMs();
 
-  while (true) {
-    // Ping server on each iteration to keep status updated. The answer also
-    // carries the API's drain signal, which reaches workers at capacity that
-    // do not poll.
-    applyApiDrainSignal(state, role, await pingServer(apiConfig, role));
+  while (shouldRunDeliveryLoop(state.deliveryMode, shuttingDown)) {
+    const deliveryChecks = pushDelivery.checks(state.deliveryMode ?? "poll");
+    // Poll workers ping each iteration. Push workers retain a 30 second ping.
+    // The response also signals drain to workers at capacity.
+    if (state.deliveryMode !== "push") {
+      applyApiDrainSignal(state, role, await pingServer(apiConfig, role));
+    }
     if (state.apiDraining) {
       await handOffTasksForApiDrain(state, role, apiConfig);
     }
 
     // Check for completed processes first and ensure tasks are marked as finished
+    const activeBeforeCompletion = state.activeTasks.size;
     await checkCompletedProcesses(state, role, apiConfig, cancelledSignaled);
+    if (state.activeTasks.size < activeBeforeCompletion) pushDelivery.wakeWork();
+    if (await exitAfterTasksIfFinished(state, exitAfterTasks, shutdown)) return;
 
     // Live HARNESS_PROVIDER reconciliation. Re-fetches `swarm_config` (overlaid
     // on env) and swaps the adapter if the resolved provider changed —
@@ -6538,7 +6934,10 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     // the current `adapter` binding and pick up the swap. `basePrompt` is
     // rebuilt because traits (and therefore prompt content) may differ across
     // providers.
-    if (Date.now() - lastHarnessReconcileAt > HARNESS_RECONCILE_INTERVAL_MS) {
+    if (
+      deliveryChecks.config &&
+      (deliveryChecks.push || Date.now() - lastHarnessReconcileAt > HARNESS_RECONCILE_INTERVAL_MS)
+    ) {
       lastHarnessReconcileAt = Date.now();
       try {
         const {
@@ -6610,6 +7009,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
         isCancelled: (taskId) => fetchTaskCancelled(apiUrl, apiKey, agentId, taskId),
         fetchStatus: (taskId) => fetchTaskStatus(apiUrl, apiKey, taskId),
         intervalMs: taskReconcileIntervalMs,
+        ...taskReconciliation(deliveryChecks),
       });
     }
 
@@ -6617,20 +7017,39 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     if (steeringDispatchState && state.activeTasks.size > 0) {
       const dispatchState = steeringDispatchState;
       for (const [taskId, task] of state.activeTasks) {
-        scheduleSteeringDispatch(apiConfig, taskId, task.session, dispatchState, (error) => {
-          console.warn(
-            `[${role}] Steering dispatch failed for task ${taskId.slice(0, 8)} (non-fatal): ${scrubSecrets(
-              (error as Error).message,
-            )}`,
-          );
-        });
+        pushDelivery.dispatchSteering(deliveryChecks, taskId, () =>
+          scheduleSteeringDispatch(apiConfig, taskId, task.session, dispatchState, (error) => {
+            console.warn(
+              `[${role}] Steering dispatch failed for task ${taskId.slice(0, 8)} (non-fatal): ${scrubSecrets(
+                (error as Error).message,
+              )}`,
+            );
+          }),
+        );
       }
     }
 
     // Only poll if we have capacity and the API is not draining
-    if (state.apiDraining) {
-      await Bun.sleep(1000);
-    } else if (state.activeTasks.size < state.maxConcurrent) {
+    const schedule = pushDelivery.schedule({
+      mode: state.deliveryMode ?? "poll",
+      push: deliveryChecks.push,
+      activeCount: state.activeTasks.size,
+      maxConcurrent:
+        exitAfterTasks === null
+          ? state.maxConcurrent
+          : Math.min(state.maxConcurrent, Math.max(0, exitAfterTasks - state.tasksProcessed)),
+      draining: state.apiDraining,
+      lastPushPingAt,
+      pollInterval: PollIntervalMs,
+    });
+    if (!schedule.poll) {
+      if (!state.apiDraining && state.activeTasks.size >= state.maxConcurrent) {
+        console.log(
+          `[${role}] At capacity (${state.activeTasks.size}/${state.maxConcurrent}), waiting for completion...`,
+        );
+      }
+      await pushDelivery.waitForSchedule(schedule);
+    } else {
       if (Date.now() - lastOrphanRecoveryAt > ORPHAN_RECOVERY_INTERVAL_MS) {
         lastOrphanRecoveryAt = Date.now();
         const recoveredOrphans = await recoverOrphanedInProgressTasks(apiConfig);
@@ -6648,16 +7067,20 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       // Use shorter timeout if tasks are running (to check completion more often)
       const effectiveTimeout = state.activeTasks.size > 0 ? 5000 : PollTimeoutMs;
 
-      const trigger = await pollForTrigger({
-        apiUrl,
-        apiKey,
-        agentId,
-        pollInterval: PollIntervalMs,
-        runtimeInstanceId,
-        pollTimeout: effectiveTimeout,
-        harnessProvider: state.harnessProvider,
-        onApiDrainSignal: (draining) => applyApiDrainSignal(state, role, draining),
-      });
+      const { trigger, failed } = await pushDelivery.poll(schedule.singlePoll, (onPollFailure) =>
+        pollForTrigger({
+          apiUrl,
+          apiKey,
+          agentId,
+          pollInterval: PollIntervalMs,
+          runtimeInstanceId,
+          pollTimeout: effectiveTimeout,
+          singlePoll: schedule.singlePoll,
+          onPollFailure,
+          harnessProvider: state.harnessProvider,
+          onApiDrainSignal: (draining) => applyApiDrainSignal(state, role, draining),
+        }),
+      );
 
       if (trigger) {
         // Phase 4 — server refused to admit a claim because the agent or
@@ -6811,11 +7234,12 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           ?.slackChannelId;
         const taskSlackThreadTs = (trigger.task as { slackThreadTs?: string } | undefined)
           ?.slackThreadTs;
-        currentTaskSlackContext = taskSlackChannelId
+        const taskSlackContext: SlackTaskContext | undefined = taskSlackChannelId
           ? { channelId: taskSlackChannelId, threadTs: taskSlackThreadTs }
           : undefined;
 
         // Handle repo context for tasks with vcsRepo (GitHub/GitLab)
+        let currentRepoContext: RepoContext | undefined;
         const taskVcsRepo = (trigger.task as { vcsRepo?: string } | undefined)?.vcsRepo;
         if (taskVcsRepo && apiUrl) {
           const repoConfig = await fetchRepoConfig(apiUrl, apiKey, taskVcsRepo);
@@ -6839,8 +7263,6 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             ...repoResult,
             guidelines: repoConfig?.guidelines ?? null,
           };
-        } else {
-          currentRepoContext = undefined;
         }
 
         // Resolve effective working directory (priority: task.dir > repoContext.clonePath > process.cwd())
@@ -6879,11 +7301,8 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             " You can still access any path on the filesystem — this is just your starting directory.";
         }
 
-        // Warn in system prompt when task dir was specified but doesn't exist
-        let cwdWarning = "";
-        if (taskDir && !effectiveCwd) {
-          cwdWarning = `\n\nNote: The task requested working directory "${taskDir}" but it does not exist. Falling back to default directory.`;
-        }
+        // Warn when task dir was specified but doesn't exist
+        const cwdWarning = missingTaskDirWarning(taskDir, effectiveCwd);
 
         // Per-task skill hot-reload. Reuses the boot-time helper; signature
         // probe short-circuits when nothing changed. Skipped for
@@ -6929,13 +7348,21 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           );
         }
 
-        // Rebuild system prompt with per-task repo context
-        const taskBasePrompt = await buildSystemPrompt();
-        const requesterProfilePrompt = await buildRequesterProfilePrompt(trigger.requestedBy);
-        const taskPromptParts = [taskBasePrompt, requesterProfilePrompt, additionalSystemPrompt]
-          .filter((part): part is string => Boolean(part))
-          .join("\n\n");
-        const taskSystemPrompt = taskPromptParts + cwdWarning;
+        // Rebuild the system prompt (profile or skills may have changed) and
+        // append the per-task context to the task prompt.
+        const taskSession = await buildTaskSessionPrompts({
+          basePromptArgs: basePromptArgs(),
+          additionalSystemPrompt,
+          taskPrompt: triggerPrompt,
+          context: {
+            repoContext: currentRepoContext,
+            slackContext: taskSlackContext,
+            requestedBy: trigger.requestedBy,
+            cwdWarning,
+          },
+        });
+        const taskSystemPrompt = taskSession.systemPrompt;
+        triggerPrompt = taskSession.prompt;
 
         // The server refused the task's explicit model for this worker's CLI
         // version (harness_model_support = unsupported): fail fast, no spawn.
@@ -7096,12 +7523,9 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
         console.log(
           `[${role}] Started task ${runningTask.taskId.slice(0, 8)} (${state.activeTasks.size}/${state.maxConcurrent} active, trigger: ${trigger.type})`,
         );
+      } else if (schedule.singlePoll) {
+        await pushDelivery.waitForSchedule(schedule, failed, PollIntervalMs);
       }
-    } else {
-      console.log(
-        `[${role}] At capacity (${state.activeTasks.size}/${state.maxConcurrent}), waiting for completion...`,
-      );
-      await Bun.sleep(1000);
     }
   }
 }
