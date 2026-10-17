@@ -9917,6 +9917,9 @@ export interface paths {
                                 allowCustomModel: boolean;
                                 description: string | null;
                                 seededFrom: string | null;
+                                credentials: {
+                                    [key: string]: string[];
+                                } | null;
                                 createdAt: string;
                                 lastUpdatedAt: string;
                             }[];
@@ -9928,7 +9931,7 @@ export interface paths {
         put?: never;
         /**
          * Create a model profile
-         * @description A profile runs on one harness. `model` must run on that harness and be in the model catalog unless `allowCustomModel` is true (a gateway id, a fresh launch); a `latest:` alias is accepted and resolves at claim. `effort` must be a level the harness and model support. Operator only (the shared API key).
+         * @description A profile runs on one harness. `model` must run on that harness and be in the model catalog unless `allowCustomModel` is true (a gateway id, a fresh launch); a `latest:` alias is accepted and resolves at claim. `effort` must be a level the harness and model support. `credentials` pins which pooled keys the profile uses: per credential var of the harness, the last 5 characters of each allowed key (`CODEX_OAUTH` is not supported). Operator only (the shared API key).
          */
         post: {
             parameters: {
@@ -9949,6 +9952,9 @@ export interface paths {
                         /** @default false */
                         allowCustomModel?: boolean;
                         description?: string | null;
+                        credentials?: {
+                            [key: string]: string[];
+                        } | null;
                     };
                 };
             };
@@ -9970,6 +9976,9 @@ export interface paths {
                             allowCustomModel: boolean;
                             description: string | null;
                             seededFrom: string | null;
+                            credentials: {
+                                [key: string]: string[];
+                            } | null;
                             createdAt: string;
                             lastUpdatedAt: string;
                         };
@@ -10046,6 +10055,9 @@ export interface paths {
                             allowCustomModel: boolean;
                             description: string | null;
                             seededFrom: string | null;
+                            credentials: {
+                                [key: string]: string[];
+                            } | null;
                             createdAt: string;
                             lastUpdatedAt: string;
                         };
@@ -10066,7 +10078,7 @@ export interface paths {
         post?: never;
         /**
          * Delete a model profile
-         * @description Refused (409) for a shipped `<harness>-<tier>` seed (edit it instead; it would come back at the next boot), and while an agent has the profile as its default or a task holds it (unfinished, or superseded and still owed its resume). Operator only (the shared API key).
+         * @description Refused (409) for a shipped `<harness>-<tier>` seed (edit it instead; it would come back at the next boot), and while an agent has the profile as its default, a schedule names it, or a task holds it (unfinished, or superseded and still owed its resume). Operator only (the shared API key).
          */
         delete: {
             parameters: {
@@ -10124,7 +10136,7 @@ export interface paths {
         head?: never;
         /**
          * Update a model profile
-         * @description Changes the model, effort, custom-model flag or description; the name and harness are fixed. Omit a field to keep it; `effort: null` clears it. Applies to tasks claimed after the change. Operator only (the shared API key).
+         * @description Changes the model, effort, custom-model flag, description or credential allowlist; the name and harness are fixed. Omit a field to keep it; `effort: null` and `credentials: null` clear it. Applies to tasks claimed after the change. Operator only (the shared API key).
          */
         patch: {
             parameters: {
@@ -10143,6 +10155,9 @@ export interface paths {
                         effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max" | null;
                         allowCustomModel?: boolean;
                         description?: string | null;
+                        credentials?: {
+                            [key: string]: string[];
+                        } | null;
                     };
                 };
             };
@@ -10164,6 +10179,9 @@ export interface paths {
                             allowCustomModel: boolean;
                             description: string | null;
                             seededFrom: string | null;
+                            credentials: {
+                                [key: string]: string[];
+                            } | null;
                             createdAt: string;
                             lastUpdatedAt: string;
                         };
@@ -16136,6 +16154,7 @@ export interface paths {
                                 model?: string;
                                 /** @enum {string} */
                                 modelTier?: "smol" | "regular" | "smart" | "ultra";
+                                profile?: string;
                                 /**
                                  * @default recurring
                                  * @enum {string}
@@ -16202,6 +16221,7 @@ export interface paths {
                                 model?: string;
                                 /** @enum {string} */
                                 modelTier?: "smol" | "regular" | "smart" | "ultra";
+                                profile?: string;
                                 /**
                                  * @default recurring
                                  * @enum {string}
@@ -16330,6 +16350,7 @@ export interface paths {
                             model?: string;
                             /** @enum {string} */
                             modelTier?: "smol" | "regular" | "smart" | "ultra";
+                            profile?: string;
                             /**
                              * @default recurring
                              * @enum {string}
@@ -16452,6 +16473,7 @@ export interface paths {
                                 model?: string;
                                 /** @enum {string} */
                                 modelTier?: "smol" | "regular" | "smart" | "ultra";
+                                profile?: string;
                                 /**
                                  * @default recurring
                                  * @enum {string}
@@ -16574,6 +16596,7 @@ export interface paths {
                             model?: string;
                             /** @enum {string} */
                             modelTier?: "smol" | "regular" | "smart" | "ultra";
+                            profile?: string;
                             /**
                              * @default recurring
                              * @enum {string}
@@ -16707,6 +16730,7 @@ export interface paths {
                             model?: string;
                             /** @enum {string} */
                             modelTier?: "smol" | "regular" | "smart" | "ultra";
+                            profile?: string;
                             /**
                              * @default recurring
                              * @enum {string}
@@ -16899,6 +16923,7 @@ export interface paths {
                             model?: string;
                             /** @enum {string} */
                             modelTier?: "smol" | "regular" | "smart" | "ultra";
+                            profile?: string;
                             /**
                              * @default recurring
                              * @enum {string}
@@ -20384,6 +20409,7 @@ export interface paths {
                                 model?: string;
                                 /** @enum {string} */
                                 modelTier?: "smol" | "regular" | "smart" | "ultra";
+                                profile?: string;
                                 /**
                                  * @default recurring
                                  * @enum {string}
@@ -20448,6 +20474,7 @@ export interface paths {
                                 model?: string;
                                 /** @enum {string} */
                                 modelTier?: "smol" | "regular" | "smart" | "ultra";
+                                profile?: string;
                                 /**
                                  * @default recurring
                                  * @enum {string}

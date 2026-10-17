@@ -438,6 +438,16 @@ export const ModelProfileNameSchema = z
   .trim()
   .regex(/^[a-z0-9][a-z0-9._-]{0,99}$/, "lowercase letters, digits, '.', '_' or '-', max 100");
 
+/**
+ * The pooled keys a profile may use, per credential var: the last 5
+ * characters of each allowed key. A var with no entry keeps its whole pool.
+ */
+export const ModelProfileCredentialsSchema = z.record(
+  z.string(),
+  z.array(z.string().length(5)).min(1),
+);
+export type ModelProfileCredentials = z.infer<typeof ModelProfileCredentialsSchema>;
+
 export const ModelProfileSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -448,6 +458,8 @@ export const ModelProfileSchema = z.object({
   description: z.string().nullable(),
   /** `tier:<tier>` (boot seed), `agent-config` (made from an agent's MODEL_OVERRIDE), or null. */
   seededFrom: z.string().nullable(),
+  /** Pooled-key allowlist (column `credentialAllowlist`); null uses the whole pool. */
+  credentials: ModelProfileCredentialsSchema.nullable(),
   createdAt: z.string(),
   lastUpdatedAt: z.string(),
 });
@@ -1804,6 +1816,8 @@ export const ScheduledTaskSchema = z
     lastErrorMessage: z.string().optional(),
     model: z.string().optional(),
     modelTier: ModelTierSchema.optional(),
+    /** Model profile copied onto every fired task; exclusive with model/modelTier. */
+    profile: z.string().optional(),
     scheduleType: z.enum(["recurring", "one_time"]).default("recurring"),
     targetType: ScheduledTaskTargetTypeSchema.default("agent-task"),
     workflowId: z.uuid().optional(),

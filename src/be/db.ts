@@ -5885,6 +5885,7 @@ type ScheduledTaskRow = {
   lastErrorMessage: string | null;
   model: string | null;
   modelTier: string | null;
+  profile: string | null;
   scheduleType: string;
   targetType: string;
   workflowId: string | null;
@@ -5937,6 +5938,7 @@ function rowToScheduledTask(row: ScheduledTaskRow): ScheduledTask {
     lastErrorMessage: row.lastErrorMessage ?? undefined,
     model: row.model ?? undefined,
     modelTier: parseModelTier(row.modelTier) ?? undefined,
+    profile: row.profile ?? undefined,
     scheduleType: row.scheduleType as "recurring" | "one_time",
     targetType: row.targetType as "agent-task" | "workflow" | "script",
     workflowId: row.workflowId ?? undefined,
@@ -6092,6 +6094,7 @@ export interface CreateScheduledTaskData {
   timezone?: string;
   model?: string;
   modelTier?: ModelTier;
+  profile?: string;
   scheduleType?: "recurring" | "one_time";
   targetType?: "agent-task" | "workflow" | "script";
   workflowId?: string;
@@ -6112,11 +6115,11 @@ export async function createScheduledTask(data: CreateScheduledTaskData): Promis
         id, "key", name, description, cronExpression, intervalMs, taskTemplate,
         taskType, tags, priority, targetAgentId, enabled, nextRunAt,
         createdByAgentId, parentTaskId, requestedDelayMs, requestedRunAt,
-        timezone, model, modelTier, scheduleType,
+        timezone, model, modelTier, profile, scheduleType,
         targetType, workflowId, scriptName, scriptArgs, params, requiredParams, requires,
         createdAt, lastUpdatedAt,
         created_by, updated_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     [
       id,
       normalizeAssetKey(data.key ?? defaultAssetKey("schedule", id)),
@@ -6138,6 +6141,7 @@ export async function createScheduledTask(data: CreateScheduledTaskData): Promis
       data.timezone ?? "UTC",
       data.model ?? null,
       data.modelTier ?? null,
+      data.profile ?? null,
       data.scheduleType ?? "recurring",
       data.targetType ?? "agent-task",
       data.workflowId ?? null,
@@ -6177,6 +6181,7 @@ export interface UpdateScheduledTaskData {
   lastErrorMessage?: string | null;
   model?: string | null;
   modelTier?: ModelTier | null;
+  profile?: string | null;
   scheduleType?: "recurring" | "one_time";
   targetType?: "agent-task" | "workflow" | "script";
   workflowId?: string | null;
@@ -6272,6 +6277,10 @@ export async function updateScheduledTask(
   if (data.modelTier !== undefined) {
     updates.push("modelTier = ?");
     params.push(data.modelTier);
+  }
+  if (data.profile !== undefined) {
+    updates.push("profile = ?");
+    params.push(data.profile);
   }
   if (data.scheduleType !== undefined) {
     updates.push("scheduleType = ?");

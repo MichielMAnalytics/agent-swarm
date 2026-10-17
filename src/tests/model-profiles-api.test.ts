@@ -7,6 +7,7 @@ import { createServer, type Server } from "node:http";
 import {
   closeDb,
   createAgent,
+  createScheduledTask,
   createTaskExtended,
   getDbClient,
   getTaskById,
@@ -98,6 +99,7 @@ afterAll(async () => {
 beforeEach(async () => {
   // References first: migration 220's triggers refuse deleting a named profile.
   await getDbClient().run("DELETE FROM agent_tasks");
+  await getDbClient().run("DELETE FROM scheduled_tasks");
   await getDbClient().run("DELETE FROM swarm_config WHERE key = 'MODEL_PROFILE'");
   await getDbClient().run("DELETE FROM model_profiles");
 });
@@ -258,6 +260,153 @@ describe("profile CRUD", () => {
     const inUse = await call("DELETE", "/api/model-profiles/claude-mine", undefined);
     expect(inUse.status).toBe(409);
     expect(((await inUse.json()) as { error: string }).error).toContain("1 agent(s)");
+  });
+});
+
+describe("profile credential allowlist", () => {
+  const base = { harness: "claude", model: "opus" };
+
+  test("POST and PATCH round-trip `credentials`; null clears it; duplicates collapse", async () => {
+    const created = await call("POST", "/api/model-profiles", {
+      ...base,
+      name: "claude-pinned",
+      credentials: { CLAUDE_CODE_OAUTH_TOKEN: ["abcde", "abcde", "fghij"] },
+    });
+    expect(created.status).toBe(201);
+    expect(((await created.json()) as { credentials: unknown }).credentials).toEqual({
+      CLAUDE_CODE_OAUTH_TOKEN: ["abcde", "fghij"],
+    });
+
+    const patched = await call("PATCH", "/api/model-profiles/claude-pinned", {
+      credentials: { ANTHROPIC_API_KEY: ["zzzzz"] },
+    });
+    expect(patched.status).toBe(200);
+    const read = await call("GET", "/api/model-profiles/claude-pinned", undefined);
+    expect(((await read.json()) as { credentials: unknown }).credentials).toEqual({
+      ANTHROPIC_API_KEY: ["zzzzz"],
+    });
+
+    // A PATCH that leaves credentials out keeps them.
+    const kept = await call("PATCH", "/api/model-profiles/claude-pinned", { description: "x" });
+    expect(((await kept.json()) as { credentials: unknown }).credentials).toEqual({
+      ANTHROPIC_API_KEY: ["zzzzz"],
+    });
+
+    const cleared = await call("PATCH", "/api/model-profiles/claude-pinned", {
+      credentials: null,
+    });
+    expect(cleared.status).toBe(200);
+    expect(((await cleared.json()) as { credentials: unknown }).credentials).toBeNull();
+    const row = await getDbClient().get<{ credentialAllowlist: string | null }>(
+      "SELECT credentialAllowlist FROM model_profiles WHERE name = 'claude-pinned'",
+    );
+    expect(row?.credentialAllowlist).toBeNull();
+  });
+
+  test("an unknown var, a CODEX_OAUTH var, an empty list or a bad suffix is 400", async () => {
+    const unknownVar = await call("POST", "/api/model-profiles", {
+      ...base,
+      name: "claude-bad-var",
+      credentials: { OPENAI_API_KEY: ["abcde"] },
+    });
+    expect(unknownVar.status).toBe(400);
+    expect(((await unknownVar.json()) as { error: string }).error).toContain("OPENAI_API_KEY");
+
+    const codexOauth = await call("POST", "/api/model-profiles", {
+      harness: "codex",
+      model: "gpt-5.6-sol",
+      name: "codex-oauth-pinned",
+      credentials: { CODEX_OAUTH: ["abcde"] },
+    });
+    expect(codexOauth.status).toBe(400);
+    expect(((await codexOauth.json()) as { error: string }).error).toContain("not supported in v1");
+
+    const empty = await call("POST", "/api/model-profiles", {
+      ...base,
+      name: "claude-empty",
+      credentials: { CLAUDE_CODE_OAUTH_TOKEN: [] },
+    });
+    expect(empty.status).toBe(400);
+
+    const longSuffix = await call("POST", "/api/model-profiles", {
+      ...base,
+      name: "claude-long",
+      credentials: { CLAUDE_CODE_OAUTH_TOKEN: ["abcdef"] },
+    });
+    expect(longSuffix.status).toBe(400);
+
+    await createModelProfile({ ...base, name: "claude-plain", harness: "claude" });
+    const patchBad = await call("PATCH", "/api/model-profiles/claude-plain", {
+      credentials: { CODEX_OAUTH: ["abcde"] },
+    });
+    expect(patchBad.status).toBe(400);
+  });
+
+  test("a model-prefixed key var is accepted on harnesses that pick the key by model", async () => {
+    const helm = await call("POST", "/api/model-profiles", {
+      harness: "pi",
+      model: "helmcode/deepseek-v4-flash",
+      name: "pi-helm-pinned",
+      credentials: { HELMCODE_API_KEY: ["abcde"] },
+    });
+    expect(helm.status).toBe(201);
+  });
+});
+
+describe("schedule profile references", () => {
+  test("a profile named by a schedule cannot be deleted; the 409 names the schedule", async () => {
+    await createModelProfile({ name: "claude-sched", harness: "claude", model: "opus" });
+    const schedule = await createScheduledTask({
+      name: "profile-sched",
+      cronExpression: "0 * * * *",
+      taskTemplate: "x",
+      profile: "claude-sched",
+    });
+    expect(schedule.profile).toBe("claude-sched");
+
+    const inUse = await call("DELETE", "/api/model-profiles/claude-sched", undefined);
+    expect(inUse.status).toBe(409);
+    const { error } = (await inUse.json()) as { error: string };
+    expect(error).toContain("1 schedule(s)");
+    expect(error).toContain(schedule.id);
+
+    // The statement-level guard holds even past the reference count.
+    expect(await profilesDb.deleteModelProfile("claude-sched")).toBe("in-use");
+
+    await getDbClient().run("UPDATE scheduled_tasks SET profile = NULL WHERE id = ?", [
+      schedule.id,
+    ]);
+    expect((await call("DELETE", "/api/model-profiles/claude-sched", undefined)).status).toBe(200);
+  });
+
+  test("a schedule naming a missing profile is refused by the trigger, on insert and update", async () => {
+    let insertError: unknown;
+    try {
+      await createScheduledTask({
+        name: "ghost-sched",
+        cronExpression: "0 * * * *",
+        taskTemplate: "x",
+        profile: "no-such-profile",
+      });
+    } catch (error) {
+      insertError = error;
+    }
+    expect(profilesDb.modelProfileRefError(insertError)).toBe("missing");
+
+    const schedule = await createScheduledTask({
+      name: "plain-sched",
+      cronExpression: "0 * * * *",
+      taskTemplate: "x",
+    });
+    let updateError: unknown;
+    try {
+      await getDbClient().run("UPDATE scheduled_tasks SET profile = 'nope' WHERE id = ?", [
+        schedule.id,
+      ]);
+    } catch (error) {
+      updateError = error;
+    }
+    expect(profilesDb.modelProfileRefError(updateError)).toBe("missing");
   });
 });
 
@@ -459,6 +608,7 @@ describe("a superseded task holds its profile until its resume exists", () => {
     expect(await profilesDb.modelProfileReferences("claude-handoff")).toEqual({
       agentIds: [],
       openTaskCount: 0,
+      scheduleIds: [],
     });
     expect(await profilesDb.deleteModelProfile("claude-handoff")).toBe("deleted");
 

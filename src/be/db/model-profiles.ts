@@ -6,6 +6,8 @@
  */
 import {
   type ModelProfile,
+  type ModelProfileCredentials,
+  ModelProfileCredentialsSchema,
   type ProviderName,
   ProviderNameSchema,
   type ReasoningEffort,
@@ -27,9 +29,27 @@ type ModelProfileRow = {
   allowCustomModel: number;
   description: string | null;
   seededFrom: string | null;
+  credentialAllowlist: string | null;
   createdAt: string;
   lastUpdatedAt: string;
 };
+
+/** The stored allowlist JSON as a map, or null when unset or unreadable. */
+function parseCredentialAllowlist(value: string | null): ModelProfileCredentials | null {
+  if (!value) return null;
+  try {
+    const parsed = ModelProfileCredentialsSchema.safeParse(JSON.parse(value));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+function serializeCredentialAllowlist(
+  value: ModelProfileCredentials | null | undefined,
+): string | null {
+  return value && Object.keys(value).length > 0 ? JSON.stringify(value) : null;
+}
 
 function rowToModelProfile(row: ModelProfileRow): ModelProfile {
   return {
@@ -43,6 +63,7 @@ function rowToModelProfile(row: ModelProfileRow): ModelProfile {
     allowCustomModel: row.allowCustomModel === 1,
     description: row.description,
     seededFrom: row.seededFrom,
+    credentials: parseCredentialAllowlist(row.credentialAllowlist),
     createdAt: row.createdAt,
     lastUpdatedAt: row.lastUpdatedAt,
   };
@@ -78,6 +99,8 @@ export interface ModelProfileInput {
   allowCustomModel?: boolean;
   description?: string | null;
   seededFrom?: string | null;
+  /** Pooled-key allowlist, stored as `credentialAllowlist`; null uses the whole pool. */
+  credentials?: ModelProfileCredentials | null;
 }
 
 /** Insert a profile. Returns null when the name is taken. */
@@ -88,8 +111,8 @@ export async function createModelProfile(
   const now = new Date().toISOString();
   const row = await getDbClient().get<ModelProfileRow>(
     `INSERT INTO model_profiles
-       (id, name, harness, model, effort, allowCustomModel, description, seededFrom, createdAt, lastUpdatedAt, created_by, updated_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (id, name, harness, model, effort, allowCustomModel, description, seededFrom, credentialAllowlist, createdAt, lastUpdatedAt, created_by, updated_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(name) DO NOTHING
      RETURNING *`,
     [
@@ -101,6 +124,7 @@ export async function createModelProfile(
       input.allowCustomModel ? 1 : 0,
       input.description ?? null,
       input.seededFrom ?? null,
+      serializeCredentialAllowlist(input.credentials),
       now,
       now,
       audit.userId ?? null,
@@ -111,10 +135,13 @@ export async function createModelProfile(
 }
 
 export type ModelProfilePatch = Partial<
-  Pick<ModelProfileInput, "model" | "effort" | "allowCustomModel" | "description">
+  Pick<ModelProfileInput, "model" | "effort" | "allowCustomModel" | "description" | "credentials">
 >;
 
-/** Update a profile's model, effort or description. The name and harness are fixed. */
+/**
+ * Update a profile's model, effort, description or credential allowlist
+ * (`credentials: null` clears it). The name and harness are fixed.
+ */
 export async function updateModelProfile(
   name: string,
   patch: ModelProfilePatch,
@@ -137,6 +164,10 @@ export async function updateModelProfile(
   if (patch.description !== undefined) {
     sets.push("description = ?");
     params.push(patch.description);
+  }
+  if (patch.credentials !== undefined) {
+    sets.push("credentialAllowlist = ?");
+    params.push(serializeCredentialAllowlist(patch.credentials));
   }
   sets.push("lastUpdatedAt = ?", "updated_by = ?");
   params.push(new Date().toISOString(), audit.userId ?? null);
@@ -167,10 +198,13 @@ function repairWindowStart(): string {
   return new Date(Date.now() - SUPERSEDED_RESUME_REPAIR_WINDOW_MS).toISOString();
 }
 
-/** Who still points at a profile: agents with it as default, and tasks that still hold it. */
+/**
+ * Who still points at a profile: agents with it as default, tasks that still
+ * hold it, and schedules that fire tasks with it.
+ */
 export async function modelProfileReferences(
   name: string,
-): Promise<{ agentIds: string[]; openTaskCount: number }> {
+): Promise<{ agentIds: string[]; openTaskCount: number; scheduleIds: string[] }> {
   const agents = await getDbClient().query<{ scopeId: string }>(
     "SELECT scopeId FROM swarm_config WHERE scope = 'agent' AND key = ? AND value = ?",
     [MODEL_PROFILE_CONFIG_KEY, name],
@@ -179,12 +213,20 @@ export async function modelProfileReferences(
     `SELECT COUNT(*) AS n FROM agent_tasks t WHERE t.profile = ? AND ${TASK_HOLDS_PROFILE_SQL}`,
     [name, repairWindowStart()],
   );
-  return { agentIds: agents.map((a) => a.scopeId), openTaskCount: tasks?.n ?? 0 };
+  const schedules = await getDbClient().query<{ id: string }>(
+    "SELECT id FROM scheduled_tasks WHERE profile = ? ORDER BY id",
+    [name],
+  );
+  return {
+    agentIds: agents.map((a) => a.scopeId),
+    openTaskCount: tasks?.n ?? 0,
+    scheduleIds: schedules.map((s) => s.id),
+  };
 }
 
 /**
- * Which migration-220 reference trigger refused a write: `missing` when a task
- * or an agent default names a profile that does not exist.
+ * Which reference trigger (migrations 220, 226) refused a write: `missing` when
+ * a task, a schedule or an agent default names a profile that does not exist.
  */
 export function modelProfileRefError(error: unknown): "missing" | null {
   const message = error instanceof Error ? error.message : "";
@@ -192,11 +234,11 @@ export function modelProfileRefError(error: unknown): "missing" | null {
 }
 
 /**
- * Delete a profile unless a task still holds it (`TASK_HOLDS_PROFILE_SQL`) or
- * an agent default names it. The check is part of the DELETE statement, so a
- * reference written after the caller's own count still makes it `in-use`; the
- * triggers in migration 220 refuse the opposite order (a reference written
- * after this delete).
+ * Delete a profile unless a task still holds it (`TASK_HOLDS_PROFILE_SQL`), an
+ * agent default names it, or a schedule names it. The check is part of the
+ * DELETE statement, so a reference written after the caller's own count still
+ * makes it `in-use`; the triggers in migrations 220 and 226 refuse the
+ * opposite order (a reference written after this delete).
  */
 export async function deleteModelProfile(name: string): Promise<"deleted" | "missing" | "in-use"> {
   const row = await getDbClient().get<{ id: string }>(
@@ -208,6 +250,8 @@ export async function deleteModelProfile(name: string): Promise<"deleted" | "mis
         AND NOT EXISTS (
           SELECT 1 FROM swarm_config
            WHERE scope = 'agent' AND key = ? AND trim(value) = model_profiles.name)
+        AND NOT EXISTS (
+          SELECT 1 FROM scheduled_tasks s WHERE s.profile = model_profiles.name)
       RETURNING id`,
     [name, repairWindowStart(), MODEL_PROFILE_CONFIG_KEY],
   );
