@@ -12250,6 +12250,8 @@ export interface paths {
                                 effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
                                 /** @enum {string} */
                                 resolvedEffort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
+                                profile?: string;
+                                resolvedProfile?: string;
                                 /** @enum {string} */
                                 provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                                 requestedByUserId?: string;

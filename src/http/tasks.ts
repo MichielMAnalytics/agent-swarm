@@ -114,6 +114,8 @@ const AgentTaskSummarySchema = AgentTaskSchema.pick({
   modelAlias: true,
   effort: true,
   resolvedEffort: true,
+  profile: true,
+  resolvedProfile: true,
   provider: true,
   requestedByUserId: true,
   progress: true,
