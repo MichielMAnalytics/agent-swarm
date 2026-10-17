@@ -16,7 +16,14 @@ import { explicitModelErrorForAgent } from "@/be/model-validation";
 import { mergeScheduleTiming, validateRecurringTiming } from "@/be/schedules/validate";
 import { getScript } from "@/be/scripts/db";
 import { calculateNextRun } from "@/scheduler";
-import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
+import {
+  createToolRegistrar,
+  modelTierDeprecatedOutputSchema,
+  modelTierDeprecation,
+  swarmToolOutputSchema,
+  toolErr,
+  toolOk,
+} from "@/tools/utils";
 import {
   AssetKeySchema,
   ModelTierSchema,
@@ -75,7 +82,9 @@ export const patchScheduleInputSchema = z.object({
     ),
   modelTier: ModelTierSchema.nullable()
     .optional()
-    .describe("Portable model tier for tasks created by this schedule. Set to null to clear."),
+    .describe(
+      'Deprecated: pass profile "<harness>-<tier>" instead (same model). Portable model tier for tasks created by this schedule, resolved at claim time through the seeded <harness>-<tier> profile. Set to null to clear.',
+    ),
   allowCustomModel: z
     .boolean()
     .optional()
@@ -125,6 +134,7 @@ export const registerPatchScheduleTool = (server: McpServer) => {
       outputSchema: swarmToolOutputSchema({
         yourAgentId: z.string().optional(),
         schedule: z.looseObject(scheduleDataShape).optional(),
+        modelTierDeprecated: modelTierDeprecatedOutputSchema.optional(),
       }),
     },
     async (
@@ -339,10 +349,20 @@ export const registerPatchScheduleTool = (server: McpServer) => {
           return toolErr("Failed to update schedule.");
         }
 
+        const modelTierDeprecated = modelTierDeprecation(
+          modelTier,
+          updated.targetAgentId
+            ? (await getAgentById(updated.targetAgentId))?.harnessProvider
+            : null,
+        );
         return toolOk(
           `Patched schedule "${updated.name}". Next run: ${updated.nextRunAt || "disabled"}`,
           {
-            data: { yourAgentId: requestInfo.agentId, schedule: updated },
+            data: {
+              yourAgentId: requestInfo.agentId,
+              schedule: updated,
+              ...(modelTierDeprecated ? { modelTierDeprecated } : {}),
+            },
           },
         );
       } catch (error) {

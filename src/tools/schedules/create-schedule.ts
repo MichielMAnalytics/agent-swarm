@@ -14,10 +14,18 @@ import {
 import { explicitModelErrorForAgent } from "@/be/model-validation";
 import { getScript } from "@/be/scripts/db";
 import { calculateNextRun } from "@/scheduler";
-import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
+import {
+  createToolRegistrar,
+  modelTierDeprecatedOutputSchema,
+  modelTierDeprecation,
+  swarmToolOutputSchema,
+  toolErr,
+  toolOk,
+} from "@/tools/utils";
 import {
   AssetKeySchema,
   ModelTierSchema,
+  type ProviderName,
   ScheduledTaskTargetTypeSchema,
   splitLegacyModelAlias,
 } from "../../types";
@@ -108,7 +116,7 @@ export const createScheduleInputSchema = z.object({
       "Concrete model override for tasks created by this schedule. Interpreted by each assignee's harness/provider and does not switch providers. Prefer modelTier for portable intent. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected.",
     ),
   modelTier: ModelTierSchema.optional().describe(
-    "Portable model tier for tasks created by this schedule: 'smol', 'regular', 'smart', or 'ultra'. Resolved by each assignee's harness/provider at run time.",
+    "Deprecated: pass profile \"<harness>-<tier>\" instead (same model). Portable model tier for tasks created by this schedule: 'smol', 'regular', 'smart', or 'ultra'. Resolved at claim time through the seeded <harness>-<tier> profile of each assignee's harness.",
   ),
   allowCustomModel: z
     .boolean()
@@ -159,6 +167,7 @@ export const registerCreateScheduleTool = (server: McpServer) => {
       outputSchema: swarmToolOutputSchema({
         yourAgentId: z.string().optional(),
         schedule: z.looseObject(scheduleDataShape).optional(),
+        modelTierDeprecated: modelTierDeprecatedOutputSchema.optional(),
       }),
     },
     async (
@@ -239,6 +248,7 @@ export const registerCreateScheduleTool = (server: McpServer) => {
       }
 
       // Validate targetAgentId if provided
+      let targetHarness: ProviderName | null | undefined = null;
       if (targetAgentId) {
         const agent = await getAgentById(targetAgentId);
         if (!agent) {
@@ -247,6 +257,7 @@ export const registerCreateScheduleTool = (server: McpServer) => {
         if (isExtensionAgent(agent)) {
           return toolErr(extensionAgentAssignmentError(agent));
         }
+        targetHarness = agent.harnessProvider;
       }
 
       // Cross-field targetType validation
@@ -328,10 +339,15 @@ export const registerCreateScheduleTool = (server: McpServer) => {
         const scheduleDesc = isOneTime
           ? `one-time at ${schedule.nextRunAt}`
           : cronExpression || `every ${intervalMs}ms`;
+        const modelTierDeprecated = modelTierDeprecation(modelTier, targetHarness);
         return toolOk(
           `Created schedule "${name}" (${scheduleDesc}). Next run: ${schedule.nextRunAt || "disabled"}`,
           {
-            data: { yourAgentId: requestInfo.agentId, schedule },
+            data: {
+              yourAgentId: requestInfo.agentId,
+              schedule,
+              ...(modelTierDeprecated ? { modelTierDeprecated } : {}),
+            },
           },
         );
       } catch (error) {
