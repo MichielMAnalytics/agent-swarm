@@ -171,14 +171,16 @@ export async function routePoolTasks(
   // check, as on the poll's unassigned scan. Memoized per pass. A runtime token's
   // config read may omit secret repo rows while a shared-key runtime reads them,
   // so judge the config each runtime that could start the task gets: every live
-  // runtime for a warm candidate, the token a woken runtime is minted for a wake.
+  // runtime, plus the token a woken runtime is minted for a wake.
   const runtimeAuthModes = withLiveRuntime === null ? null : await liveRuntimeAuthModes();
   const secretViews = (agent: Agent, viaWake: boolean): boolean[] => {
     if (runtimeAuthModes === null) return [true];
     const tokenView = runtimeReadsRepoSecrets(agent);
-    const modes = viaWake ? undefined : runtimeAuthModes.get(agent.id);
-    if (!modes?.length) return [tokenView];
-    return [...new Set(modes.map((runtimeToken) => (runtimeToken ? tokenView : true)))];
+    const views = (runtimeAuthModes.get(agent.id) ?? []).map((runtimeToken) =>
+      runtimeToken ? tokenView : true,
+    );
+    if (viaWake || !views.length) views.push(tokenView);
+    return [...new Set(views)];
   };
   const profileOk = new Map<string, boolean>();
   const passesProfileCheck = async (

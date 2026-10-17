@@ -18,6 +18,11 @@ import { createModelProfile, getAgentDefaultProfileName } from "../be/db/model-p
 import { checkProfileForAgent } from "../be/model-profile-check";
 import { recordClaimModelResolution } from "../be/model-tier-resolution";
 import { upsertRuntimeInstance } from "../be/multi-runtime";
+import {
+  bindAgentToPool,
+  createRuntimeController,
+  createRuntimePool,
+} from "../be/runtime-pools/db";
 import { routePoolTasks } from "../be/runtime-pools/routing";
 import { mintRuntimeToken } from "../be/users";
 import { handlePoll } from "../http/poll";
@@ -385,6 +390,9 @@ describe("a task's own profile", () => {
     });
     afterEach(async () => {
       await getDbClient().run("DELETE FROM runtime_instances");
+      await getDbClient().run("UPDATE agents SET runtime_pool_id = NULL");
+      await getDbClient().run("DELETE FROM runtime_pools");
+      await getDbClient().run("DELETE FROM runtime_controllers");
       for (const [key, value] of Object.entries(saved)) {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
@@ -482,6 +490,37 @@ describe("a task's own profile", () => {
       });
       expect(await routePoolTasks()).toEqual([{ taskId: keyB.id, agentId: w.id }]);
       expect((await getTaskById(keyA.id))?.status).toBe("unassigned");
+    });
+
+    test("a wake past the grace still judges the agent's live shared-key runtime", async () => {
+      const w = await keyedWorker("p-route-wake");
+      const controller = await createRuntimeController({ name: "p-wake-docker", kind: "docker" });
+      const pool = await createRuntimePool({
+        name: "p-wake-coders",
+        kind: "docker",
+        placements: [controller.id],
+        image: "test-worker",
+      });
+      await bindAgentToPool(w.id, pool.id);
+      await upsertRuntimeInstance({ id: crypto.randomUUID(), agentId: w.id, reportedSlots: 1 });
+
+      // The live runtime reads 22222 and would poll the woken task before any
+      // new runtime starts, so the 11111 task waits, before and after the grace.
+      const task = await createTaskExtended("needs 11111", {
+        profile: "p-route-wake-key-a",
+        vcsRepo: "acme/widgets",
+      });
+      const afterGrace = new Date(Date.parse(task.createdAt) + 16000);
+      expect(await routePoolTasks({ now: new Date(task.createdAt) })).toEqual([]);
+      expect(await routePoolTasks({ now: afterGrace })).toEqual([]);
+      expect((await getTaskById(task.id))?.status).toBe("unassigned");
+
+      // Control: a fully cold wake is judged as the minted token, which reads 11111.
+      await getDbClient().run("DELETE FROM runtime_instances");
+      expect(await routePoolTasks({ now: afterGrace })).toEqual([
+        { taskId: task.id, agentId: w.id },
+      ]);
+      expect((await getTaskById(task.id))?.poolWakeAt).toBe(afterGrace.toISOString());
     });
   });
 });
