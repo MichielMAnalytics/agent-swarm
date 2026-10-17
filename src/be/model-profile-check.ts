@@ -59,7 +59,7 @@ function harnessRow(profile: ModelProfile, harness: string | null): ProfileCheck
   return {
     check: "harness",
     state: "fail",
-    detail: `profile runs on ${profile.harness}; the agent runs ${harness}`,
+    detail: `profile runs on the ${profile.harness} harness; the agent runs ${harness}`,
   };
 }
 

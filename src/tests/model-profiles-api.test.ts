@@ -4,6 +4,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   closeDb,
   createAgent,
@@ -23,6 +25,7 @@ import { handleAgentsRest } from "../http/agents";
 import { handleModelProfiles } from "../http/model-profiles";
 import { handleTasks } from "../http/tasks";
 import * as followUps from "../tasks/worker-follow-up";
+import { registerSendTaskTool } from "../tools/send-task";
 import type { User } from "../types";
 import { setRequestAuth } from "../utils/request-auth-context";
 import { listenOnFreePort } from "./test-net";
@@ -100,7 +103,9 @@ beforeEach(async () => {
   // References first: migration 220's triggers refuse deleting a named profile.
   await getDbClient().run("DELETE FROM agent_tasks");
   await getDbClient().run("DELETE FROM scheduled_tasks");
-  await getDbClient().run("DELETE FROM swarm_config WHERE key = 'MODEL_PROFILE'");
+  await getDbClient().run(
+    "DELETE FROM swarm_config WHERE key IN ('MODEL_PROFILE', 'CLAUDE_CODE_OAUTH_TOKEN')",
+  );
   await getDbClient().run("DELETE FROM model_profiles");
 });
 
@@ -722,6 +727,110 @@ describe("agent default via PATCH /api/agents/{id}/runtime", () => {
       value: "haiku",
     });
     expect(await modelProfileConfig(CLAUDE_ID)).not.toBeNull();
+  });
+});
+
+describe("the profile check gates the agent default and task creation", () => {
+  // CLAUDE_ID's pooled key ends 11111. The worker has not reported, so the
+  // harness-credentials row is unverified and only the allowlist decides.
+  async function poolOneKey(): Promise<void> {
+    await upsertSwarmConfig({
+      scope: "agent",
+      scopeId: CLAUDE_ID,
+      key: "CLAUDE_CODE_OAUTH_TOKEN",
+      value: "sk-ant-oat01-pooled-key-11111",
+      exportToEnv: true,
+    });
+  }
+
+  test("PATCH runtime with an allowlist no pooled key matches is 400 naming the var", async () => {
+    await poolOneKey();
+    await createModelProfile({
+      name: "claude-no-key",
+      harness: "claude",
+      model: "opus",
+      credentials: { CLAUDE_CODE_OAUTH_TOKEN: ["zzzzz"] },
+    });
+    const res = await call("PATCH", `/api/agents/${CLAUDE_ID}/runtime`, {
+      harness_provider: "claude",
+      profile: "claude-no-key",
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string; check: { ok: boolean } };
+    expect(body.error).toContain("credential-allowlist");
+    expect(body.error).toContain("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(body.error).not.toContain("pooled-key");
+    expect(body.check.ok).toBe(false);
+    expect(await modelProfileConfig(CLAUDE_ID)).toBeNull();
+  });
+
+  test("PATCH runtime with a warn-only profile is 200 and returns profileCheck", async () => {
+    await poolOneKey();
+    await createModelProfile({
+      name: "claude-some-keys",
+      harness: "claude",
+      model: "opus",
+      credentials: { CLAUDE_CODE_OAUTH_TOKEN: ["11111", "zzzzz"] },
+    });
+    const res = await call("PATCH", `/api/agents/${CLAUDE_ID}/runtime`, {
+      harness_provider: "claude",
+      profile: "claude-some-keys",
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      id: string;
+      profileCheck: { ok: boolean; profiles: { checks: { check: string; state: string }[] }[] };
+    };
+    expect(body.id).toBe(CLAUDE_ID);
+    expect(body.profileCheck.ok).toBe(true);
+    expect(body.profileCheck.profiles[0]?.checks).toContainEqual(
+      expect.objectContaining({ check: "credential-allowlist", state: "warn" }),
+    );
+    expect(await modelProfileConfig(CLAUDE_ID)).toEqual({
+      value: "claude-some-keys",
+      exportToEnv: 0,
+    });
+  });
+
+  test("send-task to an agent that fails the check is a tool error listing the failing rows", async () => {
+    await poolOneKey();
+    await createModelProfile({
+      name: "claude-no-key",
+      harness: "claude",
+      model: "gpt-5.6-sol",
+      credentials: { CLAUDE_CODE_OAUTH_TOKEN: ["zzzzz"] },
+    });
+    const mcp = new McpServer({ name: "test-model-profiles-send-task", version: "1.0.0" });
+    registerSendTaskTool(mcp);
+    const tool = (
+      mcp as unknown as {
+        _registeredTools: Record<
+          string,
+          { handler: (args: unknown, extra: unknown) => Promise<CallToolResult> }
+        >;
+      }
+    )._registeredTools["send-task"];
+    const result = await tool!.handler(
+      {
+        task: "profile work",
+        agentId: CLAUDE_ID,
+        routingReason: "human_pinned",
+        routingNote: "This test pins the target",
+        profile: "claude-no-key",
+        allowDuplicate: true,
+      },
+      { sessionId: "test-session", requestInfo: { headers: { "x-agent-id": LEAD_ID } } },
+    );
+    expect(result.isError).toBe(true);
+    const text = (result.content as { type: string; text: string }[])
+      .map((part) => part.text)
+      .join("\n");
+    expect(text).toContain('Model profile "claude-no-key" fails model');
+    expect(text).toContain('Model profile "claude-no-key" fails credential-allowlist');
+    expect(text).toContain("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(
+      await getDbClient().get("SELECT id FROM agent_tasks WHERE profile = 'claude-no-key'"),
+    ).toBeNull();
   });
 });
 

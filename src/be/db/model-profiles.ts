@@ -14,6 +14,7 @@ import {
   ReasoningEffortSchema,
 } from "../../types";
 import { vcsRepoName, vcsRepoUrlMatches } from "../../utils/vcs-repo-match";
+import { checkProfileForAgent, formatProfileCheckFailures } from "../model-profile-check";
 import { getDbClient } from "./runtime";
 import { SUPERSEDED_RESUME_REPAIR_WINDOW_MS } from "./tasks/read";
 
@@ -298,10 +299,11 @@ export async function repoModelOverrideKeys(
 }
 
 /**
- * Why a task cannot ask for `profile`, or null when it can. PR 1 validity is
- * the harness only: the profile must exist and, when the target agent is known
- * and has a harness, run on that harness. `profile` is exclusive with `model`
- * and `modelTier`, which pick the model another way.
+ * Why a task cannot ask for `profile`, or null when it can. The profile must
+ * exist and, when the target agent is known, pass `checkProfileForAgent`
+ * (harness, model, credentials, allowlist). A pooled task (no agent) is judged
+ * per agent at claim instead. `profile` is exclusive with `model` and
+ * `modelTier`, which pick the model another way.
  */
 export async function taskProfileError(check: {
   profile?: string | null;
@@ -319,14 +321,9 @@ export async function taskProfileError(check: {
     return `Unknown model profile "${name}". List profiles with list-model-profiles.`;
   }
   if (!check.agentId) return null;
-  const agent = await getDbClient().get<{ harness: string | null }>(
-    "SELECT COALESCE(harness_provider, provider) AS harness FROM agents WHERE id = ?",
-    [check.agentId],
-  );
-  if (agent?.harness && agent.harness !== profile.harness) {
-    return `Model profile "${name}" runs on the ${profile.harness} harness; the target agent runs ${agent.harness}.`;
-  }
-  return null;
+  const result = await checkProfileForAgent(check.agentId, name);
+  if (!result || result.ok) return null;
+  return formatProfileCheckFailures(result);
 }
 
 type OverrideRowState = { value: string; exportToEnv?: number } | null;

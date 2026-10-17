@@ -170,6 +170,38 @@ describe("a task's own profile", () => {
     expect(trigger?.taskId).toBe(task.id);
     expect(trigger?.task.resolvedProfile).toBe("claude-opus-high");
   });
+
+  test("a pool task waits for a worker that passes the profile check", async () => {
+    await createModelProfile({
+      name: "claude-pinned-key",
+      harness: "claude",
+      model: "opus",
+      credentials: { CLAUDE_CODE_OAUTH_TOKEN: ["22222"] },
+    });
+    const a = await worker("p-check-fail", "claude");
+    const b = await worker("p-check-pass", "claude");
+    for (const [agentId, value] of [
+      [a.id, "sk-ant-oat01-key-a-11111"],
+      [b.id, "sk-ant-oat01-key-b-22222"],
+    ] as const) {
+      await upsertSwarmConfig({
+        scope: "agent",
+        scopeId: agentId,
+        key: "CLAUDE_CODE_OAUTH_TOKEN",
+        value,
+        exportToEnv: true,
+      });
+    }
+    // Two tasks on one profile: A judges it once per poll and skips both.
+    const first = await createTaskExtended("pool work", { profile: "claude-pinned-key" });
+    await createTaskExtended("pool work", { profile: "claude-pinned-key" });
+
+    expect(await callPoll(a.id)).toBeNull();
+    expect((await getTaskById(first.id))?.status).toBe("unassigned");
+    const trigger = await callPoll(b.id);
+    expect(trigger?.taskId).toBe(first.id);
+    expect(trigger?.task.resolvedProfile).toBe("claude-pinned-key");
+  });
 });
 
 describe("the agent's default profile", () => {

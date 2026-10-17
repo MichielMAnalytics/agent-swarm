@@ -35,7 +35,7 @@ import {
 } from "../be/db/model-profiles";
 import { createEvent } from "../be/events";
 import { setAgentHarnessCliVersion } from "../be/harness-model-support";
-import { checkProfileForAgent } from "../be/model-profile-check";
+import { checkProfileForAgent, formatProfileCheckFailures } from "../be/model-profile-check";
 import {
   sanitizeModelTierOverrides,
   setAgentModelTierOverrides,
@@ -65,6 +65,7 @@ import {
   AgentStatusSchema,
   AgentWithTasksSchema,
   DeliveryModeSchema,
+  type ProfileCheckResult,
   ProfileCheckResultSchema,
   type ProfileSyncConflict,
   type ProviderName,
@@ -285,7 +286,7 @@ const updateAgentRuntimeRoute = route({
   pattern: ["api", "agents", null, "runtime"],
   summary: "Update an agent's runtime harness and default model",
   description:
-    "Updates `agents.harness_provider` and agent-scoped runtime config. The settings apply to future provider sessions. For `model`, `reasoning_effort`, and `claude.transport`: omit the field to leave it unchanged, send `null` to clear the corresponding override, or send a value to set it. A `model` the model catalog does not list is a 400 unless `allow_custom_model` is true. A `latest:` alias is not accepted here (aliases resolve for a task's model and for `MODEL_TIER_*` values); `reasoning_effort` must be one the harness and model support. `profile` sets the agent's default model profile (same tri-state): it must exist and run on `harness_provider`, and it cannot be sent with `model`. Sending `model`, or changing the model or effort override by any path, clears the default profile.",
+    "Updates `agents.harness_provider` and agent-scoped runtime config. The settings apply to future provider sessions. For `model`, `reasoning_effort`, and `claude.transport`: omit the field to leave it unchanged, send `null` to clear the corresponding override, or send a value to set it. A `model` the model catalog does not list is a 400 unless `allow_custom_model` is true. A `latest:` alias is not accepted here (aliases resolve for a task's model and for `MODEL_TIER_*` values); `reasoning_effort` must be one the harness and model support. `profile` sets the agent's default model profile (same tri-state): it must exist, run on `harness_provider` and pass the profile check (`GET /api/agents/{id}/profile-check`) against it, and it cannot be sent with `model`. A failing check is a 400 `{ error, check }`; a passing one returns the result as `profileCheck`. Sending `model`, or changing the model or effort override by any path, clears the default profile.",
   tags: ["Agents"],
   params: z.object({ id: z.string() }),
   query: z.object({ repoId: z.string().optional() }),
@@ -299,8 +300,12 @@ const updateAgentRuntimeRoute = route({
     claude: ClaudeRuntimeConfigSchema.optional(),
   }),
   responses: {
-    200: { description: "Updated agent row", schema: AgentWithCapacitySchema },
-    400: { description: "Validation error" },
+    200: {
+      description:
+        "Updated agent row. `profileCheck` is set when the body set `profile`, so warnings show.",
+      schema: AgentWithCapacitySchema.extend({ profileCheck: ProfileCheckResultSchema.optional() }),
+    },
+    400: { description: "Validation error, or `{ error, check }` when the profile check fails" },
     404: { description: "Agent not found" },
   },
 });
@@ -1156,6 +1161,7 @@ export async function handleAgentsRest(
     const { harness_provider, model, allow_custom_model, reasoning_effort, profile, acp, claude } =
       parsed.body;
 
+    let profileCheck: ProfileCheckResult | null = null;
     if (typeof profile === "string") {
       if (model !== undefined) {
         jsonError(res, "Send `profile` or `model`, not both", 400);
@@ -1172,6 +1178,15 @@ export async function handleAgentsRest(
           `Model profile "${profile}" runs on the ${picked.harness} harness, not ${harness_provider}`,
           400,
         );
+        return true;
+      }
+      // Judged against the body's harness: a PATCH that also switches it is
+      // checked against the new one.
+      profileCheck = await checkProfileForAgent(parsed.params.id, profile, {
+        harness: harness_provider,
+      });
+      if (profileCheck && !profileCheck.ok) {
+        json(res, { error: formatProfileCheckFailures(profileCheck), check: profileCheck }, 400);
         return true;
       }
     }
@@ -1413,7 +1428,10 @@ export async function handleAgentsRest(
       jsonError(res, "Agent not found", 404);
       return true;
     }
-    updateAgentRuntimeRoute.respond(res, 200, await agentWithCapacity(agent));
+    updateAgentRuntimeRoute.respond(res, 200, {
+      ...(await agentWithCapacity(agent)),
+      ...(profileCheck ? { profileCheck } : {}),
+    });
     return true;
   }
 

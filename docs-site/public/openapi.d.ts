@@ -2470,7 +2470,7 @@ export interface paths {
         head?: never;
         /**
          * Update an agent's runtime harness and default model
-         * @description Updates `agents.harness_provider` and agent-scoped runtime config. The settings apply to future provider sessions. For `model`, `reasoning_effort`, and `claude.transport`: omit the field to leave it unchanged, send `null` to clear the corresponding override, or send a value to set it. A `model` the model catalog does not list is a 400 unless `allow_custom_model` is true. A `latest:` alias is not accepted here (aliases resolve for a task's model and for `MODEL_TIER_*` values); `reasoning_effort` must be one the harness and model support. `profile` sets the agent's default model profile (same tri-state): it must exist and run on `harness_provider`, and it cannot be sent with `model`. Sending `model`, or changing the model or effort override by any path, clears the default profile.
+         * @description Updates `agents.harness_provider` and agent-scoped runtime config. The settings apply to future provider sessions. For `model`, `reasoning_effort`, and `claude.transport`: omit the field to leave it unchanged, send `null` to clear the corresponding override, or send a value to set it. A `model` the model catalog does not list is a 400 unless `allow_custom_model` is true. A `latest:` alias is not accepted here (aliases resolve for a task's model and for `MODEL_TIER_*` values); `reasoning_effort` must be one the harness and model support. `profile` sets the agent's default model profile (same tri-state): it must exist, run on `harness_provider` and pass the profile check (`GET /api/agents/{id}/profile-check`) against it, and it cannot be sent with `model`. A failing check is a 400 `{ error, check }`; a passing one returns the result as `profileCheck`. Sending `model`, or changing the model or effort override by any path, clears the default profile.
          */
         patch: {
             parameters: {
@@ -2513,7 +2513,7 @@ export interface paths {
                 };
             };
             responses: {
-                /** @description Updated agent row */
+                /** @description Updated agent row. `profileCheck` is set when the body set `profile`, so warnings show. */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -2525,10 +2525,11 @@ export interface paths {
                                 max: number;
                                 available: number;
                             };
+                            profileCheck?: components["schemas"]["ProfileCheckResult"];
                         };
                     };
                 };
-                /** @description Validation error */
+                /** @description Validation error, or `{ error, check }` when the profile check fails */
                 400: {
                     headers: {
                         [name: string]: unknown;
