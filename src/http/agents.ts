@@ -35,6 +35,7 @@ import {
 } from "../be/db/model-profiles";
 import { createEvent } from "../be/events";
 import { setAgentHarnessCliVersion } from "../be/harness-model-support";
+import { checkProfileForAgent } from "../be/model-profile-check";
 import {
   sanitizeModelTierOverrides,
   setAgentModelTierOverrides,
@@ -64,6 +65,7 @@ import {
   AgentStatusSchema,
   AgentWithTasksSchema,
   DeliveryModeSchema,
+  ProfileCheckResultSchema,
   type ProfileSyncConflict,
   type ProviderName,
   ProviderNameSchema,
@@ -608,6 +610,22 @@ const getAgentCredentialStatusRoute = route({
   responses: {
     200: { description: "Credential status payload", schema: AgentCredentialStatusEntrySchema },
     404: { description: "Agent not found" },
+  },
+});
+
+const getAgentProfileCheckRoute = route({
+  method: "get",
+  path: "/api/agents/{id}/profile-check",
+  pattern: ["api", "agents", null, "profile-check"],
+  summary: "Check whether an agent can run a model profile",
+  description:
+    "Read-only. Judges the profile's harness, model, the agent's credential report and the profile's credential allowlist. Each row is pass, warn, fail or unverified; `ok` is false only when a row fails. Never returns a secret value.",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  query: z.object({ profile: z.string().trim().min(1) }),
+  responses: {
+    200: { description: "The check result", schema: ProfileCheckResultSchema },
+    404: { description: "Agent or profile not found" },
   },
 });
 
@@ -1529,6 +1547,22 @@ export async function handleAgentsRest(
       credStatus: agent.credStatus ?? null,
       lastCheckedAt: agent.lastUpdatedAt,
     });
+    return true;
+  }
+
+  if (getAgentProfileCheckRoute.match(req.method, pathSegments)) {
+    const parsed = await getAgentProfileCheckRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!(await getAgentById(parsed.params.id))) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+    const result = await checkProfileForAgent(parsed.params.id, parsed.query.profile);
+    if (!result) {
+      jsonError(res, `Model profile "${parsed.query.profile}" not found`, 404);
+      return true;
+    }
+    getAgentProfileCheckRoute.respond(res, 200, result);
     return true;
   }
 

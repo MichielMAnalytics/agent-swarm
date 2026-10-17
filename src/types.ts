@@ -465,6 +465,37 @@ export const ModelProfileSchema = z.object({
 });
 export type ModelProfile = z.infer<typeof ModelProfileSchema>;
 
+/** One check's verdict: only `fail` blocks; `unverified` means nothing to judge yet. */
+export const ProfileCheckStateSchema = z.enum(["pass", "warn", "fail", "unverified"]);
+export type ProfileCheckState = z.infer<typeof ProfileCheckStateSchema>;
+
+export const ProfileCheckRowSchema = z.object({
+  check: z.enum(["harness", "model", "harness-credentials", "credential-allowlist"]),
+  state: ProfileCheckStateSchema,
+  /** Why, in words. Names vars and key suffixes, never a secret value. */
+  detail: z.string().optional(),
+});
+export type ProfileCheckRow = z.infer<typeof ProfileCheckRowSchema>;
+
+/**
+ * Whether an agent can run a profile. `profiles[0]` is the primary; `ok` is
+ * true when it has no `fail` row.
+ */
+export const ProfileCheckResultSchema = z
+  .object({
+    agentId: z.string(),
+    ok: z.boolean(),
+    profiles: z.array(
+      z.object({
+        name: z.string(),
+        ok: z.boolean(),
+        checks: z.array(ProfileCheckRowSchema),
+      }),
+    ),
+  })
+  .openapi("ProfileCheckResult");
+export type ProfileCheckResult = z.infer<typeof ProfileCheckResultSchema>;
+
 // ============================================================================
 // Task Steering Messages
 // ============================================================================

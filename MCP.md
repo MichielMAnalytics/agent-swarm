@@ -29,6 +29,7 @@ SDK allowlist instead), and HTTP REST routes are generally not gated.
   - [get-metrics](#get-metrics)
   - [send-task](#send-task)
   - [list-model-profiles](#list-model-profiles)
+  - [check-model-profile](#check-model-profile)
   - [get-task-details](#get-task-details)
   - [store-progress](#store-progress)
   - [my-agent-info](#my-agent-info)
@@ -324,6 +325,17 @@ List model profiles: named harness + model + effort combinations. Pass a profile
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `harness` | `claude \| codex \| pi \| devin \| claude-managed \| opencode \| acp \| dsh \| amp \| cursor \| grok` | No | - | Only profiles for this harness (claude, codex, pi, ...). |
+
+### check-model-profile
+
+**Check Model Profile**
+
+Check whether an agent can run a model profile before you pass it as `profile` or set it as the agent's default. Judges the harness, the model, the agent's credential report and the profile's credential allowlist. Each row is pass, warn, fail or unverified; only a fail blocks.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `agentId` | `string` | Yes | - | The agent that would run the profile. |
+| `profile` | `string` | Yes | - | Model profile name (see list-model-profiles). |
 
 ### get-task-details
 

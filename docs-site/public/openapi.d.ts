@@ -3121,6 +3121,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/agents/{id}/profile-check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Check whether an agent can run a model profile
+         * @description Read-only. Judges the profile's harness, model, the agent's credential report and the profile's credential allowlist. Each row is pass, warn, fail or unverified; `ok` is false only when a row fails. Never returns a secret value.
+         */
+        get: {
+            parameters: {
+                query: {
+                    profile: string;
+                };
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The check result */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ProfileCheckResult"];
+                    };
+                };
+                /** @description Agent or profile not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/agents/credential-status": {
         parameters: {
             query?: never;
@@ -25203,6 +25255,21 @@ export interface components {
             createdAt: string;
             /** Format: date-time */
             lastUpdatedAt: string;
+        };
+        ProfileCheckResult: {
+            agentId: string;
+            ok: boolean;
+            profiles: {
+                name: string;
+                ok: boolean;
+                checks: {
+                    /** @enum {string} */
+                    check: "harness" | "model" | "harness-credentials" | "credential-allowlist";
+                    /** @enum {string} */
+                    state: "pass" | "warn" | "fail" | "unverified";
+                    detail?: string;
+                }[];
+            }[];
         };
         AssetSummary: {
             /** @enum {string} */
