@@ -8,6 +8,7 @@
  * reaches a row's `detail`: rows name vars and 5-character key suffixes only.
  */
 import { harnessModelMismatch, isAlias, isHarnessModelJudged } from "@desplega/model-catalog";
+import { can } from "../rbac";
 import type {
   Agent,
   ModelProfile,
@@ -48,6 +49,19 @@ export interface ProfileCheckOptions {
   vcsRepo?: string | null;
   /** Whether the worker's config read includes secret repo rows (`readsRepoSecrets`). */
   includeRepoSecrets?: boolean;
+}
+
+/**
+ * Whether a runtime-token agent's config read includes secret repo rows: only
+ * with `config.read.secrets`. Other callers always get them.
+ */
+export function runtimeReadsRepoSecrets(agent: { id: string; isLead?: boolean }): boolean {
+  return can({
+    principal: { kind: "agent", agentId: agent.id, isLead: agent.isLead ?? false },
+    verb: "config.read.secrets",
+    resource: { kind: "none" },
+    source: "http",
+  }).allow;
 }
 
 /**

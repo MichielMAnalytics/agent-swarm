@@ -979,16 +979,6 @@ export async function handleTasks(
       jsonError(res, modelError, 400);
       return true;
     }
-    const profileError = await taskProfileError({
-      profile: parsed.body.profile,
-      ...splitLegacyModelAlias({ model: parsed.body.model, modelTier: parsed.body.modelTier }),
-      agentId: defaultAgentId,
-    });
-    if (profileError) {
-      jsonError(res, profileError, 400);
-      return true;
-    }
-
     const parentTask = parsed.body.parentTaskId
       ? await getTaskById(parsed.body.parentTaskId)
       : null;
@@ -1025,6 +1015,18 @@ export async function handleTasks(
         .allow
     ) {
       jsonError(res, "Permission denied: only a lead can bind a task to a chat thread.", 403);
+      return true;
+    }
+    // The child inherits the parent's repo in createTaskExtended, and the worker
+    // loads that repo's config, so the profile check judges the same pool.
+    const profileError = await taskProfileError({
+      profile: parsed.body.profile,
+      ...splitLegacyModelAlias({ model: parsed.body.model, modelTier: parsed.body.modelTier }),
+      agentId: defaultAgentId,
+      vcsRepo: parentTask?.vcsRepo,
+    });
+    if (profileError) {
+      jsonError(res, profileError, 400);
       return true;
     }
     let assetKey: string | undefined;

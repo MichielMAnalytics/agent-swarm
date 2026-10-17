@@ -17,10 +17,12 @@ import {
 import { createModelProfile, getAgentDefaultProfileName } from "../be/db/model-profiles";
 import { checkProfileForAgent } from "../be/model-profile-check";
 import { recordClaimModelResolution } from "../be/model-tier-resolution";
+import { upsertRuntimeInstance } from "../be/multi-runtime";
 import { routePoolTasks } from "../be/runtime-pools/routing";
 import { handlePoll } from "../http/poll";
 import { taskModelPin } from "../tasks/model-pin";
 import { inheritedModelSelection } from "../tasks/worker-follow-up";
+import { setRequestAuth } from "../utils/request-auth-context";
 
 const TEST_DB_PATH = "./test-profile-claim.sqlite";
 
@@ -36,13 +38,27 @@ async function removeDbFiles(path: string): Promise<void> {
 
 type Trigger = { type: string; taskId: string; task: Record<string, unknown> };
 
-async function callPoll(agentId: string): Promise<Trigger | null> {
+async function callPoll(agentId: string, runtimeId?: string): Promise<Trigger | null> {
   let bodyStr = "";
   const req = {
     method: "GET",
     url: "/api/poll",
-    headers: { "x-agent-id": agentId },
+    headers: {
+      "x-agent-id": agentId,
+      ...(runtimeId ? { "x-runtime-instance-id": runtimeId } : {}),
+    },
   } as unknown as Parameters<typeof handlePoll>[0];
+  // A runtime-token poll, as a pooled worker's runtime makes it.
+  if (runtimeId) {
+    setRequestAuth(req, {
+      kind: "agent",
+      agentId,
+      taskId: null,
+      runtimeId,
+      tokenId: "runtime-token",
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    });
+  }
   const res = {
     setHeader() {},
     writeHead() {},
@@ -277,6 +293,75 @@ describe("a task's own profile", () => {
     const trigger = await callPoll(b.id);
     expect(trigger?.taskId).toBe(task.id);
     expect(trigger?.task.resolvedProfile).toBe("claude-routed-key");
+  });
+
+  test("pool routing judges a runtime worker on the config its runtime token reads", async () => {
+    const saved = {
+      RUNTIME_POOLS_ENABLED: process.env.RUNTIME_POOLS_ENABLED,
+      MULTI_RUNTIME_ENABLED: process.env.MULTI_RUNTIME_ENABLED,
+    };
+    process.env.RUNTIME_POOLS_ENABLED = "true";
+    process.env.MULTI_RUNTIME_ENABLED = "true";
+    try {
+      await createModelProfile({
+        name: "claude-secret-repo-key",
+        harness: "claude",
+        model: "opus",
+        credentials: { CLAUDE_CODE_OAUTH_TOKEN: ["22222"] },
+      });
+      const w = await worker("p-route-runtime", "claude");
+      const runtimeId = crypto.randomUUID();
+      await upsertRuntimeInstance({ id: runtimeId, agentId: w.id, reportedSlots: 1 });
+      await upsertSwarmConfig({
+        scope: "agent",
+        scopeId: w.id,
+        key: "CLAUDE_CODE_OAUTH_TOKEN",
+        value: "sk-ant-oat01-key-a-11111",
+        exportToEnv: true,
+      });
+      const repo = await createSwarmRepo({
+        url: "https://github.com/acme/widgets",
+        name: "widgets",
+      });
+      // A non-lead runtime token does not read secret repo rows, so this worker's
+      // env keeps the agent's 11111 key.
+      await upsertSwarmConfig({
+        scope: "repo",
+        scopeId: repo.id,
+        key: "CLAUDE_CODE_OAUTH_TOKEN",
+        value: "sk-ant-oat01-key-b-22222",
+        isSecret: true,
+        exportToEnv: true,
+      });
+      const task = await createTaskExtended("pool work", {
+        profile: "claude-secret-repo-key",
+        vcsRepo: "acme/widgets",
+      });
+
+      expect(await routePoolTasks()).toEqual([]);
+      expect(await callPoll(w.id, runtimeId)).toBeNull();
+      expect((await getTaskById(task.id))?.status).toBe("unassigned");
+
+      // Control: the same key as a plain repo row reaches the runtime, and routes.
+      await upsertSwarmConfig({
+        scope: "repo",
+        scopeId: repo.id,
+        key: "CLAUDE_CODE_OAUTH_TOKEN",
+        value: "sk-ant-oat01-key-b-22222",
+        isSecret: false,
+        exportToEnv: true,
+      });
+      expect(await routePoolTasks()).toEqual([{ taskId: task.id, agentId: w.id }]);
+      const trigger = await callPoll(w.id, runtimeId);
+      expect(trigger?.taskId).toBe(task.id);
+      expect(trigger?.task.resolvedProfile).toBe("claude-secret-repo-key");
+    } finally {
+      await getDbClient().run("DELETE FROM runtime_instances");
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 });
 

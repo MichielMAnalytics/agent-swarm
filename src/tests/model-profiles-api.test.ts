@@ -10,6 +10,7 @@ import {
   closeDb,
   createAgent,
   createScheduledTask,
+  createSwarmRepo,
   createTaskExtended,
   getDbClient,
   getTaskById,
@@ -831,6 +832,107 @@ describe("the profile check gates the agent default and task creation", () => {
     expect(
       await getDbClient().get("SELECT id FROM agent_tasks WHERE profile = 'claude-no-key'"),
     ).toBeNull();
+  });
+});
+
+describe("a child judges the profile on the repo it inherits from its parent", () => {
+  // CLAUDE_ID's own key ends 11111; the parent's repo pools 22222, the only key
+  // the profile allows. createTaskExtended gives the child the parent's repo.
+  async function parents(): Promise<{ inRepo: string; bare: string }> {
+    await getDbClient().run("DELETE FROM swarm_repos");
+    await upsertSwarmConfig({
+      scope: "agent",
+      scopeId: CLAUDE_ID,
+      key: "CLAUDE_CODE_OAUTH_TOKEN",
+      value: "sk-ant-oat01-agent-key-11111",
+      exportToEnv: true,
+    });
+    const repo = await createSwarmRepo({ url: "https://github.com/acme/widgets", name: "widgets" });
+    await upsertSwarmConfig({
+      scope: "repo",
+      scopeId: repo.id,
+      key: "CLAUDE_CODE_OAUTH_TOKEN",
+      value: "sk-ant-oat01-repo-key-22222",
+      exportToEnv: true,
+    });
+    await createModelProfile({
+      name: "claude-repo-key",
+      harness: "claude",
+      model: "opus",
+      credentials: { CLAUDE_CODE_OAUTH_TOKEN: ["22222"] },
+    });
+    const inRepo = await createTaskExtended("parent", {
+      agentId: LEAD_ID,
+      creatorAgentId: LEAD_ID,
+      vcsRepo: "acme/widgets",
+    });
+    const bare = await createTaskExtended("parent", { agentId: LEAD_ID, creatorAgentId: LEAD_ID });
+    return { inRepo: inRepo.id, bare: bare.id };
+  }
+
+  test("POST /api/tasks", async () => {
+    const { inRepo, bare } = await parents();
+    const child = (parentTaskId: string) =>
+      call("POST", "/api/tasks", {
+        task: "child work",
+        agentId: CLAUDE_ID,
+        routingReason: "continuity",
+        parentTaskId,
+        profile: "claude-repo-key",
+      });
+
+    const ok = await child(inRepo);
+    expect(ok.status).toBe(201);
+    const { id } = (await ok.json()) as { id: string };
+    expect(await getTaskById(id)).toMatchObject({
+      vcsRepo: "acme/widgets",
+      profile: "claude-repo-key",
+    });
+    // Control: a parent without a repo leaves the agent's own key, which fails.
+    const refused = await child(bare);
+    expect(refused.status).toBe(400);
+    expect(((await refused.json()) as { error: string }).error).toContain("credential-allowlist");
+  });
+
+  test("send-task", async () => {
+    const { inRepo, bare } = await parents();
+    const mcp = new McpServer({ name: "test-model-profiles-inherited-repo", version: "1.0.0" });
+    registerSendTaskTool(mcp);
+    const tool = (
+      mcp as unknown as {
+        _registeredTools: Record<
+          string,
+          { handler: (args: unknown, extra: unknown) => Promise<CallToolResult> }
+        >;
+      }
+    )._registeredTools["send-task"];
+    const child = (parentTaskId: string) =>
+      tool!.handler(
+        {
+          task: "child work",
+          agentId: CLAUDE_ID,
+          routingReason: "human_pinned",
+          routingNote: "This test pins the target",
+          parentTaskId,
+          profile: "claude-repo-key",
+          allowDuplicate: true,
+        },
+        { sessionId: "test-session", requestInfo: { headers: { "x-agent-id": LEAD_ID } } },
+      );
+
+    const ok = await child(inRepo);
+    expect(ok.isError).toBeFalsy();
+    expect(
+      await getDbClient().get(
+        "SELECT vcsRepo FROM agent_tasks WHERE parentTaskId = ? AND profile = 'claude-repo-key'",
+        [inRepo],
+      ),
+    ).toEqual({ vcsRepo: "acme/widgets" });
+    const refused = await child(bare);
+    expect(refused.isError).toBe(true);
+    expect(
+      (refused.content as { type: string; text: string }[]).map((part) => part.text).join("\n"),
+    ).toContain("credential-allowlist");
   });
 });
 

@@ -17,7 +17,7 @@ import {
   releaseTask,
 } from "../db";
 import { type AgentTaskRow, rowToAgentTask } from "../db/tasks/read";
-import { checkProfileForAgent } from "../model-profile-check";
+import { checkProfileForAgent, runtimeReadsRepoSecrets } from "../model-profile-check";
 import { poolTaskRunsOnHarness } from "../model-validation";
 import { agentsWithLiveRuntime, runtimeStaleThresholdMinutes } from "../multi-runtime";
 import { listRuntimePools } from "./db";
@@ -164,14 +164,19 @@ export async function routePoolTasks(
     return (agent.maxTasks ?? 1) - count;
   };
   // A task with an explicit `profile` waits for an agent that passes the profile
-  // check, as on the poll's unassigned scan. Memoized per pass.
+  // check, as on the poll's unassigned scan. Memoized per pass. Warm and wake
+  // candidates are runtime-backed whenever runtime liveness is tracked, and a
+  // runtime token's config read may omit secret repo rows; judge the pool it gets.
   const profileOk = new Map<string, boolean>();
   const passesProfileCheck = async (agent: Agent, task: AgentTask): Promise<boolean> => {
     if (!task.profile) return true;
     const memoKey = JSON.stringify([agent.id, task.profile, task.vcsRepo ?? null]);
     let ok = profileOk.get(memoKey);
     if (ok === undefined) {
-      const result = await checkProfileForAgent(agent.id, task.profile, { vcsRepo: task.vcsRepo });
+      const result = await checkProfileForAgent(agent.id, task.profile, {
+        vcsRepo: task.vcsRepo,
+        includeRepoSecrets: withLiveRuntime === null || runtimeReadsRepoSecrets(agent),
+      });
       ok = result?.ok !== false;
       profileOk.set(memoKey, ok);
     }

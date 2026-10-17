@@ -492,7 +492,8 @@ export async function sendTaskHandler(
     model: normalizedModel.model,
     modelTier: normalizedModel.modelTier,
     agentId: effectiveAgentId,
-    vcsRepo: effectiveVcsRepo,
+    // createTaskExtended fills an unset repo from the parent; judge that repo's config.
+    vcsRepo: effectiveVcsRepo || effectiveParentTask?.vcsRepo,
   });
   if (profileError) return toolErr(profileError, { data: { yourAgentId: creatorAgentId } });
   const effectiveRoutingReason =
