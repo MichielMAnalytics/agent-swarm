@@ -58,7 +58,7 @@ SDK selection is incompatible with an effective Claude Bridge or legacy bridge b
 | Harness & tools | `CLAUDE_TRUST_PRESEED`, `SCRIPTS_ONLY_MCP`, `TASK_TOOL_PRELOAD_ENABLED`, `PI_TOOL_DEFERRAL`, `PI_CODEMODE`, `CURSOR_NATIVE_SYSTEM_PROMPT`, `PI_CODEMODE_MODELS`, `TASK_TOOL_MANIFESTS`, `MULTI_RUNTIME_ENABLED`, `CAPABILITIES`, `SWARM_ENABLED_TOOLS`, `OPENROUTER_BASE_URL`, `OPENROUTER_APP_ATTRIBUTION`, `WORKER_API_READY_TIMEOUT_SECONDS`, `CONTEXT_PREAMBLE_MAX_TOKENS`, `MODEL_WINDOW_EXHAUSTED_POLICY`, `MODEL_LATEST_SOAK_DAYS`, `MODEL_AUTO_UPGRADE` |
 | Model tiers | `MODEL_TIER_<PROVIDER>_<TIER>` for every provider with a tier mapping |
 | Database | `DB_QUERY_BOUNDED_ENABLED`, `DB_QUERY_HTTP_BUDGET_MS`, `DB_QUERY_HTTP_MAX_ROWS`, `DB_QUERY_MCP_BUDGET_MS`, `DB_QUERY_MCP_MAX_ROWS`, `DB_QUERY_CONCURRENCY_CAP`, `SESSION_LOG_RETENTION_DAYS`, `AGENT_LOG_RETENTION_DAYS`, `EVENTS_RETENTION_DAYS`, `DB_RETENTION_DRY_RUN`, `DB_RETENTION_TICK_BUDGET_MS`, `DB_RETENTION_CATCHUP_INTERVAL_MS`, `DB_RETENTION_MAX_STATEMENT_MS` |
-| Integrations | `SLACK_MODE`, `SLACK_DISABLE`, `SLACK_ALLOW_DEV_SOCKET_MODE`, `SLACK_RENDER_V2`, `SLACK_RENDER_V2_DELEGATION`, `SLACK_CONCLUSION_SETTLE_SEC`, `SLACK_CONCLUSION_TIMEOUT_MIN`, `SLACK_TREE_STALL_MIN`, `GITHUB_DISABLE`, `LINEAR_DISABLE`, `SLACK_ALERTS_CHANNEL`, `SLACK_BLOCK_EXTERNAL_CHANNELS`, `AGENT_FS_REQUEST_TIMEOUT_MS`, `COMB_ENABLED`, `CHAT_SDK_ENABLED`, `CHAT_SDK_BUFFER_MS`, `AGENT_FS_PUBLIC_URL`, `SLACK_REACTION_ACCEPTED`, `SLACK_REACTION_BUFFERED`, `SLACK_REACTION_NOW`, `SLACK_REACTION_STEERED`, `SLACK_REACTION_COMPLETED`, `SLACK_REACTION_FAILED` |
+| Integrations | `SLACK_MODE`, `SLACK_DISABLE`, `SLACK_ALLOW_DEV_SOCKET_MODE`, `SLACK_RENDER_V2`, `SLACK_RENDER_V2_DELEGATION`, `SLACK_CONCLUSION_SETTLE_SEC`, `SLACK_CONCLUSION_TIMEOUT_MIN`, `SLACK_TREE_STALL_MIN`, `GITHUB_DISABLE`, `LINEAR_DISABLE`, `SLACK_ALERTS_CHANNEL`, `SLACK_BLOCK_EXTERNAL_CHANNELS`, `AGENT_FS_REQUEST_TIMEOUT_MS`, `COMB_ENABLED`, `CHAT_SDK_ENABLED`, `CHAT_SDK_BUFFER_MS`, `AGENT_FS_PUBLIC_URL`, `SLACK_REACTION_ACCEPTED`, `SLACK_REACTION_BUFFERED`, `SLACK_REACTION_NOW`, `SLACK_REACTION_STEERED`, `SLACK_REACTION_COMPLETED`, `SLACK_REACTION_FAILED`, `SLACK_STATUS_ICON_COMPLETED` |
 | Security & access | `RBAC_ENABLED`, `BUDGET_ADMISSION_DISABLED`, `EXTENSION_ALLOW_INLINE_INSTALL`, `MCP_OAUTH_ALLOW_PRIVATE_HOSTS`, `CORS_ALLOWED_ORIGINS` (custom list replaces hosted/dev defaults; unset or blank uses defaults) |
 | Workflows & scheduler | `WORKFLOW_MAX_ITERATIONS`, `SCHEDULER_INTERVAL_MS`, `SCRIPT_EXECUTOR`, `SCRIPT_QUICKJS_POOL_SIZE`, `SEED_AUTOMATIONS_ENABLED`, `EXTENSION_HANDLER_TIMEOUT_MS`, `EXTENSION_MAX_CONSECUTIVE_FAILURES` |
 | Telemetry & observability | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_EXPORT_API_LOGS`, `ANONYMIZED_TELEMETRY` |
@@ -114,6 +114,47 @@ The gate always fails open. One 60-second deadline covers script lookup, credent
 and execution. A timeout, a failure, or a result without a boolean `quiet` is an `error`
 verdict, and the checklist task is created in both modes. Both keys apply on the next tick
 without a restart. Config writes reject modes other than `shadow` and `enforce`.
+
+### Jev gate
+
+The built-in `heartbeat-jev-gate` script is a ready gate. Set
+`HEARTBEAT_CHECKLIST_GATE_SCRIPT=heartbeat-jev-gate` to use it. Each tick it builds a compact
+state of about 1,500 characters (current time, new failures since the previous checklist,
+tracked HEARTBEAT items due today or past their `DELETE` date, the previous checklist result,
+task counts, agent status) and asks Jev, TypeSafe's decision model, whether the Lead needs to
+act. It reports a quiet tick when Jev's probability is below the threshold, and puts the
+probability and provider in `reason`. On a wake verdict, `summary` lists the failures and
+tracked items behind it. One decision costs about $0.00004.
+
+Jev needs one of two global secrets, set on the Secrets page; a key set only in the API's
+environment is not detected. The key never enters the script: it calls the
+`system-one-decide` tool, and the API server reads the key and sends the request, the same way a
+`system-one-decision` workflow node does.
+
+- `TYPESAFE_API_KEY`: TypeSafe's decisions API at `api.typesafe.ai`.
+- `OPENROUTER_API_KEY`: OpenRouter's decisions API at `openrouter.ai`. Refused when the
+  effective `OPENROUTER_BASE_URL` (stored or in the API's environment) points at a gateway, since
+  the key may then be a gateway token. The tick then reports an `error` verdict and the checklist
+  runs.
+
+With neither key, the first tick creates one approval request asking a person to add a key or
+decline, and links it in the heartbeat log's gate `reason`. No Slack message is sent. Until a
+key exists, every tick returns `{ quiet: false, reason: "jev-gate inactive: <state>" }` with no
+`summary`, so the checklist runs as if the gate were off. Ticks never prompt again after that
+first request, whether it is pending, approved, rejected, or expired. Adding a key turns the
+gate on at the next tick with no further step. The setup state lives in KV namespace
+`heartbeat-jev-gate`, key `setup`. Delete it to ask again.
+
+Optional global config values tune the script:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `HEARTBEAT_JEV_GATE_THRESHOLD` | `0.5` | Quiet when p(needs action) is below this |
+| `HEARTBEAT_JEV_GATE_PROVIDER` | `auto` | `typesafe`, `openrouter`, or `auto` (TypeSafe first) |
+| `HEARTBEAT_JEV_GATE_TIMEZONE` | `UTC` | IANA zone for the state's time and due dates |
+
+Run `script-run` on `heartbeat-jev-gate` with `{ "dryRun": true }` to see the verdict, the
+compact state, and the setup prompt, without creating a prompt or writing KV.
 
 ## Script executor
 
