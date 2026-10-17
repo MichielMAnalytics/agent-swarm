@@ -28,6 +28,7 @@ import { mintRuntimeToken } from "../be/users";
 import { handlePoll } from "../http/poll";
 import { taskModelPin } from "../tasks/model-pin";
 import { inheritedModelSelection } from "../tasks/worker-follow-up";
+import { registerPollTaskTool } from "../tools/poll-task";
 import { setRequestAuth } from "../utils/request-auth-context";
 
 const TEST_DB_PATH = "./test-profile-claim.sqlite";
@@ -105,9 +106,33 @@ async function setDefault(agentId: string, profile: string): Promise<void> {
   });
 }
 
+type PollTaskHandler = (args: unknown, extra: unknown) => Promise<unknown>;
+const mcpHandlers = new Map<string, PollTaskHandler>();
+
+/** MCP poll-task as a worker runtime calls it; onNotify runs between passes. */
+async function pollTaskAs(agentId: string, runtimeId: string, onNotify: () => Promise<void>) {
+  const handler = mcpHandlers.get("poll-task");
+  if (!handler) throw new Error("poll-task not registered");
+  return (await handler(
+    {},
+    {
+      sessionId: "test-session",
+      requestInfo: { headers: { "x-agent-id": agentId, "x-runtime-instance-id": runtimeId } },
+      sendNotification: onNotify,
+    },
+  )) as { structuredContent?: { task?: { id?: string } } };
+}
+
 beforeAll(async () => {
   await removeDbFiles(TEST_DB_PATH);
   initDb(TEST_DB_PATH);
+  const mcp = {
+    registerTool(name: string, _config: unknown, handler: PollTaskHandler) {
+      mcpHandlers.set(name, handler);
+      return { name };
+    },
+  };
+  registerPollTaskTool(mcp as unknown as Parameters<typeof registerPollTaskTool>[0]);
 });
 
 afterAll(async () => {
@@ -521,6 +546,40 @@ describe("a task's own profile", () => {
         { taskId: task.id, agentId: w.id },
       ]);
       expect((await getTaskById(task.id))?.poolWakeAt).toBe(afterGrace.toISOString());
+    });
+
+    test("a draining token runtime is still judged, since MCP poll-task can start work on it", async () => {
+      const w = await keyedWorker("p-route-drain");
+      await upsertRuntimeInstance({ id: crypto.randomUUID(), agentId: w.id, reportedSlots: 1 });
+      const draining = crypto.randomUUID();
+      await upsertRuntimeInstance({ id: draining, agentId: w.id, reportedSlots: 1 });
+      await mintRuntimeToken(w.id, draining);
+      await getDbClient().run("UPDATE runtime_instances SET draining = 1 WHERE id = ?", [draining]);
+
+      // The shared-key sibling reads 22222, the draining token runtime 11111.
+      const task = await createTaskExtended("needs 22222", {
+        profile: "p-route-drain-key-b",
+        vcsRepo: "acme/widgets",
+      });
+      await routePoolTasks();
+      const result = await pollTaskAs(w.id, draining, async () => {
+        // Retire the runtime so the long poll ends on its next pass.
+        await getDbClient().run("DELETE FROM runtime_instances WHERE id = ?", [draining]);
+      });
+      expect(result.structuredContent?.task?.id ?? null).toBeNull();
+      expect((await getTaskById(task.id))?.status).toBe("unassigned");
+
+      // Control: once the token view also reads 22222, the task routes.
+      const repoId = (await getDbClient().get<{ id: string }>("SELECT id FROM swarm_repos"))!.id;
+      await upsertSwarmConfig({
+        scope: "repo",
+        scopeId: repoId,
+        key: "CLAUDE_CODE_OAUTH_TOKEN",
+        value: "sk-ant-oat01-key-b-22222",
+        isSecret: false,
+        exportToEnv: true,
+      });
+      expect(await routePoolTasks()).toEqual([{ taskId: task.id, agentId: w.id }]);
     });
   });
 });

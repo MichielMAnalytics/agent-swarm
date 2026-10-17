@@ -457,7 +457,7 @@ export async function agentsWithLiveRuntime(): Promise<Set<string>> {
  * How each agent's live runtimes authenticate: true for a runtime token, false
  * for the shared API key. Registration binds a runtime token to its runtime id,
  * so a live runtime with no unrevoked, unexpired token row uses the shared key.
- * Draining runtimes accept no new work, so they are left out.
+ * Draining runtimes stay in: MCP poll-task can still start a pending task on one.
  */
 export async function liveRuntimeAuthModes(): Promise<Map<string, boolean[]>> {
   const now = new Date().toISOString();
@@ -468,7 +468,7 @@ export async function liveRuntimeAuthModes(): Promise<Map<string, boolean[]>> {
          AND s.revokedAt IS NULL AND s.expiresAt > ?
      ) AS runtime_token
      FROM runtime_instances r
-     WHERE r.status = 'active' AND r.draining = 0 AND r.last_seen_at >= ?`,
+     WHERE r.status = 'active' AND r.last_seen_at >= ?`,
     [now, runtimeLivenessCutoff()],
   );
   const modes = new Map<string, boolean[]>();
