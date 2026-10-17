@@ -16341,6 +16341,7 @@ export interface paths {
                         model?: string;
                         /** @enum {string} */
                         modelTier?: "smol" | "regular" | "smart" | "ultra";
+                        profile?: string;
                         allowCustomModel?: boolean;
                         /** @enum {string} */
                         scheduleType?: "recurring" | "one_time";
@@ -16724,6 +16725,7 @@ export interface paths {
                         model?: string | null;
                         /** @enum {string|null} */
                         modelTier?: "smol" | "regular" | "smart" | "ultra" | null;
+                        profile?: string | null;
                         allowCustomModel?: boolean;
                         nextRunAt?: string | null;
                         /** @enum {string} */
@@ -16917,6 +16919,7 @@ export interface paths {
                         model?: string | null;
                         /** @enum {string|null} */
                         modelTier?: "smol" | "regular" | "smart" | "ultra" | null;
+                        profile?: string | null;
                         allowCustomModel?: boolean;
                         nextRunAt?: string | null;
                         /** @enum {string} */

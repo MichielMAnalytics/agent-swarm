@@ -37367,6 +37367,9 @@
                       "ultra"
                     ]
                   },
+                  "profile": {
+                    "type": "string"
+                  },
                   "allowCustomModel": {
                     "type": "boolean"
                   },
@@ -38795,6 +38798,12 @@
                       null
                     ]
                   },
+                  "profile": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "allowCustomModel": {
                     "type": "boolean"
                   },
@@ -39190,6 +39199,12 @@
                       "smart",
                       "ultra",
                       null
+                    ]
+                  },
+                  "profile": {
+                    "type": [
+                      "string",
+                      "null"
                     ]
                   },
                   "allowCustomModel": {

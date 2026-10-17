@@ -326,6 +326,48 @@ export async function taskProfileError(check: {
   return formatProfileCheckFailures(result);
 }
 
+/**
+ * The profile half of a schedule update. `profile` and `model`/`modelTier`
+ * pick the model two ways, so setting one clears the other, and sending both
+ * is an error. A new profile, or a move of a profiled schedule to another
+ * agent, is judged by `taskProfileError`. Returns the columns to write.
+ */
+export async function scheduleProfileUpdate(
+  existing: { profile?: string | null; targetAgentId?: string | null },
+  patch: {
+    profile?: string | null;
+    model?: string | null;
+    modelTier?: string | null;
+    targetAgentId?: string | null;
+  },
+): Promise<
+  | { error: string }
+  | { error?: undefined; fields: { profile?: string | null; model?: null; modelTier?: null } }
+> {
+  const profile = patch.profile === undefined ? undefined : patch.profile?.trim() || null;
+  const agentId = patch.targetAgentId !== undefined ? patch.targetAgentId : existing.targetAgentId;
+  if (profile) {
+    const error = await taskProfileError({
+      profile,
+      model: patch.model,
+      modelTier: patch.modelTier,
+      agentId,
+    });
+    if (error) return { error };
+    return { fields: { profile, model: null, modelTier: null } };
+  }
+  if (patch.model?.trim() || patch.modelTier?.trim() || profile === null) {
+    return { fields: { profile: null } };
+  }
+  const agentChanged =
+    patch.targetAgentId !== undefined && patch.targetAgentId !== existing.targetAgentId;
+  if (agentChanged && existing.profile) {
+    const error = await taskProfileError({ profile: existing.profile, agentId });
+    if (error) return { error };
+  }
+  return { fields: {} };
+}
+
 type OverrideRowState = { value: string; exportToEnv?: number } | null;
 
 /** What a config row does to the worker env: its value, withheld (exportToEnv off), or absent. */

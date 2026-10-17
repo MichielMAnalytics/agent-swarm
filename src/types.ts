@@ -739,7 +739,7 @@ export const AgentTaskSchema = z
 
     // Model selection (optional — provider-specific; can be "opus", "gpt-4o",
     // "openrouter/openai/gpt-5-nano", etc. depending on HARNESS_PROVIDER).
-    // Prefer modelTier for portable task intent; model is a concrete override
+    // Prefer `profile` (below) for named intent; model is a concrete override
     // interpreted by the claiming worker's harness and never switches provider.
     model: z.string().optional(),
     modelTier: ModelTierSchema.optional(),

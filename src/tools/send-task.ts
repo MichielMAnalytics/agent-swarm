@@ -139,7 +139,7 @@ export const sendTaskInputSchema = z
       .min(1)
       .optional()
       .describe(
-        "Concrete model override for this task, interpreted by the assignee's harness/provider. This does not switch providers. Prefer modelTier for portable intent. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected.",
+        "Concrete model override for this task, interpreted by the assignee's harness/provider. This does not switch providers. Prefer `profile` for a named harness + model + effort. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected.",
       ),
     modelTier: ModelTierSchema.optional().describe(
       "Deprecated: pass profile \"<harness>-<tier>\" instead (same model). Portable model tier for this task: 'smol', 'regular', 'smart', or 'ultra'. Resolved at claim time through the seeded <harness>-<tier> profile of the assignee's harness. Legacy model shortnames map as haiku→smol, sonnet→regular, opus→smart, fable→ultra.",

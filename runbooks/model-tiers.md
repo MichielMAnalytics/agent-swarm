@@ -93,14 +93,15 @@ Concrete freeform model strings stay concrete. When both `model` and `modelTier`
 
 ## Claim-time resolution
 
-`model`/`modelTier` only apply to schedules with `targetType: 'agent-task'` (the
+`model`/`modelTier`/`profile` only apply to schedules with `targetType: 'agent-task'` (the
 default) — a `workflow`- or `script`-targeted schedule triggers directly with no
 agent in the loop, so these fields are ignored for those targets.
 
-Tasks, schedules, and workflow `agent-task` nodes store both optional fields:
+Tasks, schedules, and workflow `agent-task` nodes store these optional fields:
 
+- `profile`: a named harness + model + effort (preferred; see [Model profiles](#model-profiles)). Exclusive with the other two.
 - `model`: concrete provider/harness-specific override.
-- `modelTier`: portable tier intent.
+- `modelTier`: portable tier intent. Deprecated: pass `profile: "<harness>-<tier>"` for the same model.
 
 The API server resolves the model when a worker claims the task (`/api/poll`, both the directly-assigned and the pool-claim path; `src/be/model-tier-resolution.ts`), in this order:
 
@@ -123,7 +124,7 @@ The session report also records `resolvedEffort`: the reasoning effort the sessi
 
 The worker still runs `resolveTaskModelSelection` locally. When the server sent a `resolvedModel`, the worker uses it; if its local result differs (for example a stale override sent before a restart, or a tier-config value the worker does not read), it logs `model resolution mismatch ... using server value`. Without a server value (older API) the worker keeps the local order: task `model`, `modelTier` with its env overrides, `MODEL_OVERRIDE`, then the adapter default.
 
-This is deliberate: pool claims, delegations, workflow fan-out, and schedules resolve against the worker that actually runs the task, not the agent or API process that created it. Schedules and workflow steps store only `model`/`modelTier`; each spawned task records its own resolution.
+This is deliberate: pool claims, delegations, workflow fan-out, and schedules resolve against the worker that actually runs the task, not the agent or API process that created it. Schedules and workflow steps store only `profile`/`model`/`modelTier`; each spawned task records its own resolution.
 
 ## Model profiles
 
@@ -135,11 +136,11 @@ A model profile is a named harness, model and effort (`model_profiles`, `src/be/
 - **Claim.** A task's own profile that is missing, on another harness, or a `latest:` alias that resolves to nothing returns `modelUnsupported` (`[model-profile-missing]`, `[model-harness-mismatch]`, `[model-profile-unresolved]`) and the worker fails the task without a spawn. The CLI-version check still swaps the model on an unsupported CLI but keeps the `profile:*` source. The profile's effort goes on the trigger only when the task set no `effort`. Pool claims skip a task whose profile runs on another harness.
 - **OpenAI-compatible providers.** A profile's `harness` is always the harness that runs it, never the provider. NaN, Helmcode and Vercel AI Gateway models are ordinary `pi` / `opencode` profiles with the provider-qualified catalog id as `model` (`nan/glm5.3`, `helmcode/deepseek-v4-flash`, `vercel/anthropic/claude-sonnet-4.6`), validated by the same catalog and harness checks as a raw `model`. Claim hands that id to the worker as `resolvedModel`, and the worker picks the provider's key (`NAN_API_KEY`, `HELMCODE_API_KEY`, `AI_GATEWAY_API_KEY`) from it. Migration `220` names a converted override by flattening the id: `pi-vercel-anthropic-claude-sonnet-4.6-medium`.
 - **Tier alias.** `modelTier` is an alias for the seeded `<harness>-<tier>` profile. Where the tier chain lands on `tier-default`, claim resolves that profile instead: `modelSource = profile:tier-alias`, `resolvedProfile = <harness>-<tier>`, and its credential allowlist on the trigger. The seeds copy the tier map, so the model is the same unless an operator edited the seed. A `worker-env` or `tier-config` override still wins. A missing or unresolved seed keeps the `tier-default` result. A tier still beats the agent default. `send-task`, `task-action` create and `create-schedule` / `update-schedule` / `patch-schedule` return `modelTierDeprecated: { tier, suggestedProfile }` and a nudge when the input carries `modelTier` (`suggestedProfile` is null for a pool task or a harness with no seed).
-- **Validation at send-task.** An unknown profile, or a profile for another harness than a known target agent, is a 400. `profile` cannot be combined with `model` or `modelTier`.
+- **Validation where a profile is written.** `send-task`, `POST /api/tasks`, schedules (`POST`/`PUT`/`PATCH /api/schedules`, `create-schedule` / `update-schedule` / `patch-schedule`) and workflow `agent-task` nodes reject an unknown profile, and, when the target agent is known, a profile that fails `checkProfileForAgent` (HTTP 400, tool error). `profile` cannot be combined with `model` or `modelTier`. A schedule update that sets `profile` clears `model` and `modelTier`, and one that sets `model` or `modelTier` clears `profile`; moving a profiled schedule to another agent re-runs the check. A schedule's profile blocks its deletion (409, migration `226` triggers). Workflow saves judge a static `profile` (and a static `agentId`), including a `foreach` body; the node re-checks the interpolated value at run and fails with the check's message. Workflow JSON has no reference guard: deleting a profile a definition names fails that node at run.
 - **Resume.** A task's own `profile` travels to its resume like `modelTier`. An agent default (`resolvedProfile` only) does not; the child's claim resolves it again.
 - **API.** `GET /api/model-profiles` and `GET /api/model-profiles/{name}` are open to any caller; `list-model-profiles` is the tool. `POST`, `PATCH` and `DELETE` need `models.profiles.write` (operator only: profiles are shared, so a dashboard user or agent editing one would change what other people's queued tasks run). A profile's `effort` must be a level the harness and model accept (`supportedReasoningLevels`), including one with no transport effect such as Opencode `off`. Delete is a 409 for a `<harness>-<tier>` seed, and while an agent's default names the profile or a task holds it: unfinished, or superseded and still owed its resume (the resume copies the profile in a later write, or the heartbeat's orphan repair makes it after a restart, within 24 hours). Each reference check and its write are one statement, so a create and a delete cannot both win a race: Migration `220`'s triggers refuse a task or agent default naming a missing profile (400 at the API), and the DELETE itself skips a profile still named (409).
 
-Not yet: a full agent-can-run-profile check, profiles on schedules and workflow nodes, fallbacks and a dashboard editor. `modelTier` is not rejected yet; the two-release clock starts when the editor ships.
+Not yet: fallbacks and a dashboard editor. `modelTier` is not rejected yet; the two-release clock starts when the editor ships.
 
 ## Explicit model ids are checked
 

@@ -11,6 +11,7 @@ import {
   getWorkflow,
   isExtensionAgent,
 } from "@/be/db";
+import { modelProfileRefError, taskProfileError } from "@/be/db/model-profiles";
 import { explicitModelErrorForAgent } from "@/be/model-validation";
 import { getScript } from "@/be/scripts/db";
 import { calculateNextRun } from "@/scheduler";
@@ -113,11 +114,19 @@ export const createScheduleInputSchema = z.object({
     .min(1)
     .optional()
     .describe(
-      "Concrete model override for tasks created by this schedule. Interpreted by each assignee's harness/provider and does not switch providers. Prefer modelTier for portable intent. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected.",
+      "Concrete model override for tasks created by this schedule. Interpreted by each assignee's harness/provider and does not switch providers. Prefer `profile` for a named harness + model + effort. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected.",
     ),
   modelTier: ModelTierSchema.optional().describe(
     "Deprecated: pass profile \"<harness>-<tier>\" instead (same model). Portable model tier for tasks created by this schedule: 'smol', 'regular', 'smart', or 'ultra'. Resolved at claim time through the seeded <harness>-<tier> profile of each assignee's harness.",
   ),
+  profile: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe(
+      "Model profile name for tasks created by this schedule (see list-model-profiles): a named harness + model + effort, applied when each task is claimed. Must run on the target agent. Exclusive with model and modelTier.",
+    ),
   allowCustomModel: z
     .boolean()
     .optional()
@@ -146,6 +155,7 @@ const scheduleDataShape = {
   timezone: z.string().optional(),
   model: z.string().optional(),
   modelTier: ModelTierSchema.optional(),
+  profile: z.string().optional(),
   scheduleType: z.string().optional(),
   targetType: ScheduledTaskTargetTypeSchema.optional(),
   workflowId: z.string().optional(),
@@ -193,6 +203,7 @@ export const registerCreateScheduleTool = (server: McpServer) => {
         enabled,
         model,
         modelTier,
+        profile,
         allowCustomModel,
       },
       requestInfo,
@@ -289,6 +300,13 @@ export const registerCreateScheduleTool = (server: McpServer) => {
         agentId: targetAgentId,
       });
       if (modelError) return toolErr(modelError);
+      const profileError = await taskProfileError({
+        profile,
+        model,
+        modelTier,
+        agentId: targetAgentId,
+      });
+      if (profileError) return toolErr(profileError);
 
       try {
         // Calculate initial nextRunAt
@@ -332,6 +350,7 @@ export const registerCreateScheduleTool = (server: McpServer) => {
           createdByAgentId: requestInfo.agentId,
           model: normalizedModel.model,
           modelTier: normalizedModel.modelTier,
+          profile,
           scheduleType: scheduleType ?? "recurring",
           createdBy,
         });
@@ -351,6 +370,12 @@ export const registerCreateScheduleTool = (server: McpServer) => {
           },
         );
       } catch (error) {
+        // The profile was deleted between taskProfileError and the insert.
+        if (modelProfileRefError(error) === "missing") {
+          return toolErr(`Unknown model profile "${profile}".`, {
+            data: { yourAgentId: requestInfo.agentId },
+          });
+        }
         const message = error instanceof Error ? error.message : "Unknown error";
         return toolErr(`Failed to create schedule: ${message}`, {
           data: { yourAgentId: requestInfo.agentId },
