@@ -15011,6 +15011,9 @@ export interface paths {
                                         mimeType?: string;
                                         sizeBytes?: number;
                                     }[];
+                                    credentialAllowlist?: {
+                                        [key: string]: string[];
+                                    };
                                 };
                                 requestedBy?: {
                                     id?: string;

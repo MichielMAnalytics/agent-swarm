@@ -43,6 +43,7 @@ import { z } from "zod";
 import {
   DEFAULT_MODEL_TIER_MAP,
   MODEL_TIERS,
+  type ModelProfileCredentials,
   type ModelTier,
   type ModelTierOverrides,
   type ProviderName,
@@ -517,6 +518,11 @@ export type ClaimModelFields = Partial<TaskModelResolution> & {
   /** The profile's effort, when it has one and the task set none; the worker spawns with it. */
   effort?: ReasoningEffort;
   /**
+   * The applied profile's pooled-key allowlist (`{ VAR: [suffix] }`). Trigger only, never
+   * stored on the task: a re-claim re-resolves it. The worker picks keys within it.
+   */
+  credentialAllowlist?: ModelProfileCredentials;
+  /**
    * Set when the task's explicit model is rejected by this worker's CLI, or belongs to another
    * harness family (`[model-harness-mismatch]`); the worker fails the task without a spawn.
    */
@@ -533,7 +539,14 @@ async function resolveClaimProfile(
   source: "profile:task" | "profile:agent-default",
   harness: ProviderName | null,
 ): Promise<
-  | { profile: { name: string; effort: ReasoningEffort | null }; resolution: TaskModelResolution }
+  | {
+      profile: {
+        name: string;
+        effort: ReasoningEffort | null;
+        credentials: ModelProfileCredentials | null;
+      };
+      resolution: TaskModelResolution;
+    }
   | { modelUnsupported: string }
   | null
 > {
@@ -569,7 +582,10 @@ async function resolveClaimProfile(
       modelAlias: profile.model.trim().toLowerCase(),
     };
   }
-  return { profile: { name: profile.name, effort: profile.effort }, resolution };
+  return {
+    profile: { name: profile.name, effort: profile.effort, credentials: profile.credentials },
+    resolution,
+  };
 }
 
 /**
@@ -646,6 +662,7 @@ export async function recordClaimModelResolution(
         ...(!task.effort && picked.profile.effort && !repoKeys.has("REASONING_EFFORT_OVERRIDE")
           ? { effort: picked.profile.effort }
           : {}),
+        ...(picked.profile.credentials ? { credentialAllowlist: picked.profile.credentials } : {}),
       };
     }
   }

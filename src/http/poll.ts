@@ -38,7 +38,12 @@ import { hasCapability } from "../server";
 import { fetchChannelActivity } from "../slack/channel-activity";
 import { type TaskModelPinFields, taskModelPin } from "../tasks/model-pin";
 import { emitTaskTelemetry, resolveTriggerSurface } from "../telemetry-trigger";
-import { AgentTaskSchema, BudgetRefusedTriggerSchema, TaskAttachmentSchema } from "../types";
+import {
+  AgentTaskSchema,
+  BudgetRefusedTriggerSchema,
+  ModelProfileCredentialsSchema,
+  TaskAttachmentSchema,
+} from "../types";
 import { ensure } from "../utils/business-use";
 import { isLeadChannelMonitoringEnabled } from "../utils/lead-monitor-channels";
 import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
@@ -111,6 +116,8 @@ const PollTaskAssignedTriggerSchema = z.object({
   triggerSurface: z.string().optional(),
   task: AgentTaskSchema.extend({
     attachments: z.array(PollTriggerAttachmentSchema),
+    // The claimed profile's pooled-key allowlist. Trigger only, not stored on the task.
+    credentialAllowlist: ModelProfileCredentialsSchema.optional(),
   }),
   requestedBy: TaskRequestedBySchema.optional(),
 });
@@ -227,6 +234,7 @@ async function claimModelFields(
     modelSource: undefined,
     modelAlias: undefined,
     resolvedProfile: undefined,
+    credentialAllowlist: undefined,
   };
   try {
     return {

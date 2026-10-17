@@ -15,7 +15,7 @@ import type {
   ProfileCheckRow,
   ProfileCheckState,
 } from "../types";
-import { getModelAwareCredentialVars, splitCredentialPool } from "../utils/credentials";
+import { getModelAwareCredentialVars, keySuffix, splitCredentialPool } from "../utils/credentials";
 import { runtimeHarnessSections } from "../utils/runtime-model-catalog";
 import { getAgentById, getDbClient, getResolvedConfig } from "./db";
 import { getModelProfileByName } from "./db/model-profiles";
@@ -174,7 +174,7 @@ async function credentialAllowlistRow(
       }
       continue;
     }
-    const have = new Set(splitCredentialPool(pool).map((key) => key.slice(-5)));
+    const have = new Set(splitCredentialPool(pool).map(keySuffix));
     const absent = wanted.filter((suffix) => !have.has(suffix));
     if (absent.length === wanted.length) {
       states.push("fail");
