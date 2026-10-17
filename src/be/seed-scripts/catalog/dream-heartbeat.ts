@@ -774,39 +774,88 @@ export default async function (args: unknown, ctx: ScriptContext) {
         return id;
       };
       // A fact is one harvested line, compared after whitespace and case normalization only: a sign, digit or
-      // punctuation mark that differs makes it a different fact.
+      // punctuation mark that differs makes it a different fact. A fact must be a whole line of the document, never
+      // part of a longer one: "Never use X." does not hold "Use X.".
       const norm = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
       const factsOf = (text: string) => [...new Set(text.split("\n").map(norm).filter(Boolean))];
-      // The chunker cuts a line longer than a chunk at ". " or " " (or mid-word), drops that separator, and starts the
-      // next chunk with an optional heading line, then the last 100 characters of the cut chunk, once per split level.
-      // Returns the text after the cut, or null when `chunk` does not start that way.
-      const afterCut = (prev: string, chunk: string) => {
-        const glue = prev.slice(-100);
-        if (!glue) return null;
-        let rest = chunk.startsWith(glue) ? chunk : chunk.replace(/^[^\n]*\n\n/, "");
-        if (!rest.startsWith(glue)) return null;
-        while (rest.startsWith(glue)) rest = rest.slice(glue.length);
-        return norm(rest);
-      };
-      // The facts of `text` that a document's chunks lack. A fact may straddle a confirmed cut, missing only the
-      // separator the chunker dropped there.
-      const lacking = (chunks: string[], text: string) => {
-        const parts = chunks.map(norm);
-        const cuts: Array<[string, string]> = [];
-        for (let i = 1; i < chunks.length; i++) {
-          const rest = afterCut(chunks[i - 1] ?? "", chunks[i] ?? "");
-          if (rest) cuts.push([parts[i - 1] ?? "", rest]);
+      // The chunker (src/be/chunking.ts) cuts a section longer than CHUNK at "\n\n", "\n", ". " or " " (or mid-word),
+      // drops that separator, and starts the next chunk with an optional heading line, then an overlap per split level:
+      // the last 100 characters of the cut piece (all of it when shorter), or of the overlapped piece one level up.
+      // Returns the raw text after the overlaps, or null when `chunk` does not start so.
+      const CHUNK = 2000;
+      const afterCut = (prev: string, prevOwn: string, chunk: string) => {
+        const glues = [prev.slice(-100), prevOwn.slice(-100)].filter(Boolean).sort((x, y) => y.length - x.length);
+        let rest = chunk.replace(/^#{1,3} [^\n]*\n\n/, "");
+        let cut = false;
+        for (let g = glues.find((x) => rest.startsWith(x)); g; g = glues.find((x) => rest.startsWith(x))) {
+          rest = rest.slice(g.length);
+          cut = true;
         }
-        return factsOf(text).filter((f) => {
-          if (parts.some((p) => p.includes(f))) return false;
-          for (const [head, rest] of cuts) {
-            for (let n = 1; n < f.length; n++) {
-              if (!head.endsWith(f.slice(0, n))) continue;
-              for (const sep of ["", " ", ". "]) if (f.startsWith(sep, n) && f.length > n + sep.length && rest.startsWith(f.slice(n + sep.length))) return false;
-            }
-          }
-          return true;
+        return cut ? rest : null;
+      };
+      // The facts of `text` that a document's chunks lack. Each fact must equal a whole line. A line at a cut is whole
+      // only when the cut is provably between lines: the heading changes, a neighbour holds a line break (the pieces of
+      // a cut line never do), or the two pieces are too short to be one line the chunker had to cut. Otherwise the fact
+      // must span the cut, missing only the separator the chunker dropped there.
+      const lacking = (chunks: string[], text: string) => {
+        const n = chunks.length;
+        const heads = chunks.map((c) => (n > 1 ? (/^(#{1,3} [^\n]*)\n\n/.exec(c)?.[1] ?? "") : ""));
+        const first = (i: number) => i === 0 || heads[i] !== heads[i - 1];
+        const pieces: Array<{ own: string; cut: boolean; hidden: boolean; nl: boolean }> = [];
+        chunks.forEach((c, i) => {
+          const rest = first(i) ? null : afterCut(chunks[i - 1] ?? "", pieces[i - 1]?.own ?? "", c);
+          const own = rest ?? c.slice(heads[i] ? (heads[i] ?? "").length + 2 : 0);
+          // An overlap the cut check could not confirm hides at the start, with line breaks of the chunk before it.
+          const hidden = !first(i) && rest === null;
+          // A section's first piece under 50 characters is dropped, and its text glues onto the next one unseparated.
+          const skip = hidden ? 200 : first(i) ? 49 : 0;
+          pieces.push({ own, cut: rest !== null, hidden, nl: own.slice(skip).includes("\n") });
         });
+        const lineCut = (i: number) => {
+          const a = pieces[i - 1];
+          const b = pieces[i];
+          if (!a || !b || b.hidden) return false;
+          if (heads[i] !== heads[i - 1] || a.nl || b.nl) return true;
+          // A cut inside a line packs whole sentences: the next one would not have fit in the piece before.
+          return a.own.length + 2 + (b.own.split("\n")[0]?.split(". ")[0] ?? "").length <= CHUNK;
+        };
+        const starts = (i: number) => i === 0 || lineCut(i);
+        const ends = (i: number) => i === n - 1 || lineCut(i + 1);
+        // The ways a piece may split into lines: its own line breaks, plus, at a section's first piece, the end of a
+        // dropped short piece (no whitespace on either side, and a part long enough to have forced the cut after it).
+        const views = (i: number) => {
+          const t = pieces[i]?.own ?? "";
+          const out = [t.split("\n")];
+          if (n < 2 || !first(i)) return out;
+          for (let k = 1; k < Math.min(50, t.length); k++) {
+            if (!/\S/.test(t[k - 1] ?? "") || !/\S/.test(t[k] ?? "")) continue;
+            const part = t.slice(k).split("\n\n")[0] ?? "";
+            const goesOn = part.length === t.length - k && i + 1 < n && !first(i + 1);
+            if (part.length < CHUNK - k - 2 && !goesOn) continue;
+            const twice = t.startsWith(t.slice(0, k), k);
+            out.push(`${t.slice(0, k)}\n${twice ? `${t.slice(k, 2 * k)}\n${t.slice(2 * k)}` : t.slice(k)}`.split("\n"));
+          }
+          return out;
+        };
+        const whole = new Set<string>();
+        const joins: Array<[string, string]> = [];
+        for (let i = 0; i < n; i++) {
+          // The heading line joins the section's heading stack with " > "; each heading line is a run of it.
+          const stack = (heads[i] ?? "").split(" > ");
+          for (let s = 0; s < stack.length; s++) for (let e = s + 1; e <= stack.length; e++) if (norm(stack.slice(s, e).join(" > "))) whole.add(norm(stack.slice(s, e).join(" > ")));
+          for (const lines of views(i)) {
+            lines.forEach((l, j) => {
+              if (j === 0 && (pieces[i]?.hidden || !starts(i))) return;
+              if (j === lines.length - 1 && !ends(i)) return;
+              if (norm(l)) whole.add(norm(l));
+            });
+            const next = pieces[i + 1];
+            const h = lines[lines.length - 1] ?? "";
+            const opens = lines.length > 1 || (starts(i) && !pieces[i]?.hidden);
+            if (next?.cut && !lineCut(i + 1) && opens && ends(i + 1)) joins.push([h, next.own.split("\n")[0] ?? ""]);
+          }
+        }
+        return factsOf(text).filter((f) => !whole.has(f) && !joins.some(([h, r]) => ["", " ", ". "].some((sep) => norm(`${h}${sep}${r}`) === f)));
       };
       // The whole document a row belongs to, whether any chunk expires, and whether every chunk was found. Chunks of an
       // explicit key share it. An auto key (scope/source/id) differs per chunk, so its siblings are the rows of the same

@@ -796,6 +796,44 @@ describe("dream-heartbeat closed-pin drain", () => {
     }
   }, 180_000);
 
+  test("a negated line is not proof of the affirmative fact: the fact lands or the pin stays", async () => {
+    const before = await leadHeartbeat();
+    await setLeadHeartbeat(PIN_HB);
+    try {
+      const name = `hb-pin-negation-${Date.now()}`;
+      // The affirmative fact is a substring of the negated line, but not a line of its own.
+      const seeded = `Rollback notes for the old migration.\n${CLOSED_PIN}\nNever use offset -1 for the rollback.`;
+      const id = await seedMemory(name, seeded);
+      const affirmative = "Use offset -1 for the rollback.";
+      const hd = {
+        draft: DRAINED_HB,
+        removed: pinRemoved(name),
+        movedToMemory: [
+          { name, content: `Rollback notes for the old migration.\n${CLOSED_PIN}\n${affirmative}` },
+        ],
+      };
+
+      const refused = await runRefusing(
+        ["memory_edit", "memory_store"],
+        await liveApplyArgs("hb-pin-negation-refused", hd),
+      );
+      expect(refused.status).toBe("refused: pin-memory-missing");
+      expect(refused.missingPin).toEqual([name]);
+      expect(refused.memories.map((m: any) => m.status)).not.toContain("exists: already holds it");
+      expect(String(memoryRows("id = ?", id)[0].content)).toBe(seeded);
+      expect(await leadHeartbeat()).toBe(PIN_HB);
+
+      const applied = await run("dream-heartbeat", await liveApplyArgs("hb-pin-negation", hd));
+      expect(applied.errors).toEqual([]);
+      expect(applied.status).toBe("applied");
+      expect(applied.memories).toEqual([{ name, id, status: "updated" }]);
+      expect(String(memoryRows("id = ?", id)[0].content).split("\n")).toContain(affirmative);
+      expect(await leadHeartbeat()).toBe(DRAINED_HB);
+    } finally {
+      await setLeadHeartbeat(before);
+    }
+  }, 180_000);
+
   test("a reused auto-key multi-chunk expiring memory is copied whole, including chunk 2", async () => {
     const before = await leadHeartbeat();
     await setLeadHeartbeat(PIN_HB);
