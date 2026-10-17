@@ -801,7 +801,7 @@ export default async function (args: unknown, ctx: ScriptContext) {
         const n = chunks.length;
         const heads = chunks.map((c) => (n > 1 ? (/^(#{1,3} [^\n]*)\n\n/.exec(c)?.[1] ?? "") : ""));
         const first = (i: number) => i === 0 || heads[i] !== heads[i - 1];
-        const pieces: Array<{ own: string; cut: boolean; hidden: boolean; nl: boolean }> = [];
+        const pieces: Array<{ own: string; cut: boolean; hidden: boolean; nl: boolean; dot: boolean }> = [];
         chunks.forEach((c, i) => {
           const rest = first(i) ? null : afterCut(chunks[i - 1] ?? "", pieces[i - 1]?.own ?? "", c);
           const own = rest ?? c.slice(heads[i] ? (heads[i] ?? "").length + 2 : 0);
@@ -809,15 +809,21 @@ export default async function (args: unknown, ctx: ScriptContext) {
           const hidden = !first(i) && rest === null;
           // A section's first piece under 50 characters is dropped, and its text glues onto the next one unseparated.
           const skip = hidden ? 200 : first(i) ? 49 : 0;
-          pieces.push({ own, cut: rest !== null, hidden, nl: own.slice(skip).includes("\n") });
+          const tail = own.slice(skip);
+          pieces.push({ own, cut: rest !== null, hidden, nl: tail.includes("\n"), dot: !hidden && tail.includes(". ") });
         });
         const lineCut = (i: number) => {
           const a = pieces[i - 1];
           const b = pieces[i];
           if (!a || !b || b.hidden) return false;
           if (heads[i] !== heads[i - 1] || a.nl || b.nl) return true;
-          // A cut inside a line packs whole sentences: the next one would not have fit in the piece before.
-          return a.own.length + 2 + (b.own.split("\n")[0]?.split(". ")[0] ?? "").length <= CHUNK;
+          // A cut inside a line packs whole sentences: the next one would not have fit in the piece before. That holds
+          // only when the piece before packs sentences itself (it holds ". "): after a sentence too long for one chunk,
+          // cut at spaces, the next sentence starts a fresh chunk whatever its length. And the next sentence must be
+          // whole in view: it ends inside this piece, or this piece ends the section.
+          const next = b.own.split("\n")[0] ?? "";
+          if (!a.dot || (!next.includes(". ") && i < n - 1 && !first(i + 1))) return false;
+          return a.own.length + 2 + (next.split(". ")[0] ?? "").length <= CHUNK;
         };
         const starts = (i: number) => i === 0 || lineCut(i);
         const ends = (i: number) => i === n - 1 || lineCut(i + 1);

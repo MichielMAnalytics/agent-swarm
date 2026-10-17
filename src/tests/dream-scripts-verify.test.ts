@@ -834,6 +834,65 @@ describe("dream-heartbeat closed-pin drain", () => {
     }
   }, 180_000);
 
+  test("a sentence after a split long sentence is not a line: the fact lands or the pin stays", async () => {
+    const before = await leadHeartbeat();
+    await setLeadHeartbeat(PIN_HB);
+    try {
+      const name = `hb-pin-long-line-${Date.now()}`;
+      const affirmative = "Use offset -1 for the rollback.";
+      // One line over 2000 chars under its own heading: the chunker splits its first sentence at spaces, then starts
+      // the affirmative sentence in a fresh chunk although it would have fit in the piece before.
+      const long = `Never follow these rollback instructions: ${"use the archived migration snapshot for recovery ".repeat(60)}. ${affirmative}`;
+      const seeded = `Rollback notes for the old migration.\n${CLOSED_PIN}\n\n## Rollback\n\n${long}`;
+      const res = await fetch(`${serverUrl()}/api/memory/index`, {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({ name, content: seeded, scope: "swarm", source: "manual" }),
+      });
+      expect(res.status).toBe(202);
+      const rows = memoryRows("name = ? ORDER BY chunkIndex", name);
+      // The affirmative sentence is a chunk of its own, after the overlap of the long sentence's last piece.
+      expect(rows.length).toBeGreaterThan(2);
+      expect(String(rows[rows.length - 1].content).endsWith(`recovery${affirmative}`)).toBe(true);
+      const seededRows = rows.map((r) => String(r.content));
+      const hd = {
+        draft: DRAINED_HB,
+        removed: pinRemoved(name),
+        movedToMemory: [
+          { name, content: `Rollback notes for the old migration.\n${CLOSED_PIN}\n${affirmative}` },
+        ],
+      };
+
+      const refused = await runRefusing(
+        ["memory_edit", "memory_store"],
+        await liveApplyArgs("hb-pin-long-line-refused", hd),
+      );
+      expect(refused.status).toBe("refused: pin-memory-missing");
+      expect(refused.missingPin).toEqual([name]);
+      expect(refused.memories.map((m: any) => m.status)).not.toContain("exists: already holds it");
+      expect(
+        memoryRows("name = ? ORDER BY chunkIndex", name).map((r) => String(r.content)),
+      ).toEqual(seededRows);
+      expect(await leadHeartbeat()).toBe(PIN_HB);
+
+      const applied = await run("dream-heartbeat", await liveApplyArgs("hb-pin-long-line", hd));
+      expect(applied.errors).toEqual([]);
+      expect(applied.status).toBe("applied");
+      // A multi-chunk memory cannot be edited, so the fact lands in a sibling that points back.
+      expect(applied.memories).toHaveLength(1);
+      expect(applied.memories[0]).toMatchObject({
+        name,
+        status: "stored-sibling",
+        target: String(rows[0].id),
+      });
+      const sibling = memoryRows("id = ?", applied.memories[0].id)[0];
+      expect(String(sibling.content).split("\n")).toContain(affirmative);
+      expect(await leadHeartbeat()).toBe(DRAINED_HB);
+    } finally {
+      await setLeadHeartbeat(before);
+    }
+  }, 180_000);
+
   test("a reused auto-key multi-chunk expiring memory is copied whole, including chunk 2", async () => {
     const before = await leadHeartbeat();
     await setLeadHeartbeat(PIN_HB);
