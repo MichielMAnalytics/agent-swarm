@@ -757,6 +757,45 @@ describe("dream-heartbeat closed-pin drain", () => {
     }
   }, 180_000);
 
+  test("a memory differing only in a sign is not proof: the changed fact lands or the pin stays", async () => {
+    const before = await leadHeartbeat();
+    await setLeadHeartbeat(PIN_HB);
+    try {
+      const name = `hb-pin-sign-${Date.now()}`;
+      // Every harvested line is already there except for the sign.
+      const id = await seedMemory(
+        name,
+        `Rollback notes for the old migration.\n${CLOSED_PIN}\nUse offset +1 for the rollback.`,
+      );
+      const changed = "Use offset -1 for the rollback.";
+      const hd = {
+        draft: DRAINED_HB,
+        removed: pinRemoved(name),
+        movedToMemory: [
+          { name, content: `Rollback notes for the old migration.\n${CLOSED_PIN}\n${changed}` },
+        ],
+      };
+
+      // Nothing can write the changed fact: "+1" does not hold "-1", so the pin stays.
+      const refused = await runRefusing(
+        ["memory_edit", "memory_store"],
+        await liveApplyArgs("hb-pin-sign-refused", hd),
+      );
+      expect(refused.status).toBe("refused: pin-memory-missing");
+      expect(refused.missingPin).toEqual([name]);
+      expect(await leadHeartbeat()).toBe(PIN_HB);
+
+      const applied = await run("dream-heartbeat", await liveApplyArgs("hb-pin-sign", hd));
+      expect(applied.errors).toEqual([]);
+      expect(applied.status).toBe("applied");
+      expect(applied.memories).toEqual([{ name, id, status: "updated" }]);
+      expect(String(memoryRows("id = ?", id)[0].content)).toContain(changed);
+      expect(await leadHeartbeat()).toBe(DRAINED_HB);
+    } finally {
+      await setLeadHeartbeat(before);
+    }
+  }, 180_000);
+
   test("a reused auto-key multi-chunk expiring memory is copied whole, including chunk 2", async () => {
     const before = await leadHeartbeat();
     await setLeadHeartbeat(PIN_HB);

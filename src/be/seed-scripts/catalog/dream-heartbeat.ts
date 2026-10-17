@@ -773,19 +773,37 @@ export default async function (args: unknown, ctx: ScriptContext) {
         if (why || !id) throw new Error(why || "memory_store returned no id");
         return id;
       };
-      // A fact is one harvested line, compared without whitespace or punctuation: the chunker trims, drops separators,
-      // and prefixes a chunk with its headings and the tail of the chunk before it.
-      const flat = (s: string) => s.replace(/[^\p{L}\p{N}]+/gu, "");
-      const factsOf = (text: string) => [...new Set(text.split("\n").map(flat).filter(Boolean))];
-      // The facts of `text` that a document's chunks lack. A fact may straddle two consecutive chunks.
+      // A fact is one harvested line, compared after whitespace and case normalization only: a sign, digit or
+      // punctuation mark that differs makes it a different fact.
+      const norm = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
+      const factsOf = (text: string) => [...new Set(text.split("\n").map(norm).filter(Boolean))];
+      // The chunker cuts a line longer than a chunk at ". " or " " (or mid-word), drops that separator, and starts the
+      // next chunk with an optional heading line, then the last 100 characters of the cut chunk, once per split level.
+      // Returns the text after the cut, or null when `chunk` does not start that way.
+      const afterCut = (prev: string, chunk: string) => {
+        const glue = prev.slice(-100);
+        if (!glue) return null;
+        let rest = chunk.startsWith(glue) ? chunk : chunk.replace(/^[^\n]*\n\n/, "");
+        if (!rest.startsWith(glue)) return null;
+        while (rest.startsWith(glue)) rest = rest.slice(glue.length);
+        return norm(rest);
+      };
+      // The facts of `text` that a document's chunks lack. A fact may straddle a confirmed cut, missing only the
+      // separator the chunker dropped there.
       const lacking = (chunks: string[], text: string) => {
-        const parts = chunks.map(flat);
+        const parts = chunks.map(norm);
+        const cuts: Array<[string, string]> = [];
+        for (let i = 1; i < chunks.length; i++) {
+          const rest = afterCut(chunks[i - 1] ?? "", chunks[i] ?? "");
+          if (rest) cuts.push([parts[i - 1] ?? "", rest]);
+        }
         return factsOf(text).filter((f) => {
           if (parts.some((p) => p.includes(f))) return false;
-          for (let i = 1; i < parts.length; i++) {
-            const head = parts[i - 1] ?? "";
-            const tail = parts[i] ?? "";
-            for (let n = 1; n < f.length; n++) if (head.endsWith(f.slice(0, n)) && tail.includes(f.slice(n))) return false;
+          for (const [head, rest] of cuts) {
+            for (let n = 1; n < f.length; n++) {
+              if (!head.endsWith(f.slice(0, n))) continue;
+              for (const sep of ["", " ", ". "]) if (f.startsWith(sep, n) && f.length > n + sep.length && rest.startsWith(f.slice(n + sep.length))) return false;
+            }
           }
           return true;
         });
