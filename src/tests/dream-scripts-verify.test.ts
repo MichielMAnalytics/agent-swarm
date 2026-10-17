@@ -60,6 +60,8 @@ const REMOVED = [
   { title: "Old rollout:", probe: "**Old rollout:**", reason: "due", movedTo: "none" },
 ];
 
+/** The spawned server's URL; `base` is shadowed inside the closed-pin describe. */
+const serverUrl = () => base;
 const sha256 = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
 const headers = () => ({
   "Content-Type": "application/json",
@@ -528,7 +530,9 @@ describe("dream-heartbeat closed-pin drain", () => {
       const applied = await run("dream-heartbeat", { ...applyArgs, draft: hd });
       expect(applied.errors).toEqual([]);
       expect(applied.status).toBe("applied");
-      expect(applied.memories).toEqual([{ name: memName, status: "stored" }]);
+      expect(applied.memories).toEqual([
+        { name: memName, id: expect.any(String), status: "stored" },
+      ]);
       expect(await leadHeartbeat()).toBe(DRAINED_HB);
       const db = new Database(TEST_DB_PATH, { readonly: true });
       try {
@@ -546,6 +550,171 @@ describe("dream-heartbeat closed-pin drain", () => {
       const next = await run("dream-heartbeat", { mode: "plan", runId: "hb-pin-next", leadId });
       expect(next.pinDrain).toMatchObject({ candidates: 1, drainable: 0 });
       expect(next.candidates.pins[0].kept).toBe(true);
+    } finally {
+      await setLeadHeartbeat(before);
+    }
+  }, 180_000);
+
+  const REFUSED = {
+    success: true,
+    status: 200,
+    data: { success: false, message: "injected refusal" },
+  };
+
+  /** dream-heartbeat in-process on the real SDK; each listed memory tool returns a tool refusal. */
+  function runRefusing(tools: Array<"memory_edit" | "memory_store">, args: unknown): Promise<any> {
+    const swarm: any = createSwarmSdk(
+      new SwarmConfig({
+        system: {
+          apiKey: { value: API_KEY, isSecret: true },
+          agentId: { value: leadId, isSecret: false },
+          mcpBaseUrl: { value: serverUrl(), isSecret: false },
+        },
+        user: {},
+      }),
+    );
+    const faulty = new Proxy(swarm, {
+      get(target, prop, receiver) {
+        const v = Reflect.get(target, prop, receiver);
+        return (tools as string[]).includes(String(prop)) ? async () => REFUSED : v;
+      },
+    });
+    return heartbeatDefault(args, { swarm: faulty } as any);
+  }
+
+  /** Index a swarm memory straight through the API and return its id. */
+  async function seedMemory(name: string, content: string, source = "manual"): Promise<string> {
+    const res = await fetch(`${serverUrl()}/api/memory/index`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ name, content, scope: "swarm", source }),
+    });
+    expect(res.status).toBe(202);
+    const body: any = await res.json();
+    expect(body.memoryIds?.length).toBe(1);
+    return String(body.memoryIds[0]);
+  }
+
+  function memoryRows(where: string, param: string): any[] {
+    const db = new Database(TEST_DB_PATH, { readonly: true });
+    try {
+      return db
+        .query(`SELECT id, name, content, expiresAt FROM agent_memory WHERE ${where}`)
+        .all(param) as any[];
+    } finally {
+      db.close();
+    }
+  }
+
+  /** Live plan + check for PIN_HB with draft `hd`; returns the apply args. */
+  async function liveApplyArgs(runId: string, hd: Record<string, unknown>) {
+    const plan = await run("dream-heartbeat", { mode: "plan", runId, leadId, dryRun: false });
+    const check = await run("dream-heartbeat", {
+      mode: "check",
+      runId,
+      leadId,
+      dryRun: false,
+      waitMs: 0,
+      plan,
+      hd,
+    });
+    expect(check.reasons).toEqual([]);
+    const disk = {
+      mode: "live",
+      fields: [
+        {
+          field: "heartbeatMd",
+          diskBeforeSha: plan.planSha,
+          draftShaOk: true,
+          diskAfterSha: check.draftSha,
+          stopReason: null,
+        },
+      ],
+    };
+    return { mode: "apply", runId, leadId, dryRun: false, plan, check, disk, draft: hd };
+  }
+
+  test("a refused memory_edit or sibling memory_store keeps the pin", async () => {
+    const before = await leadHeartbeat();
+    await setLeadHeartbeat(PIN_HB);
+    try {
+      const target = `hb-pin-refusal-${Date.now()}`;
+      const targetId = await seedMemory(target, "Old migration notes.");
+      const text = `Drained from Lead HEARTBEAT Tracked Items.\n${CLOSED_PIN}`;
+      const hd = {
+        draft: DRAINED_HB,
+        removed: pinRemoved(target),
+        movedToMemory: [{ name: target, content: text }],
+      };
+
+      // Edit and sibling store both refused: nothing holds the text, so the pin stays.
+      const both = await runRefusing(
+        ["memory_edit", "memory_store"],
+        await liveApplyArgs("hb-pin-refuse-both", hd),
+      );
+      expect(both.status).toBe("refused: pin-memory-missing");
+      expect(both.missingPin).toEqual([target]);
+      expect(both.memories).toEqual([{ name: target, status: "failed" }]);
+      expect(await leadHeartbeat()).toBe(PIN_HB);
+      expect(memoryRows("id = ?", targetId)[0].content).toBe("Old migration notes.");
+
+      // Edit refused: the sibling store carries the text, and only then the pin leaves.
+      const editOnly = await runRefusing(
+        ["memory_edit"],
+        await liveApplyArgs("hb-pin-refuse-edit", hd),
+      );
+      expect(editOnly.status).toBe("applied");
+      expect(editOnly.memories[0]).toMatchObject({ status: "stored-sibling", target: targetId });
+      expect(editOnly.errors.join(" ")).toContain("injected refusal");
+      const sibling = memoryRows("id = ?", editOnly.memories[0].id)[0];
+      expect(String(sibling.content)).toContain(CLOSED_PIN);
+      expect(await leadHeartbeat()).toBe(DRAINED_HB);
+    } finally {
+      await setLeadHeartbeat(before);
+    }
+  }, 180_000);
+
+  test("updateOf a differently named memory appends there and applies", async () => {
+    const before = await leadHeartbeat();
+    await setLeadHeartbeat(PIN_HB);
+    try {
+      const anchor = `hb-pin-anchor-${Date.now()}`;
+      const anchorId = await seedMemory(anchor, "Migration runbook.");
+      const entry = `hb-pin-new-name-${Date.now()}`;
+      const hd = {
+        draft: DRAINED_HB,
+        removed: pinRemoved(entry),
+        movedToMemory: [{ name: entry, updateOf: anchor, content: `Closed pin.\n${CLOSED_PIN}` }],
+      };
+      const applied = await run("dream-heartbeat", await liveApplyArgs("hb-pin-update-of", hd));
+      expect(applied.errors).toEqual([]);
+      expect(applied.status).toBe("applied");
+      expect(applied.memories).toEqual([{ name: entry, id: anchorId, status: "updated" }]);
+      expect(String(memoryRows("id = ?", anchorId)[0].content)).toContain(CLOSED_PIN);
+      expect(memoryRows("name = ?", entry)).toEqual([]);
+      expect(await leadHeartbeat()).toBe(DRAINED_HB);
+    } finally {
+      await setLeadHeartbeat(before);
+    }
+  }, 180_000);
+
+  test("a reused expiring memory gets a durable copy before the pin leaves", async () => {
+    const before = await leadHeartbeat();
+    await setLeadHeartbeat(PIN_HB);
+    try {
+      const reused = `hb-pin-expiring-${Date.now()}`;
+      const reusedId = await seedMemory(reused, `Task result.\n${CLOSED_PIN}`, "task_completion");
+      expect(memoryRows("id = ?", reusedId)[0].expiresAt).not.toBeNull();
+      const hd = { draft: DRAINED_HB, removed: pinRemoved(reused), movedToMemory: [] };
+      const applied = await run("dream-heartbeat", await liveApplyArgs("hb-pin-expiring", hd));
+      expect(applied.errors).toEqual([]);
+      expect(applied.status).toBe("applied");
+      const copy = applied.memories.find((m: any) => m.status === "stored-durable-copy");
+      expect(copy).toMatchObject({ name: reused, from: reusedId });
+      const row = memoryRows("id = ?", copy.id)[0];
+      expect(row.expiresAt).toBeNull();
+      expect(String(row.content)).toContain(CLOSED_PIN);
+      expect(await leadHeartbeat()).toBe(DRAINED_HB);
     } finally {
       await setLeadHeartbeat(before);
     }

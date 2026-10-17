@@ -761,6 +761,30 @@ export default async function (args: unknown, ctx: ScriptContext) {
       // Memories land BEFORE the DB write, so a drained pin is never only in a pre-image. A pin memory whose name already
       // exists (or an entry with updateOf) is appended to that memory instead of creating a twin.
       const pinNames = new Set(removed.map(memKey).filter(Boolean));
+      // A tool refusal comes back as HTTP 200 with data.success false, so judge the tool's verdict, not the transport's.
+      const refusal = (r: any) =>
+        !r || r.success === false || r.isError || r.data?.success === false || r.data?.isError
+          ? String(r?.data?.message ?? r?.data?.error ?? r?.message ?? `status ${r?.status ?? "none"}`).slice(0, 160)
+          : "";
+      const storeMemory = async (name: string, content: string, tags: string[]) => {
+        const r: any = await ctx.swarm.memory_store({ name, content, scope: "swarm", tags, intent: `dreaming heartbeat lane ${runId}` } as any);
+        const why = refusal(r);
+        const id = String(r?.data?.memoryIds?.[0] ?? "");
+        if (why || !id) throw new Error(why || "memory_store returned no id");
+        return id;
+      };
+      // The whole document a row belongs to (chunks share key, scope and owner), and whether any chunk expires.
+      const docOf = async (id: string) => {
+        const row = (await q(`SELECT id, key, scope, agentId, content, expiresAt FROM agent_memory WHERE id = ? LIMIT 1`, [id]))[0];
+        if (!row) return null;
+        const parts = row.key ? await q(`SELECT content, expiresAt FROM agent_memory WHERE key = ? AND scope = ? AND agentId IS ? ORDER BY chunkIndex`, [row.key, row.scope, row.agentId]) : [row];
+        return { id: String(row.id), text: parts.map((p: any) => String(p.content ?? "")).join("\n"), expiring: parts.some((p: any) => p.expiresAt != null) };
+      };
+      const pinTags = ["dreaming", runId, "heartbeat", "heartbeat-pin"];
+      // Pin key (entry name and its updateOf) -> the row that now holds the text, and the text that must be in it.
+      const held = new Map<string, { id: string; snippet: string }>();
+      // Pin keys whose entry failed to write: an older row under the same name does not hold this run's text.
+      const failed = new Set<string>();
       const memories: any[] = [];
       let general = 0;
       let pinned = 0;
@@ -777,40 +801,73 @@ export default async function (args: unknown, ctx: ScriptContext) {
           memories.push({ name, status: "refused" });
           continue;
         }
-        const ex = await q(`SELECT id, name, totalChunks, content FROM agent_memory WHERE id = ? OR (name = ? AND chunkIndex = 0) ORDER BY createdAt DESC LIMIT 1`, [target || name, target || name]);
-        const hit = ex[0];
-        if (hit && (isPin || target)) {
-          if (String(hit.content ?? "").includes(content.trim().slice(0, 200))) {
-            memories.push({ name, id: hit.id, status: "exists: already holds it" });
+        const snippet = content.trim().slice(0, 200);
+        const keep = (id: string, status: string, extra: Record<string, unknown> = {}) => {
+          memories.push({ name, id, status, ...extra });
+          if (isPin) for (const k of [name, target]) if (k) held.set(k, { id, snippet });
+        };
+        try {
+          const ex = await q(`SELECT id, name, totalChunks, content FROM agent_memory WHERE id = ? OR (name = ? AND chunkIndex = 0) ORDER BY createdAt DESC LIMIT 1`, [target || name, target || name]);
+          const hit = ex[0];
+          if (hit && (isPin || target)) {
+            if (String(hit.content ?? "").includes(snippet)) {
+              keep(String(hit.id), "exists: already holds it");
+              continue;
+            }
+            if (Number(hit.totalChunks ?? 1) === 1) {
+              try {
+                const er: any = await ctx.swarm.memory_edit({ memoryId: String(hit.id), mode: "replace", content: `${String(hit.content).trimEnd()}\n\n${content.trim()}`, intent: `dreaming heartbeat lane ${runId}: drained heartbeat pin` });
+                const why = refusal(er);
+                if (why) throw new Error(why);
+                keep(String(hit.id), "updated");
+                continue;
+              } catch (e: any) {
+                errors.push(`memory_edit ${name}: ${String(e?.message ?? e).slice(0, 160)}`);
+              }
+            }
+            // Multi-chunk rows cannot be edited (and an edit can be refused): keep the text in a sibling that points back.
+            const taken = (await q(`SELECT 1 FROM agent_memory WHERE name = ? LIMIT 1`, [name])).length > 0;
+            const sibling = taken ? `${name.slice(0, 80)}-${date.slice(5)}` : name;
+            const sid = await storeMemory(sibling, `Addendum to memory "${String(hit.name).slice(0, 120)}" (${hit.id}).\n\n${content}`, pinTags);
+            keep(sid, "stored-sibling", { target: String(hit.id), sibling });
             continue;
           }
-          if (Number(hit.totalChunks ?? 1) === 1) {
-            try {
-              const er: any = await ctx.swarm.memory_edit({ memoryId: String(hit.id), mode: "replace", content: `${String(hit.content).trimEnd()}\n\n${content.trim()}`, intent: `dreaming heartbeat lane ${runId}: drained heartbeat pin` });
-              if (er?.success === false || er?.isError || er?.error) throw new Error(String(er?.message ?? er?.error ?? "memory_edit refused"));
-              memories.push({ name, id: hit.id, status: "updated" });
-              continue;
-            } catch (e: any) {
-              errors.push(`memory_edit ${name}: ${String(e?.message ?? e).slice(0, 160)}`);
-            }
+          if (hit) {
+            memories.push({ name, status: "exists" });
+            continue;
           }
-          // Multi-chunk rows cannot be edited (and an edit can be refused): keep the text in a sibling that points back.
-          const taken = (await q(`SELECT 1 FROM agent_memory WHERE name = ? LIMIT 1`, [name])).length > 0;
-          const sibling = taken ? `${name.slice(0, 80)}-${date.slice(5)}` : name;
-          await ctx.swarm.memory_store({ name: sibling, content: `Addendum to memory "${String(hit.name).slice(0, 120)}" (${hit.id}).\n\n${content}`, scope: "swarm", tags: ["dreaming", runId, "heartbeat", "heartbeat-pin"], intent: `dreaming heartbeat lane ${runId}` } as any);
-          memories.push({ name, id: hit.id, status: "stored-sibling", sibling });
+          keep(await storeMemory(name, content, isPin ? pinTags : ["dreaming", runId, "heartbeat"]), "stored");
+        } catch (e: any) {
+          errors.push(`memory_store ${name}: ${String(e?.message ?? e).slice(0, 160)}`);
+          memories.push({ name, status: "failed" });
+          if (isPin) for (const k of [name, target]) if (k) failed.add(k);
+        }
+      }
+      // Re-read every drained pin's memory before the prune: it must exist, hold the text this run wrote, and not expire.
+      // A reused hit that expires (task_completion, session_summary) gets a durable manual copy, or its facts vanish with the line.
+      const missingPin: string[] = [];
+      const durable = new Map<string, string>();
+      for (const k of pinNames) {
+        const h = held.get(k);
+        const id = h?.id ?? String((await q(`SELECT id FROM agent_memory WHERE id = ? OR (name = ? AND chunkIndex = 0) ORDER BY createdAt DESC LIMIT 1`, [k, k]))[0]?.id ?? "");
+        const doc = id && (h || !failed.has(k)) ? await docOf(id) : null;
+        if (!doc || (h && !doc.text.includes(h.snippet))) {
+          missingPin.push(k);
           continue;
         }
-        if (hit) {
-          memories.push({ name, status: "exists" });
-          continue;
+        if (!doc.expiring || durable.has(doc.id)) continue;
+        try {
+          const cid = await storeMemory(`${k.slice(0, 80)}-durable`, `Durable copy of memory ${doc.id}, which expires; kept because a drained heartbeat pin points at it.\n\n${doc.text}`, pinTags);
+          const copy = await docOf(cid);
+          if (!copy || copy.expiring || !copy.text.includes(h?.snippet ?? doc.text.slice(0, 200))) throw new Error(`durable copy ${cid} did not re-read`);
+          durable.set(doc.id, cid);
+          memories.push({ name: k, id: cid, status: "stored-durable-copy", from: doc.id });
+        } catch (e: any) {
+          errors.push(`durable copy ${k}: ${String(e?.message ?? e).slice(0, 160)}`);
+          missingPin.push(k);
         }
-        await ctx.swarm.memory_store({ name, content, scope: "swarm", tags: ["dreaming", runId, "heartbeat", ...(isPin ? ["heartbeat-pin"] : [])], intent: `dreaming heartbeat lane ${runId}` } as any);
-        memories.push({ name, status: "stored" });
       }
       // A drained pin whose memory is still missing: the disk already holds the draft, so Lead puts the backup back.
-      const missingPin: string[] = [];
-      for (const k of pinNames) if (!(await q(`SELECT 1 FROM agent_memory WHERE name = ? OR id = ? LIMIT 1`, [k, k])).length) missingPin.push(k);
       if (missingPin.length) {
         await restoreTask(`${missingPin.length} drained pin memory(ies) did not store (${missingPin.slice(0, 3).join(", ")})`, String(plan.planSha ?? ""));
         return { ...base, ok: false, status: "refused: pin-memory-missing", missingPin, memories, restoreTask: "sent to Lead", errors };
