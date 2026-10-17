@@ -114,6 +114,7 @@ export class AgentTaskExecutor extends BaseExecutor<
       model: config.model,
       modelTier: config.modelTier,
       agentId: config.agentId,
+      vcsRepo: effectiveVcsRepo,
     });
     if (profileError) return { status: "failed", error: profileError };
     const preCreate = await applyPreTaskCreate({

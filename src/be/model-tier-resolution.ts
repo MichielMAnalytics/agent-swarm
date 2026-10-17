@@ -613,7 +613,23 @@ async function resolveTierAlias(
   }
   if (resolved.modelSource !== "tier-default") return null;
   const picked = await resolveClaimProfile(name, "profile:tier-alias", harness);
-  return picked && "profile" in picked ? picked : null;
+  if (!picked || !("profile" in picked)) return null;
+  // A seed copied from a stale MODEL_TIER_* row can name another harness's model.
+  // The tier chain skipped that value, so the alias skips it too.
+  if (
+    isHarnessModelJudged(harness) &&
+    harnessModelMismatch(
+      picked.resolution.resolvedModel,
+      harness,
+      (await loadResolutionCatalog()).catalog as HarnessCatalogSections,
+    )
+  ) {
+    console.warn(
+      `[model-tiers] profile ${name} names ${picked.resolution.resolvedModel}, which does not run on ${harness}; keeping the tier result`,
+    );
+    return null;
+  }
+  return picked;
 }
 
 /**

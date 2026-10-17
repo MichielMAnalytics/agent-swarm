@@ -32674,6 +32674,18 @@
                                 "required": [
                                   "name"
                                 ]
+                              },
+                              "credentialAllowlist": {
+                                "type": "object",
+                                "additionalProperties": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string",
+                                    "minLength": 5,
+                                    "maxLength": 5
+                                  },
+                                  "minItems": 1
+                                }
                               }
                             },
                             "required": [

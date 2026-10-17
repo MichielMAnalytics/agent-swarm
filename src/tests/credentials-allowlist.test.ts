@@ -15,10 +15,11 @@ import {
   test,
 } from "bun:test";
 import { unlink } from "node:fs/promises";
-import { closeDb, createAgent, createTaskExtended, getDbClient, initDb } from "../be/db";
+import { closeDb, createAgent, createTaskExtended, getDbClient, initDb, pauseTask } from "../be/db";
 import { createModelProfile } from "../be/db/model-profiles";
-import { fetchResolvedEnv } from "../commands/runner";
+import { fetchResolvedEnv, getPausedTasksFromAPI } from "../commands/runner";
 import { handlePoll } from "../http/poll";
+import { handleTasks } from "../http/tasks";
 import {
   type AvailabilityInfo,
   CredentialAllowlistError,
@@ -395,5 +396,75 @@ describe("the claim trigger carries the profile's allowlist", () => {
   test("a profile without one, or no profile, leaves it off", async () => {
     expect(await claim("claude-open")).not.toHaveProperty("credentialAllowlist");
     expect(await claim(undefined)).not.toHaveProperty("credentialAllowlist");
+  });
+
+  // Paused-task recovery spawns from `GET /api/paused-tasks`, not a claim
+  // trigger. Drives the runner's real fetch and key pick over that response.
+  test("a paused task resumes on an allowlisted key", async () => {
+    const w = await createAgent({
+      name: "w-paused",
+      isLead: false,
+      status: "idle",
+      maxTasks: 1,
+      harnessProvider: "claude",
+    });
+    const created = await createTaskExtended("work", { agentId: w.id, profile: "claude-pinned" });
+    expect((await callPoll(w.id))?.task.credentialAllowlist).toEqual({ [VAR]: ALLOWED });
+    expect(await pauseTask(created.id)).not.toBeNull();
+
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/api/paused-tasks") {
+          let body = "";
+          const fakeReq = {
+            method: "GET",
+            url: "/api/paused-tasks",
+            headers: { "x-agent-id": w.id },
+          } as unknown as Parameters<typeof handleTasks>[0];
+          const fakeRes = {
+            setHeader() {},
+            writeHead() {},
+            end(chunk?: string) {
+              body = chunk ?? "";
+            },
+          } as unknown as Parameters<typeof handleTasks>[1];
+          await handleTasks(fakeReq, fakeRes, ["api", "paused-tasks"], url.searchParams, w.id);
+          return new Response(body, { headers: { "content-type": "application/json" } });
+        }
+        if (url.pathname === "/api/config/resolved") {
+          return Response.json({
+            configs: [
+              { key: VAR, value: POOL.join(",") },
+              { key: "HARNESS_PROVIDER", value: "claude" },
+            ],
+          });
+        }
+        if (url.pathname === "/api/keys/available") {
+          return Response.json({ success: true, availableIndices: [0, 1, 2, 3], totalKeys: 4 });
+        }
+        return new Response("Not found", { status: 404 });
+      },
+    });
+    const apiUrl = server.url.toString().replace(/\/$/, "");
+    try {
+      const [paused] = await getPausedTasksFromAPI({ apiUrl, apiKey: "key", agentId: w.id });
+      expect(paused?.id).toBe(created.id);
+      const seen = new Set<string>();
+      for (let i = 0; i < 40; i++) {
+        const { env } = await fetchResolvedEnv(apiUrl, "key", w.id, {}, "opus", {
+          provider: "claude",
+          taskId: paused!.id,
+          enforceModelCapacity: true,
+          resolvedProfile: paused!.resolvedProfile,
+          credentialAllowlist: paused!.credentialAllowlist,
+        });
+        seen.add(keySuffix(env[VAR] ?? ""));
+      }
+      expect([...seen].filter((suffix) => !ALLOWED.includes(suffix))).toEqual([]);
+    } finally {
+      server.stop(true);
+    }
   });
 });

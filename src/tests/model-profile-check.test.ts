@@ -3,9 +3,16 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
-import { closeDb, createAgent, getDbClient, initDb, upsertSwarmConfig } from "../be/db";
+import {
+  closeDb,
+  createAgent,
+  createSwarmRepo,
+  getDbClient,
+  initDb,
+  upsertSwarmConfig,
+} from "../be/db";
 import { updateAgentCredStatus } from "../be/db/agents";
-import { createModelProfile } from "../be/db/model-profiles";
+import { createModelProfile, taskProfileError } from "../be/db/model-profiles";
 import { checkProfileForAgent, formatProfileCheckFailures } from "../be/model-profile-check";
 import type { AgentCredStatus, ProfileCheckResult, ProfileCheckRow } from "../types";
 
@@ -92,6 +99,7 @@ beforeEach(async () => {
   await client.run("DELETE FROM agent_tasks");
   await client.run("DELETE FROM scheduled_tasks");
   await client.run("DELETE FROM swarm_config");
+  await client.run("DELETE FROM swarm_repos");
   await client.run("DELETE FROM api_key_status");
   await client.run("DELETE FROM agents");
   await client.run("DELETE FROM model_profiles");
@@ -295,6 +303,39 @@ describe("credential-allowlist", () => {
       ["CLAUDE_CODE_OAUTH_TOKEN", "11111", crypto.randomUUID()],
     );
     expect(row(await check(id, "claude-env"), "credential-allowlist")?.state).toBe("unverified");
+  });
+
+  // The worker loads a task's repo-scoped config over the agent's (repo > agent),
+  // so a check for that task judges the same pool.
+  test("a repo-scoped pool overrides the agent's for a task in that repo", async () => {
+    await createModelProfile({
+      name: "claude-repo-key",
+      harness: "claude",
+      model: "opus",
+      credentials: { CLAUDE_CODE_OAUTH_TOKEN: ["22222"] },
+    });
+    const id = await agent("claude", report());
+    await pool(id, "CLAUDE_CODE_OAUTH_TOKEN", KEY_A);
+    const repo = await createSwarmRepo({ url: "https://github.com/acme/widgets", name: "widgets" });
+    await upsertSwarmConfig({
+      scope: "repo",
+      scopeId: repo.id,
+      key: "CLAUDE_CODE_OAUTH_TOKEN",
+      value: KEY_B,
+      isSecret: true,
+      exportToEnv: true,
+    });
+
+    expect((await check(id, "claude-repo-key")).ok).toBe(false);
+    const inRepo = await checkProfileForAgent(id, "claude-repo-key", { vcsRepo: "acme/widgets" });
+    expect(inRepo?.ok).toBe(true);
+    expect(row(inRepo!, "credential-allowlist")?.state).toBe("pass");
+    expect(
+      await taskProfileError({ profile: "claude-repo-key", agentId: id, vcsRepo: "acme/widgets" }),
+    ).toBeNull();
+    expect(await taskProfileError({ profile: "claude-repo-key", agentId: id })).toContain(
+      "credential-allowlist",
+    );
   });
 
   test("no output contains a decrypted value", async () => {

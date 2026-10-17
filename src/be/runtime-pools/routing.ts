@@ -17,6 +17,7 @@ import {
   releaseTask,
 } from "../db";
 import { type AgentTaskRow, rowToAgentTask } from "../db/tasks/read";
+import { checkProfileForAgent } from "../model-profile-check";
 import { poolTaskRunsOnHarness } from "../model-validation";
 import { agentsWithLiveRuntime, runtimeStaleThresholdMinutes } from "../multi-runtime";
 import { listRuntimePools } from "./db";
@@ -162,10 +163,25 @@ export async function routePoolTasks(
     }
     return (agent.maxTasks ?? 1) - count;
   };
+  // A task with an explicit `profile` waits for an agent that passes the profile
+  // check, as on the poll's unassigned scan. Memoized per pass.
+  const profileOk = new Map<string, boolean>();
+  const passesProfileCheck = async (agent: Agent, task: AgentTask): Promise<boolean> => {
+    if (!task.profile) return true;
+    const memoKey = JSON.stringify([agent.id, task.profile, task.vcsRepo ?? null]);
+    let ok = profileOk.get(memoKey);
+    if (ok === undefined) {
+      const result = await checkProfileForAgent(agent.id, task.profile, { vcsRepo: task.vcsRepo });
+      ok = result?.ok !== false;
+      profileOk.set(memoKey, ok);
+    }
+    return ok;
+  };
   const eligible = async (agent: Agent, task: AgentTask): Promise<boolean> =>
     (await headroom(agent)) > 0 &&
     isAgentEligibleForTask(agent, task) &&
-    (await poolTaskRunsOnHarness(task, agent.harnessProvider ?? agent.provider ?? null));
+    (await poolTaskRunsOnHarness(task, agent.harnessProvider ?? agent.provider ?? null)) &&
+    (await passesProfileCheck(agent, task));
 
   const assigned: Array<{ taskId: string; agentId: string }> = [];
   const limit = nonnegativeEnv("HEARTBEAT_MAX_AUTO_ASSIGN", 5);

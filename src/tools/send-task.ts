@@ -492,6 +492,7 @@ export async function sendTaskHandler(
     model: normalizedModel.model,
     modelTier: normalizedModel.modelTier,
     agentId: effectiveAgentId,
+    vcsRepo: effectiveVcsRepo,
   });
   if (profileError) return toolErr(profileError, { data: { yourAgentId: creatorAgentId } });
   const effectiveRoutingReason =

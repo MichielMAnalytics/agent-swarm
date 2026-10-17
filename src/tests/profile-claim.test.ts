@@ -7,6 +7,7 @@ import { unlink } from "node:fs/promises";
 import {
   closeDb,
   createAgent,
+  createSwarmRepo,
   createTaskExtended,
   getDbClient,
   getTaskById,
@@ -14,7 +15,9 @@ import {
   upsertSwarmConfig,
 } from "../be/db";
 import { createModelProfile, getAgentDefaultProfileName } from "../be/db/model-profiles";
+import { checkProfileForAgent } from "../be/model-profile-check";
 import { recordClaimModelResolution } from "../be/model-tier-resolution";
+import { routePoolTasks } from "../be/runtime-pools/routing";
 import { handlePoll } from "../http/poll";
 import { taskModelPin } from "../tasks/model-pin";
 import { inheritedModelSelection } from "../tasks/worker-follow-up";
@@ -201,6 +204,79 @@ describe("a task's own profile", () => {
     const trigger = await callPoll(b.id);
     expect(trigger?.taskId).toBe(first.id);
     expect(trigger?.task.resolvedProfile).toBe("claude-pinned-key");
+  });
+
+  test("a pool task's repo-scoped key counts, and one poll judges each repo apart", async () => {
+    await createModelProfile({
+      name: "claude-repo-key",
+      harness: "claude",
+      model: "opus",
+      credentials: { CLAUDE_CODE_OAUTH_TOKEN: ["22222"] },
+    });
+    const w = await worker("p-repo", "claude");
+    await upsertSwarmConfig({
+      scope: "agent",
+      scopeId: w.id,
+      key: "CLAUDE_CODE_OAUTH_TOKEN",
+      value: "sk-ant-oat01-key-a-11111",
+      exportToEnv: true,
+    });
+    const repo = await createSwarmRepo({ url: "https://github.com/acme/widgets", name: "widgets" });
+    await upsertSwarmConfig({
+      scope: "repo",
+      scopeId: repo.id,
+      key: "CLAUDE_CODE_OAUTH_TOKEN",
+      value: "sk-ant-oat01-key-b-22222",
+      exportToEnv: true,
+    });
+    // The repo-less task is scanned first and fails on the agent's key; the
+    // repo task must not inherit that verdict.
+    const bare = await createTaskExtended("pool work", { profile: "claude-repo-key" });
+    await Bun.sleep(5);
+    const scoped = await createTaskExtended("pool work", {
+      profile: "claude-repo-key",
+      vcsRepo: "acme/widgets",
+    });
+
+    const trigger = await callPoll(w.id);
+    expect(trigger?.taskId).toBe(scoped.id);
+    expect((await getTaskById(bare.id))?.status).toBe("unassigned");
+  });
+
+  test("automatic pool routing skips a worker that fails the profile check", async () => {
+    await createModelProfile({
+      name: "claude-routed-key",
+      harness: "claude",
+      model: "opus",
+      credentials: { CLAUDE_CODE_OAUTH_TOKEN: ["22222"] },
+    });
+    const a = await worker("p-route-fail", "claude");
+    await upsertSwarmConfig({
+      scope: "agent",
+      scopeId: a.id,
+      key: "CLAUDE_CODE_OAUTH_TOKEN",
+      value: "sk-ant-oat01-key-a-11111",
+      exportToEnv: true,
+    });
+    const task = await createTaskExtended("pool work", { profile: "claude-routed-key" });
+    expect((await checkProfileForAgent(a.id, "claude-routed-key"))?.ok).toBe(false);
+
+    expect(await routePoolTasks()).toEqual([]);
+    expect(await callPoll(a.id)).toBeNull();
+    expect((await getTaskById(task.id))?.status).toBe("unassigned");
+
+    const b = await worker("p-route-pass", "claude");
+    await upsertSwarmConfig({
+      scope: "agent",
+      scopeId: b.id,
+      key: "CLAUDE_CODE_OAUTH_TOKEN",
+      value: "sk-ant-oat01-key-b-22222",
+      exportToEnv: true,
+    });
+    expect(await routePoolTasks()).toEqual([{ taskId: task.id, agentId: b.id }]);
+    const trigger = await callPoll(b.id);
+    expect(trigger?.taskId).toBe(task.id);
+    expect(trigger?.task.resolvedProfile).toBe("claude-routed-key");
   });
 });
 

@@ -17,6 +17,7 @@ import type {
 } from "../types";
 import { getModelAwareCredentialVars, keySuffix, splitCredentialPool } from "../utils/credentials";
 import { runtimeHarnessSections } from "../utils/runtime-model-catalog";
+import { vcsRepoName, vcsRepoUrlMatches } from "../utils/vcs-repo-match";
 import { getAgentById, getDbClient, getResolvedConfig } from "./db";
 import { getModelProfileByName } from "./db/model-profiles";
 import { isKnownCatalogModel } from "./model-validation";
@@ -40,12 +41,36 @@ export interface ProfileCheckOptions {
    * then for the old harness, so that row is `unverified`.
    */
   harness?: string | null;
+  /**
+   * The task's `vcsRepo`. The worker loads that repo's scoped config over the
+   * agent's (repo > agent), so the check judges the same pool.
+   */
+  vcsRepo?: string | null;
+  /** Whether the worker's config read includes secret repo rows (`readsRepoSecrets`). */
+  includeRepoSecrets?: boolean;
+}
+
+/**
+ * The `swarm_repos` id `vcsRepo` names, matched as the worker's
+ * `fetchRepoConfig` matches it. Null when no registered repo matches.
+ */
+export async function vcsRepoId(vcsRepo: string | null | undefined): Promise<string | null> {
+  if (!vcsRepo?.trim()) return null;
+  const repos = await getDbClient().query<{ id: string; url: string }>(
+    "SELECT id, url FROM swarm_repos WHERE name = ? ORDER BY name ASC",
+    [vcsRepoName(vcsRepo)],
+  );
+  return repos.find((r) => vcsRepoUrlMatches(r.url, vcsRepo))?.id ?? null;
 }
 
 /** Pooled credential values the worker would get, by var: exported config rows only. */
-async function configPools(agentId: string): Promise<Map<string, string>> {
+async function configPools(
+  agentId: string,
+  { vcsRepo, includeRepoSecrets = true }: ProfileCheckOptions,
+): Promise<Map<string, string>> {
   const pools = new Map<string, string>();
-  for (const row of await getResolvedConfig(agentId)) {
+  const repoId = (await vcsRepoId(vcsRepo)) ?? undefined;
+  for (const row of await getResolvedConfig(agentId, repoId, { includeRepoSecrets })) {
     if (row.exportToEnv && row.value.trim()) pools.set(row.key, row.value);
   }
   return pools;
@@ -210,7 +235,7 @@ export async function checkProfileForAgent(
   if (!agent || !profile) return null;
   const agentHarness = agent.harnessProvider ?? agent.provider ?? null;
   const harness = options.harness === undefined ? agentHarness : options.harness;
-  const pools = await configPools(agentId);
+  const pools = await configPools(agentId, options);
 
   const checks: ProfileCheckRow[] = [
     harnessRow(profile, harness),

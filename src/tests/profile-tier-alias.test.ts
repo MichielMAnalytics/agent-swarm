@@ -17,7 +17,14 @@ import {
 import { unlink } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { closeDb, createAgent, createTaskExtended, getDbClient, initDb } from "../be/db";
+import {
+  closeDb,
+  createAgent,
+  createTaskExtended,
+  getDbClient,
+  initDb,
+  upsertSwarmConfig,
+} from "../be/db";
 import { getModelProfileByName, updateModelProfile } from "../be/db/model-profiles";
 import {
   recordClaimModelResolution,
@@ -212,6 +219,40 @@ describe("overrides and edits", () => {
       expect(own.effort).toBeUndefined();
     } finally {
       await updateModelProfile("claude-regular", { effort: null });
+    }
+  });
+
+  // The seeder copies a global MODEL_TIER_* row into the seed. The tier chain
+  // skips a value from another harness; the alias must not bring it back.
+  test("a seed configured with another harness's model keeps the tier result", async () => {
+    const key = "MODEL_TIER_CLAUDE_SMART";
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    await getDbClient().run("DELETE FROM model_profiles WHERE name = 'claude-smart'");
+    await upsertSwarmConfig({ scope: "global", key, value: "gpt-5.6-sol" });
+    process.env[key] = "gpt-5.6-sol";
+    try {
+      await seedModelProfiles();
+      expect((await getModelProfileByName("claude-smart"))?.model).toBe("gpt-5.6-sol");
+      const baseline = await resolveTaskModel({
+        modelTier: "smart",
+        harnessProvider: "claude",
+        record: false,
+      });
+      const today = baseline && !("harnessMismatch" in baseline) ? baseline : null;
+      expect(today?.resolvedModel).toBe(DEFAULT_MODEL_TIER_MAP.claude.smart);
+
+      const { fields, row } = await claimTier("claude", "smart");
+      expect(fields.resolvedModel).toBe(today?.resolvedModel);
+      expect(fields.modelSource).toBe(today?.modelSource);
+      expect(fields.resolvedProfile).toBeUndefined();
+      expect(row?.resolvedModel).toBe(today?.resolvedModel ?? null);
+      expect(row?.resolvedProfile).toBeNull();
+    } finally {
+      delete process.env[key];
+      warnSpy.mockRestore();
+      await getDbClient().run("DELETE FROM swarm_config WHERE scope = 'global' AND key = ?", [key]);
+      await getDbClient().run("DELETE FROM model_profiles WHERE name = 'claude-smart'");
+      await seedModelProfiles();
     }
   });
 

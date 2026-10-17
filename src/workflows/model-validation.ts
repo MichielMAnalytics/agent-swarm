@@ -31,7 +31,11 @@ function asString(value: unknown): string | undefined {
  * sit beside `model`/`modelTier`, and must pass the profile check when
  * `agentId` is static too.
  */
-export async function workflowModelErrors(def: WorkflowDefinition): Promise<string[]> {
+export async function workflowModelErrors(
+  def: WorkflowDefinition,
+  /** The workflow-level `vcsRepo` a node without its own inherits. */
+  { vcsRepo }: { vcsRepo?: string | null } = {},
+): Promise<string[]> {
   const errors: string[] = [];
   for (const node of def.nodes) {
     const targets: Array<{ config: NodeConfig; path: string }> = [];
@@ -47,6 +51,8 @@ export async function workflowModelErrors(def: WorkflowDefinition): Promise<stri
           model: asString(config.model),
           modelTier: asString(config.modelTier),
           agentId: isStatic(config.agentId) ? config.agentId : undefined,
+          // A node's own repo wins over the workflow's, as in the executor.
+          vcsRepo: config.vcsRepo === undefined ? vcsRepo : asString(config.vcsRepo),
         });
         if (error) errors.push(`Node "${node.id}" ${path}.profile: ${error}`);
       }

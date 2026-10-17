@@ -2387,6 +2387,9 @@ export async function getPausedTasksFromAPI(config: ApiConfig): Promise<
     status?: string;
     contextKey?: string;
     requestedBy?: Trigger["requestedBy"];
+    /** The profile claim applied, and its pooled-key allowlist read again at fetch. */
+    resolvedProfile?: string;
+    credentialAllowlist?: Record<string, string[]>;
   }>
 > {
   const headers: Record<string, string> = {
@@ -2424,6 +2427,8 @@ export async function getPausedTasksFromAPI(config: ApiConfig): Promise<
         output?: string;
         status?: string;
         requestedBy?: Trigger["requestedBy"];
+        resolvedProfile?: string;
+        credentialAllowlist?: Record<string, string[]>;
       }>;
     };
     return data.tasks || [];
@@ -6853,9 +6858,8 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
               vcsRepo: task.vcsRepo,
               contextKey: (task as { contextKey?: string }).contextKey,
               localBlocks: state.modelWindowBlocks,
-              resolvedProfile: (task as { resolvedProfile?: string }).resolvedProfile,
-              credentialAllowlist: (task as { credentialAllowlist?: Record<string, string[]> })
-                .credentialAllowlist,
+              resolvedProfile: task.resolvedProfile,
+              credentialAllowlist: task.credentialAllowlist,
             },
             logDir,
             isYolo,

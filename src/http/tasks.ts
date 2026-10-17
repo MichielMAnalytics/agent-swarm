@@ -35,7 +35,11 @@ import {
   updateTaskTitle,
   updateTaskVcs,
 } from "../be/db";
-import { modelProfileRefError, taskProfileError } from "../be/db/model-profiles";
+import {
+  getModelProfileByName,
+  modelProfileRefError,
+  taskProfileError,
+} from "../be/db/model-profiles";
 import { explicitModelErrorForAgent } from "../be/model-validation";
 import {
   getTaskSteeringFields,
@@ -61,6 +65,7 @@ import {
   AgentTaskStatusSchema,
   AssetKeySchema,
   isTerminalTaskStatus,
+  ModelProfileCredentialsSchema,
   ModelTierSchema,
   OnUnsupportedSchema,
   ProviderNameSchema,
@@ -612,6 +617,9 @@ const listPausedTasks = route({
             // Same requester projection a fresh task_assigned trigger carries,
             // so a resumed session gets the same requester-profile prompt.
             requestedBy: TaskRequestedBySchema.optional(),
+            // The claimed profile's pooled-key allowlist, read again from the
+            // profile, so the recovery spawn picks keys as the claim did.
+            credentialAllowlist: ModelProfileCredentialsSchema.optional(),
           }),
         ),
       }),
@@ -1741,10 +1749,14 @@ export async function handleTasks(
     const tasks = await Promise.all(
       pausedTasks.map(async (task) => {
         const requestedBy = await buildTaskRequestedBy(task);
+        const profile = task.resolvedProfile
+          ? await getModelProfileByName(task.resolvedProfile)
+          : null;
         return {
           ...task,
           attachments: await getTaskAttachments(task.id),
           ...(requestedBy && { requestedBy }),
+          ...(profile?.credentials && { credentialAllowlist: profile.credentials }),
         };
       }),
     );

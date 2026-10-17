@@ -13,8 +13,11 @@ import {
   type ReasoningEffort,
   ReasoningEffortSchema,
 } from "../../types";
-import { vcsRepoName, vcsRepoUrlMatches } from "../../utils/vcs-repo-match";
-import { checkProfileForAgent, formatProfileCheckFailures } from "../model-profile-check";
+import {
+  checkProfileForAgent,
+  formatProfileCheckFailures,
+  vcsRepoId,
+} from "../model-profile-check";
 import { getDbClient } from "./runtime";
 import { SUPERSEDED_RESUME_REPAIR_WINDOW_MS } from "./tasks/read";
 
@@ -282,18 +285,13 @@ export async function repoModelOverrideKeys(
   vcsRepo: string | null | undefined,
   { includeSecrets = true }: { includeSecrets?: boolean } = {},
 ): Promise<Set<string>> {
-  if (!vcsRepo?.trim()) return new Set();
-  const repos = await getDbClient().query<{ id: string; url: string }>(
-    "SELECT id, url FROM swarm_repos WHERE name = ? ORDER BY name ASC",
-    [vcsRepoName(vcsRepo)],
-  );
-  const repo = repos.find((r) => vcsRepoUrlMatches(r.url, vcsRepo));
-  if (!repo) return new Set();
+  const repoId = await vcsRepoId(vcsRepo);
+  if (!repoId) return new Set();
   const rows = await getDbClient().query<{ key: string }>(
     `SELECT key FROM swarm_config
       WHERE scope = 'repo' AND scopeId = ? AND key IN ('MODEL_OVERRIDE', 'REASONING_EFFORT_OVERRIDE')
         ${includeSecrets ? "" : "AND isSecret = 0"}`,
-    [repo.id],
+    [repoId],
   );
   return new Set(rows.map((row) => row.key));
 }
@@ -310,6 +308,8 @@ export async function taskProfileError(check: {
   model?: string | null;
   modelTier?: string | null;
   agentId?: string | null;
+  /** The task's repo; its scoped credentials count, as on the worker. */
+  vcsRepo?: string | null;
 }): Promise<string | null> {
   const name = check.profile?.trim();
   if (!name) return null;
@@ -321,7 +321,7 @@ export async function taskProfileError(check: {
     return `Unknown model profile "${name}". List profiles with list-model-profiles.`;
   }
   if (!check.agentId) return null;
-  const result = await checkProfileForAgent(check.agentId, name);
+  const result = await checkProfileForAgent(check.agentId, name, { vcsRepo: check.vcsRepo });
   if (!result || result.ok) return null;
   return formatProfileCheckFailures(result);
 }

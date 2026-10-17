@@ -13287,6 +13287,9 @@ export interface paths {
                                     notes?: string;
                                     comms?: components["schemas"]["UserCommsPrefs"];
                                 };
+                                credentialAllowlist?: {
+                                    [key: string]: string[];
+                                };
                             })[];
                         };
                     };
