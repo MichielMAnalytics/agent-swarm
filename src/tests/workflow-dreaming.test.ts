@@ -390,6 +390,11 @@ describe("dreaming template", () => {
       "draft",
     );
     expect(hbDraft({ g: g(), hp: { ...hp, chars: 100 } })).toBe("skip");
+    // Closed-head Tracked Items pins wake the lane on their own; zero drainable pins do not.
+    expect(hbDraft({ g: g(), hp: { ...hp, chars: 100, pinDrain: { drainable: 2 } } })).toBe(
+      "draft",
+    );
+    expect(hbDraft({ g: g(), hp: { ...hp, chars: 100, pinDrain: { drainable: 0 } } })).toBe("skip");
     // hb-plan's lane-off shape has no sizes to compare: the gate must not throw on it.
     expect(
       hbDraft({

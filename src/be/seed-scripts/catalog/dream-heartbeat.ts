@@ -2,11 +2,11 @@ import type { ScriptContext } from "swarm-sdk";
 import { z } from "zod";
 
 // Dreaming heartbeat lane (lane C): Lead HEARTBEAT triage and prune.
-// mode "plan":     parse Lead heartbeatMd, list deterministic + LLM candidates, pins, deferred ops, handshake, survival.
-//                  Live runs store the pre-image at KV preimage:<runId>:<leadId>:heartbeatMd.
+// mode "plan":     parse Lead heartbeatMd, list deterministic + LLM candidates, pins, Tracked Items pin drain candidates,
+//                  deferred ops, handshake, survival. Live runs store the pre-image at KV preimage:<runId>:<leadId>:heartbeatMd.
 // mode "text":     live Lead heartbeatMd + sha (the hb-draft task reads it over REST).
-// mode "check":    store the hb-draft task's `draft` text at KV hb-draft:<runId>, validate it (validator port, pins,
-//                  size, removed coverage), then wait for a quiet window. lead-disk reads the KV draft and checks its sha.
+// mode "check":    store the hb-draft task's `draft` text at KV hb-draft:<runId>, validate it (validator port, pins + pin
+//                  harvest, size, removed coverage), then wait for a quiet window. lead-disk reads the KV draft and checks its sha.
 // mode "quiet":    read-only: is any Lead heartbeat-checklist task live? lead-disk runs it right before the disk copy.
 // mode "apply":    DB write after lead-disk wrote the disk (live runs only); else wouldApply. The draft comes from KV.
 // mode "restore-db": set the DB back to the run's pre-image once Lead has restored the disk copy.
@@ -27,7 +27,7 @@ export const argsSchema = z.object({
   apply: z.unknown().optional(),
   plan: z.unknown().optional(),
   check: z.unknown().optional(),
-  // hb-draft task output: { draft: string, notes?, removed?, compressed?, movedToMemory?, runbookAdds?, draftSha? }.
+  // hb-draft task output: { draft: string, notes?, removed?, compressed?, movedToMemory?, keptPins?, runbookAdds?, draftSha? }.
   draft: z.unknown().optional(),
   // Alias of `draft` (the workflow input name).
   hd: z.unknown().optional(),
@@ -42,6 +42,8 @@ const DEFAULT_DISK_BACKUP_DIR = "/workspace/personal/heartbeat-backups";
 const PROCEDURES_SKILL = "lead-heartbeat-procedures";
 const TARGETS = { firstRunChars: 60000, steadyChars: 50000, trackedItemsChars: 25000, itemChars: 500, standingOrdersChars: 25000 };
 const MAX_MEMORIES = 10;
+// Tracked Items 📌 lines drained into memory per night (on top of MAX_MEMORIES): ~30 pins clear in 3 runs.
+const MAX_PIN_MEMORIES = 12;
 const BUSY = ["unassigned", "offered", "reviewing", "pending", "in_progress", "paused"];
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
 
@@ -141,6 +143,25 @@ const probeOf = (norm: string) => {
 };
 // Every 📌 line in the whole file (validator form), verbatim.
 const pinLines = (text: string) => text.split(/\r?\n/).map(strip).filter((l) => l.startsWith("📌"));
+// Bold title of a 📌 line, past any emoji run after the pin ("📌🔑 **T**" -> "T").
+const pinTitle = (norm: string) => /^\*\*(.+?)\*\*/.exec(norm.replace(/^📌[^\w*`]*/u, ""))?.[1] ?? null;
+// Short reference key for a pin title: the head before " (", " — ", ": " or ". " when that is distinctive, else 60 chars.
+const pinKey = (t: string) => {
+  const head = (t.split(/ \(| — |: |\. /)[0] ?? "").trim();
+  return head.length >= 12 ? head : t.slice(0, 60);
+};
+// A pin whose head says its item is over. Case-sensitive on DEAD/GONE/CLOSED so "a dead job" in a rule does not count.
+const CLOSED_HEAD = /\bitems? [^.;)]{0,40}?\b(?:closed|CLOSED|deleted|retired)\b|\b(?:DEAD|GONE|CLOSED|RETIRED|DELETED)\b|\b(?:deleted|retired|expired)\b|⚰️/;
+// Body of the section that starts at `heading` (a line prefix), up to the next "## " heading.
+const sectionText = (text: string, heading: string) => {
+  const i = text.indexOf(`\n${heading}`);
+  if (i < 0) return "";
+  const rest = text.slice(i + 1);
+  const m = /\n## /.exec(rest);
+  return m ? rest.slice(0, m.index) : rest;
+};
+// Memory a removed[] entry names (drained pins only): a movedToMemory name or an existing memory name/id.
+const memKey = (r: any) => String(r?.memory ?? "").trim();
 
 // MM-DD -> Date in the year that puts it nearest to (and not >180 days after) today.
 function mmdd(m: string, d: string, today: Date): Date {
@@ -200,7 +221,7 @@ const shingles = (s: string, k = 8) => {
 };
 
 // Pure draft check, shared by mode "check" and selftest.
-export function checkDraft(env: { live: string; next: string; removed: any[]; deferred: any[]; mustKeep: string[]; maxChars: number }): string[] {
+export function checkDraft(env: { live: string; next: string; removed: any[]; deferred: any[]; mustKeep: string[]; maxChars: number; pinMemories?: string[]; lockedPins?: string[] }): string[] {
   const reasons: string[] = [];
   const { live, next } = env;
   try {
@@ -213,7 +234,26 @@ export function checkDraft(env: { live: string; next: string; removed: any[]; de
   if (next.length >= live.length) reasons.push(`not net-smaller: ${live.length} -> ${next.length}`);
   const nextPins = new Set(pinLines(next));
   const lostPins = pinLines(live).filter((p) => !nextPins.has(p));
-  if (lostPins.length) reasons.push(`📌 lines changed or dropped: ${lostPins.length} (first: ${(lostPins[0] ?? "").slice(0, 80)})`);
+  // A 📌 line may leave only from Tracked Items, only when the plan did not lock it, and only with a removed[] entry whose
+  // `memory` names a memory that exists (or that apply stores before the DB write). Everything else stays locked.
+  const liveTracked = new Set(trackedLines(live));
+  const known = new Set(env.pinMemories ?? []);
+  const locked = (env.lockedPins ?? []).filter(Boolean);
+  let harvested = 0;
+  const unharvested = lostPins.filter((p) => {
+    if (!liveTracked.has(p) || locked.some((k) => p.includes(k))) return true;
+    const r = env.removed.find((x: any) => {
+      const k = String(x?.title ?? x?.probe ?? "").replace(/^\*\*|\*\*$/g, "");
+      return k && (p.includes(k) || k.includes(p.slice(0, 60)));
+    });
+    if (r && memKey(r) && known.has(memKey(r))) {
+      harvested++;
+      return false;
+    }
+    return true;
+  });
+  if (unharvested.length) reasons.push(`📌 lines changed or dropped: ${unharvested.length} (first: ${(unharvested[0] ?? "").slice(0, 80)}; a Tracked Items pin may leave only unlocked, with removed[].memory naming an existing or harvested memory)`);
+  if (harvested > MAX_PIN_MEMORIES) reasons.push(`too many pins drained: ${harvested} > ${MAX_PIN_MEMORIES}`);
   // Every live tracked item that is gone (no line with its title, and no line it shortens to) needs a removed[] entry.
   const nextTracked = trackedLines(next);
   const removedKeys = env.removed.map((r: any) => String(r?.title ?? r?.probe ?? "")).filter(Boolean);
@@ -366,13 +406,33 @@ export default async function (args: unknown, ctx: ScriptContext) {
         { name: "check- Rule #N label in Standing Orders dropped -> refused", got: checkDraft({ live: live.replace("- do things", "- do things per Rule #7"), next: pureDeletion, removed: removed10, deferred: [], mustKeep: [], maxChars: 60000 }), wantRefused: true },
         { name: "check- 📌 line dropped -> refused", got: c(pureDeletion.replace("📌 keep me forever\n", ""), removed10), wantRefused: true },
       ].map((x) => ({ name: x.name, pass: (x.got.length > 0) === x.wantRefused, reasons: x.got.slice(0, 2) }));
+      // Pin drain controls: a Tracked Items pin leaves only unlocked and with removed[].memory naming a known memory.
+      const pinLive = live.replace("## Standing Orders\n- do things", "## Standing Orders\n- do things\n- 📌 standing pin");
+      const pinGone = pureDeletion.replace("📌 keep me forever\n", "");
+      const pinKept = pinGone.replace("- do things", "- do things\n- 📌 standing pin");
+      const pinRm = (memory?: string) => [...removed10, { probe: "📌 keep me forever", reason: "closed", movedTo: "memory", ...(memory ? { memory } : {}) }];
+      const pc = (next: string, removed: any[], extra: { pinMemories?: string[]; lockedPins?: string[] } = {}) =>
+        checkDraft({ live: pinLive, next, removed, deferred: [], mustKeep: [], maxChars: 60000, ...extra });
+      const pinChecks = [
+        { name: "pin+ tracked pin removed with a known memory -> passes", got: pc(pinKept, pinRm("pin-mem"), { pinMemories: ["pin-mem"] }), wantRefused: false },
+        { name: "pin- tracked pin removed, memory unknown -> refused", got: pc(pinKept, pinRm("pin-mem"), { pinMemories: [] }), wantRefused: true },
+        { name: "pin- tracked pin removed, no removed[].memory -> refused", got: pc(pinKept, pinRm(), { pinMemories: ["pin-mem"] }), wantRefused: true },
+        { name: "pin- tracked pin locked by plan -> refused", got: pc(pinKept, pinRm("pin-mem"), { pinMemories: ["pin-mem"], lockedPins: ["📌 keep me"] }), wantRefused: true },
+        { name: "pin- 📌 outside Tracked Items dropped -> refused", got: pc(pureDeletion, [...removed10, { probe: "📌 standing pin", reason: "closed", memory: "pin-mem" }], { pinMemories: ["pin-mem"] }), wantRefused: true },
+        { name: "pin+ drained draft passes the server validator", got: passes(pinLive, pinGone) ? [] : ["validator"], wantRefused: false },
+      ].map((x) => ({ name: x.name, pass: (x.got.length > 0) === x.wantRefused, reasons: x.got.slice(0, 2) }));
+      const pt = [
+        { name: "pinTitle skips the emoji run", pass: pinTitle("📌🔑 **BLG GONE: cancelled 10-03** rest") === "BLG GONE: cancelled 10-03" },
+        { name: "closed head+ item N closed", pass: CLOSED_HEAD.test("PRE-PUSH DURABLES (item 255 closed on #1317)") },
+        { name: "closed head- lowercase dead in a rule", pass: !CLOSED_HEAD.test("it cannot distinguish a dead job from a correctly-infrequent one") },
+      ];
       const hs = [
         { name: "handshake- systemDefault skill refused", pass: handshake({ systemDefault: 1, content: "probe A" }, ["probe A"]).status === "refused: system-default" },
         { name: "handshake+ probe present -> ready", pass: handshake({ systemDefault: 0, content: "x probe A y" }, ["probe A"]).ready.length === 1 },
         { name: "handshake- probe absent -> waiting", pass: handshake({ systemDefault: 0, content: "x y" }, ["probe A"]).waiting.length === 1 },
       ];
-      const ok = parity.every((r) => r.want === r.got) && checks.every((x) => x.pass) && hs.every((x) => x.pass);
-      return { ok, mode: "selftest", parity: { cases: parity.length, mismatches: parity.filter((r) => r.want !== r.got) }, checks, handshake: hs };
+      const ok = parity.every((r) => r.want === r.got) && checks.every((x) => x.pass) && pinChecks.every((x) => x.pass) && pt.every((x) => x.pass) && hs.every((x) => x.pass);
+      return { ok, mode: "selftest", parity: { cases: parity.length, mismatches: parity.filter((r) => r.want !== r.got) }, checks, pinChecks, pinParse: pt, handshake: hs };
     }
 
     // ---------------- plan ----------------
@@ -418,6 +478,45 @@ export default async function (args: unknown, ctx: ScriptContext) {
         seen.set(it.norm, it.line);
       }
       const closedUndated = items.filter((i) => !i.pinned && i.closed && !i.closedAt).map((i) => ({ line: i.line, probe: i.probe, reason: "⚰️/CLOSED without a date" }));
+      // Tracked Items 📌 lines are drain candidates. Locked when Standing Orders, Reference, a named script or a workflow
+      // definition references the bold title (its key). The draft keeps a candidate that holds an open next action.
+      const refText: Array<[string, string]> = [
+        ["standing-orders", sectionText(live, "## Standing Orders")],
+        ["reference", sectionText(live, "## Reference")],
+      ];
+      const pinCandidates: any[] = [];
+      for (const it of items.filter((i) => i.pinned)) {
+        const t = pinTitle(it.norm);
+        const key = t ? pinKey(t) : it.norm.replace(/^📌[^\w*`]*/u, "").slice(0, 60);
+        const refs = refText.filter(([, s]) => s.includes(key)).map(([k]) => k);
+        const sr = await q(`SELECT name, scope FROM scripts WHERE isScratch = 0 AND name NOT GLOB 'dream-heartbeat*' AND instr(source, ?) > 0 LIMIT 3`, [key]);
+        refs.push(...sr.map((r) => `script:${r.name}/${r.scope}`));
+        const wr = await q(`SELECT id, name FROM workflows WHERE instr(definition, ?) > 0 LIMIT 3`, [key]);
+        refs.push(...wr.map((r) => `workflow:${r.name}/${String(r.id).slice(0, 8)}`));
+        pinCandidates.push({ line: it.line, probe: it.norm.slice(0, 80), title: t, key, chars: it.chars, closedHead: !!t && CLOSED_HEAD.test(t), refs, locked: refs.length > 0 });
+      }
+      // Pins the last applied draft kept (open next action) sit out for 7 days, so they do not wake the lane every night.
+      const stPins = await kvGet("hb-state:lead");
+      const kept: string[] = stPins?.at && now.getTime() - Date.parse(stPins.at) < 7 * dayMs && Array.isArray(stPins.keptPins) ? stPins.keptPins.map(String).filter(Boolean) : [];
+      for (const c of pinCandidates) c.kept = kept.some((k) => c.probe.startsWith(k.slice(0, 60)) || k.startsWith(c.probe.slice(0, 60)));
+      // Closed heads first, then the largest; the draft drains at most MAX_PIN_MEMORIES a night.
+      pinCandidates.sort((x, y) => Number(y.closedHead) - Number(x.closedHead) || y.chars - x.chars);
+      // memory-search each unlocked candidate so the draft updates an existing memory instead of creating a twin.
+      const searchable = pinCandidates.filter((c) => !c.locked).slice(0, MAX_PIN_MEMORIES * 2);
+      for (let i = 0; i < searchable.length; i += 6) {
+        await Promise.all(
+          searchable.slice(i, i + 6).map(async (c) => {
+            try {
+              const r: any = await ctx.swarm.memory_search({ query: String(c.title ?? c.key).slice(0, 200), intent: "dreaming heartbeat lane: find an existing memory before draining a heartbeat pin", scope: "swarm", limit: 3 });
+              const hits: any[] = r?.data?.results ?? r?.results ?? r?.data?.memories ?? r?.memories ?? [];
+              c.memoryHits = hits.slice(0, 3).map((h: any) => ({ id: h.id, name: h.name, similarity: h.similarity ?? h.score ?? null }));
+            } catch (e: any) {
+              c.memoryHits = [];
+              errors.push(`memory_search pin ${c.line}: ${String(e?.message ?? e).slice(0, 120)}`);
+            }
+          }),
+        );
+      }
       // LLM candidates.
       const over500 = items.filter((i) => i.chars > TARGETS.itemChars).map((i) => ({ line: i.line, probe: i.probe, chars: i.chars }));
       const soIdx = hb.sections.findIndex((s) => s.heading.startsWith("## Standing Orders"));
@@ -502,7 +601,16 @@ export default async function (args: unknown, ctx: ScriptContext) {
         },
         pinLines: pinCount,
         standingOrders: { chars: soTotal, target: TARGETS.standingOrdersChars, sections: so.map((s) => ({ heading: s.heading, chars: s.chars })) },
-        candidates: { remove, review, closedUndated, over500, sectionsOver, dupes: dupes.slice(0, 60) },
+        candidates: { remove, review, closedUndated, over500, sectionsOver, dupes: dupes.slice(0, 60), pins: pinCandidates },
+        pinDrain: {
+          cap: MAX_PIN_MEMORIES,
+          candidates: pinCandidates.length,
+          unlocked: pinCandidates.filter((c) => !c.locked).length,
+          closedHead: pinCandidates.filter((c) => c.closedHead).length,
+          // hb-draft-gate wakes the lane on its own only for closed-head pins (the pile-up); other unlocked pins drain when the lane drafts anyway.
+          drainable: pinCandidates.filter((c) => !c.locked && !c.kept && c.closedHead).length,
+        },
+        lockedPins: pinCandidates.filter((c) => c.locked).map((c) => c.probe),
         deferredToHeartbeat: deferred,
         pins,
         mustRestore,
@@ -553,6 +661,11 @@ export default async function (args: unknown, ctx: ScriptContext) {
         else reasons.push(`KV draft re-read mismatch at ${key}: ${back.detail || "sha differs"}`);
       }
       const removed: any[] = Array.isArray(draft.removed) ? draft.removed : [];
+      // Memories a removed pin may name: one that exists now (name or id), or one this draft harvests (apply stores it first).
+      const harvest = (Array.isArray(draft.movedToMemory) ? draft.movedToMemory : []).filter((m: any) => /^[a-z0-9-]{3,90}$/.test(String(m?.name ?? "")) && String(m?.content ?? "").trim());
+      const pinMemories: string[] = harvest.map((m: any) => String(m.name));
+      const named = [...new Set(removed.map(memKey).filter((k) => k && !pinMemories.includes(k)))];
+      for (const k of named) if ((await q(`SELECT 1 FROM agent_memory WHERE name = ? OR id = ? LIMIT 1`, [k, k])).length) pinMemories.push(k);
       if (next) {
         reasons.push(
           ...checkDraft({
@@ -562,6 +675,8 @@ export default async function (args: unknown, ctx: ScriptContext) {
             deferred: Array.isArray(plan.deferredToHeartbeat) ? plan.deferredToHeartbeat : [],
             mustKeep: Array.isArray(plan.pins) ? plan.pins : [],
             maxChars: Number(plan.targets?.maxChars ?? TARGETS.firstRunChars),
+            pinMemories,
+            lockedPins: Array.isArray(plan.lockedPins) ? plan.lockedPins : [],
           }),
         );
       }
@@ -601,6 +716,8 @@ export default async function (args: unknown, ctx: ScriptContext) {
           removed: removed.length,
           compressed: Array.isArray(draft.compressed) ? draft.compressed.length : 0,
           movedToMemory: Array.isArray(draft.movedToMemory) ? draft.movedToMemory.length : 0,
+          pinsDrained: pinLines(live).length - pinLines(next).length,
+          pinMemories: [...new Set(removed.map(memKey).filter(Boolean))].length,
           runbookAdds: Array.isArray(draft.runbookAdds) ? draft.runbookAdds.length : 0,
         },
         errors,
@@ -631,18 +748,75 @@ export default async function (args: unknown, ctx: ScriptContext) {
       if (disk.mode !== "live" || !diskField || diskField.diskAfterSha !== draftSha) {
         return { ...base, ok: false, status: "refused: disk-not-written", detail: diskField?.stopReason ?? `disk after ${String(diskField?.diskAfterSha ?? "none").slice(0, 12)} != draft ${draftSha.slice(0, 12)}`, errors };
       }
-      const live = await liveHb();
-      const dbSha = await sha(live);
       const preKey = preimageKey(runId, LEAD);
       // lead-disk copies Lead's disk file here before it writes the draft.
       const diskBackup = `${DEFAULT_DISK_BACKUP_DIR}/${runId}.md`;
-      const restoreTask = async (why: string) =>
+      const restoreTask = async (why: string, expectSha: string) =>
         ctx.swarm.task_send({
           agentId: LEAD,
           routingReason: "human_pinned",
           routingNote: `dreaming heartbeat lane: restore HEARTBEAT.md after ${why}`,
-          task: `dreaming heartbeat lane (run ${runId}): ${why}, so the prune was not applied. Restore your disk copy with ONE bash call and no Write/Edit tool: \`cp ${diskBackup} /workspace/HEARTBEAT.md && sha256sum /workspace/HEARTBEAT.md\`. Expected sha ${dbSha}. Reply with the sha.`,
+          task: `dreaming heartbeat lane (run ${runId}): ${why}, so the prune was not applied. Restore your disk copy with ONE bash call and no Write/Edit tool: \`cp ${diskBackup} /workspace/HEARTBEAT.md && sha256sum /workspace/HEARTBEAT.md\`. Expected sha ${expectSha}. Reply with the sha.`,
         });
+      // Memories land BEFORE the DB write, so a drained pin is never only in a pre-image. A pin memory whose name already
+      // exists (or an entry with updateOf) is appended to that memory instead of creating a twin.
+      const pinNames = new Set(removed.map(memKey).filter(Boolean));
+      const memories: any[] = [];
+      let general = 0;
+      let pinned = 0;
+      for (const m of Array.isArray(draft.movedToMemory) ? draft.movedToMemory : []) {
+        const name = String(m?.name ?? "");
+        const content = String(m?.content ?? "");
+        const target = String(m?.updateOf ?? "").trim();
+        const isPin = pinNames.has(name) || (!!target && pinNames.has(target));
+        if (isPin ? ++pinned > MAX_PIN_MEMORIES : ++general > MAX_MEMORIES) {
+          memories.push({ name, status: "refused: cap" });
+          continue;
+        }
+        if (!/^[a-z0-9-]{3,90}$/.test(name) || !content.trim()) {
+          memories.push({ name, status: "refused" });
+          continue;
+        }
+        const ex = await q(`SELECT id, name, totalChunks, content FROM agent_memory WHERE id = ? OR (name = ? AND chunkIndex = 0) ORDER BY createdAt DESC LIMIT 1`, [target || name, target || name]);
+        const hit = ex[0];
+        if (hit && (isPin || target)) {
+          if (String(hit.content ?? "").includes(content.trim().slice(0, 200))) {
+            memories.push({ name, id: hit.id, status: "exists: already holds it" });
+            continue;
+          }
+          if (Number(hit.totalChunks ?? 1) === 1) {
+            try {
+              const er: any = await ctx.swarm.memory_edit({ memoryId: String(hit.id), mode: "replace", content: `${String(hit.content).trimEnd()}\n\n${content.trim()}`, intent: `dreaming heartbeat lane ${runId}: drained heartbeat pin` });
+              if (er?.success === false || er?.isError || er?.error) throw new Error(String(er?.message ?? er?.error ?? "memory_edit refused"));
+              memories.push({ name, id: hit.id, status: "updated" });
+              continue;
+            } catch (e: any) {
+              errors.push(`memory_edit ${name}: ${String(e?.message ?? e).slice(0, 160)}`);
+            }
+          }
+          // Multi-chunk rows cannot be edited (and an edit can be refused): keep the text in a sibling that points back.
+          const taken = (await q(`SELECT 1 FROM agent_memory WHERE name = ? LIMIT 1`, [name])).length > 0;
+          const sibling = taken ? `${name.slice(0, 80)}-${date.slice(5)}` : name;
+          await ctx.swarm.memory_store({ name: sibling, content: `Addendum to memory "${String(hit.name).slice(0, 120)}" (${hit.id}).\n\n${content}`, scope: "swarm", tags: ["dreaming", runId, "heartbeat", "heartbeat-pin"], intent: `dreaming heartbeat lane ${runId}` } as any);
+          memories.push({ name, id: hit.id, status: "stored-sibling", sibling });
+          continue;
+        }
+        if (hit) {
+          memories.push({ name, status: "exists" });
+          continue;
+        }
+        await ctx.swarm.memory_store({ name, content, scope: "swarm", tags: ["dreaming", runId, "heartbeat", ...(isPin ? ["heartbeat-pin"] : [])], intent: `dreaming heartbeat lane ${runId}` } as any);
+        memories.push({ name, status: "stored" });
+      }
+      // A drained pin whose memory is still missing: the disk already holds the draft, so Lead puts the backup back.
+      const missingPin: string[] = [];
+      for (const k of pinNames) if (!(await q(`SELECT 1 FROM agent_memory WHERE name = ? OR id = ? LIMIT 1`, [k, k])).length) missingPin.push(k);
+      if (missingPin.length) {
+        await restoreTask(`${missingPin.length} drained pin memory(ies) did not store (${missingPin.slice(0, 3).join(", ")})`, String(plan.planSha ?? ""));
+        return { ...base, ok: false, status: "refused: pin-memory-missing", missingPin, memories, restoreTask: "sent to Lead", errors };
+      }
+      const live = await liveHb();
+      const dbSha = await sha(live);
       let status = "";
       if (dbSha === plan.planSha) {
         // Pre-image: plan stored it; re-store it from the live text when missing or stale (live = plan here).
@@ -652,7 +826,7 @@ export default async function (args: unknown, ctx: ScriptContext) {
           pre = await kvGet(preKey);
         }
         if (pre?.sha !== dbSha || (await sha(String(pre?.content ?? ""))) !== dbSha) {
-          await restoreTask("the heartbeat pre-image could not be stored");
+          await restoreTask("the heartbeat pre-image could not be stored", dbSha);
           return { ...base, ok: false, status: "refused: no pre-image", detail: `${preKey} missing or sha differs`, restoreTask: "sent to Lead", errors };
         }
         let msg = "";
@@ -664,7 +838,7 @@ export default async function (args: unknown, ctx: ScriptContext) {
         }
         if (msg) {
           // The disk already holds the draft; put it back so disk and DB both hold the old text.
-          await restoreTask(`the DB rejected the heartbeat prune (${msg.slice(0, 200)})`);
+          await restoreTask(`the DB rejected the heartbeat prune (${msg.slice(0, 200)})`, dbSha);
           return { ...base, ok: false, status: "rejected", detail: msg.slice(0, 300), restoreTask: "sent to Lead", errors };
         }
         const reSha = await sha(await liveHb());
@@ -676,12 +850,13 @@ export default async function (args: unknown, ctx: ScriptContext) {
         const back = removed.map((r: any) => String(r?.probe ?? r?.title ?? "")).filter((pr) => pr && live.includes(pr));
         if (!back.length && trackedLines(next).every((l) => live.includes(l))) status = "applied-via-self-edit";
         else {
-          await restoreTask("your heartbeatMd changed in the DB while the prune ran");
+          await restoreTask("your heartbeatMd changed in the DB while the prune ran", dbSha);
           return { ...base, ok: false, status: "refused: db-drift", detail: `db ${dbSha.slice(0, 12)} is neither plan nor draft; ${back.length} removed probe(s) present`, restoreTask: "sent to Lead", errors };
         }
       }
       const removedProbes = removed.map((r: any) => String(r?.probe ?? r?.title ?? "").slice(0, 80)).filter(Boolean);
-      const state = { runId, at: now.toISOString(), beforeSha: plan.planSha, afterSha: draftSha, afterChars: next.length, afterText: next, preimageKey: preKey, diskBackup, removedProbes, status };
+      const keptPins = (Array.isArray(draft.keptPins) ? draft.keptPins : []).map((k: any) => String(k).slice(0, 80)).filter(Boolean).slice(0, 40);
+      const state = { runId, at: now.toISOString(), beforeSha: plan.planSha, afterSha: draftSha, afterChars: next.length, afterText: next, preimageKey: preKey, diskBackup, removedProbes, keptPins, status };
       await kvSet("hb-state:lead", state);
       await kvSet(`hb-state:${runId}`, { ...state, afterText: undefined });
       await kvSet(`cuts:${runId}:C`, {
@@ -700,16 +875,6 @@ export default async function (args: unknown, ctx: ScriptContext) {
       });
       const adds: any[] = Array.isArray(draft.runbookAdds) ? draft.runbookAdds : [];
       if (adds.length) await kvSet("hb-runbook-adds:latest", { runId, at: now.toISOString(), skill: plan.runbookSkill ?? PROCEDURES_SKILL, adds });
-      const memories: any[] = [];
-      for (const m of (Array.isArray(draft.movedToMemory) ? draft.movedToMemory : []).slice(0, MAX_MEMORIES)) {
-        const name = String(m?.name ?? "");
-        const content = String(m?.content ?? "");
-        if (!/^[a-z0-9-]{3,90}$/.test(name) || !content.trim()) { memories.push({ name, status: "refused" }); continue; }
-        const c = await q(`SELECT COUNT(*) n FROM agent_memory WHERE name = ?`, [name]);
-        if (Number(c[0]?.n) > 0) { memories.push({ name, status: "exists" }); continue; }
-        await ctx.swarm.memory_store({ name, content, scope: "swarm", tags: ["dreaming", runId, "heartbeat"], intent: `dreaming heartbeat lane ${runId}` } as any);
-        memories.push({ name, status: "stored" });
-      }
       return { ...base, status, stateKey: "hb-state:lead", cutsKey: `cuts:${runId}:C`, preimageKey: preKey, beforeSha: plan.planSha, afterSha: draftSha, memories, runbookAdds: adds.length, errors };
     }
 

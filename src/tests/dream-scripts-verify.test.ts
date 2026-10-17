@@ -12,7 +12,7 @@ import { unlink } from "node:fs/promises";
 import type { Subprocess } from "bun";
 import { closeDb, initDb } from "../be/db";
 import { typecheckScript } from "../be/scripts/typecheck";
-import heartbeatDefault from "../be/seed-scripts/catalog/dream-heartbeat";
+import heartbeatDefault, { checkDraft } from "../be/seed-scripts/catalog/dream-heartbeat";
 import verifyDefault, {
   isGreenDryRun,
   isProfilePreimageKey,
@@ -381,6 +381,175 @@ describe("dream-heartbeat", () => {
     const cuts = await kvGet(`cuts:${runId}:C`);
     expect(cuts.cuts[0].backupRef).toBe(plan.preimageKey);
   }, 120_000);
+});
+
+describe("dream-heartbeat closed-pin drain", () => {
+  const CLOSED_PIN = "📌 **Old migration GONE: retired 10-01** keep the rollback notes for audits";
+  const OPEN_PIN = "📌 Keep the release checklist current";
+  const PIN_HB = [
+    "# Lead heartbeat",
+    "",
+    "## Standing Orders",
+    "- Check the task queue every heartbeat.",
+    "- 📌 Never skip the morning sweep",
+    "",
+    "## Tracked Items",
+    `- ${CLOSED_PIN}`,
+    `- ${OPEN_PIN}`,
+    "- **Docs refresh:** refresh the operator docs for the new flags. DELETE 12-30",
+    "",
+  ].join("\n");
+  const DRAINED_HB = PIN_HB.replace(`- ${CLOSED_PIN}\n`, "");
+  const pinRemoved = (memory?: string) => [
+    {
+      probe: CLOSED_PIN.slice(0, 80),
+      reason: "closed",
+      movedTo: "memory",
+      ...(memory ? { memory } : {}),
+    },
+  ];
+  const base = (extra: { pinMemories?: string[]; lockedPins?: string[] } = {}) => ({
+    live: PIN_HB,
+    deferred: [],
+    mustKeep: [],
+    maxChars: 60000,
+    ...extra,
+  });
+
+  test("selftest is ok, including the pin drain controls", async () => {
+    const r = await run("dream-heartbeat", { mode: "selftest" });
+    expect(r.pinChecks?.length).toBeGreaterThan(0);
+    expect(r.pinChecks.filter((x: any) => !x.pass)).toEqual([]);
+    expect(r.pinParse.every((x: any) => x.pass)).toBe(true);
+    expect(r.ok).toBe(true);
+  }, 60_000);
+
+  test("checkDraft lets a Tracked Items pin leave only unlocked, with a known memory", () => {
+    const known = { pinMemories: ["hb-pin-old-migration"] };
+    expect(
+      checkDraft({
+        ...base(known),
+        next: DRAINED_HB,
+        removed: pinRemoved("hb-pin-old-migration"),
+      }),
+    ).toEqual([]);
+    // Unknown memory, no memory at all, or a plan lock: refused.
+    expect(
+      checkDraft({ ...base({ pinMemories: [] }), next: DRAINED_HB, removed: pinRemoved("x-y-z") }),
+    ).not.toEqual([]);
+    expect(checkDraft({ ...base(known), next: DRAINED_HB, removed: pinRemoved() })).not.toEqual([]);
+    expect(
+      checkDraft({
+        ...base({ ...known, lockedPins: [CLOSED_PIN.slice(0, 40)] }),
+        next: DRAINED_HB,
+        removed: pinRemoved("hb-pin-old-migration"),
+      }),
+    ).not.toEqual([]);
+    // A 📌 outside Tracked Items stays locked even with a known memory.
+    const soDropped = PIN_HB.replace("- 📌 Never skip the morning sweep\n", "");
+    const reasons = checkDraft({
+      ...base({ pinMemories: ["hb-pin-sweep"] }),
+      next: soDropped,
+      removed: [
+        { probe: "📌 Never skip the morning sweep", reason: "closed", memory: "hb-pin-sweep" },
+      ],
+    });
+    expect(reasons.some((r) => r.startsWith("📌 lines changed or dropped"))).toBe(true);
+  });
+
+  test("plan lists drain candidates; apply stores the pin memory before the DB write", async () => {
+    const before = await leadHeartbeat();
+    await setLeadHeartbeat(PIN_HB);
+    try {
+      const runId = "hb-pin-live";
+      const plan = await run("dream-heartbeat", { mode: "plan", runId, leadId, dryRun: false });
+      expect(plan.pinDrain).toMatchObject({ cap: 12, candidates: 2, unlocked: 2, closedHead: 1 });
+      expect(plan.pinDrain.drainable).toBe(1);
+      expect(plan.lockedPins).toEqual([]);
+      // Closed heads sort first.
+      expect(plan.candidates.pins[0].probe).toBe(CLOSED_PIN.slice(0, 80));
+      expect(plan.candidates.pins[0].closedHead).toBe(true);
+
+      const memName = `hb-pin-old-migration-${Date.now()}`;
+      const hd = {
+        draft: DRAINED_HB,
+        removed: pinRemoved(memName),
+        movedToMemory: [
+          { name: memName, content: `Drained from Lead HEARTBEAT Tracked Items.\n${CLOSED_PIN}` },
+        ],
+        keptPins: [OPEN_PIN],
+      };
+      // Without the harvested memory the drained pin is refused.
+      const refusedCheck = await run("dream-heartbeat", {
+        mode: "check",
+        runId: "hb-pin-dry",
+        leadId,
+        dryRun: true,
+        plan,
+        hd: { ...hd, movedToMemory: [] },
+      });
+      expect(refusedCheck.ready).toBe(false);
+      expect(refusedCheck.reasons.join(" ")).toContain("📌 lines changed or dropped");
+
+      const check = await run("dream-heartbeat", {
+        mode: "check",
+        runId,
+        leadId,
+        dryRun: false,
+        waitMs: 0,
+        plan,
+        hd,
+      });
+      expect(check.reasons).toEqual([]);
+      expect(check.stats).toMatchObject({ pinsDrained: 1, pinMemories: 1 });
+      const disk = {
+        mode: "live",
+        fields: [
+          {
+            field: "heartbeatMd",
+            diskBeforeSha: plan.planSha,
+            draftShaOk: true,
+            diskAfterSha: check.draftSha,
+            stopReason: null,
+          },
+        ],
+      };
+      const applyArgs = { mode: "apply", runId, leadId, dryRun: false, plan, check, disk };
+
+      // A removed[] entry naming a memory that neither exists nor gets stored: refused, DB untouched.
+      const missing = await run("dream-heartbeat", {
+        ...applyArgs,
+        draft: { removed: pinRemoved("hb-pin-never-stored"), movedToMemory: [] },
+      });
+      expect(missing.status).toBe("refused: pin-memory-missing");
+      expect(missing.missingPin).toEqual(["hb-pin-never-stored"]);
+      expect(await leadHeartbeat()).toBe(PIN_HB);
+
+      const applied = await run("dream-heartbeat", { ...applyArgs, draft: hd });
+      expect(applied.errors).toEqual([]);
+      expect(applied.status).toBe("applied");
+      expect(applied.memories).toEqual([{ name: memName, status: "stored" }]);
+      expect(await leadHeartbeat()).toBe(DRAINED_HB);
+      const db = new Database(TEST_DB_PATH, { readonly: true });
+      try {
+        const row = db
+          .query("SELECT content, tags FROM agent_memory WHERE name = ? LIMIT 1")
+          .get(memName) as any;
+        expect(String(row?.content ?? "")).toContain(CLOSED_PIN);
+        expect(String(row?.tags ?? "")).toContain("heartbeat-pin");
+      } finally {
+        db.close();
+      }
+      expect((await kvGet("hb-state:lead")).keptPins).toEqual([OPEN_PIN]);
+
+      // The kept pin sits out: it no longer counts, and the drained pin is gone.
+      const next = await run("dream-heartbeat", { mode: "plan", runId: "hb-pin-next", leadId });
+      expect(next.pinDrain).toMatchObject({ candidates: 1, drainable: 0 });
+      expect(next.candidates.pins[0].kept).toBe(true);
+    } finally {
+      await setLeadHeartbeat(before);
+    }
+  }, 180_000);
 });
 
 describe("dream-verify green dry run", () => {
