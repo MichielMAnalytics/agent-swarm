@@ -773,16 +773,52 @@ export default async function (args: unknown, ctx: ScriptContext) {
         if (why || !id) throw new Error(why || "memory_store returned no id");
         return id;
       };
-      // The whole document a row belongs to (chunks share key, scope and owner), and whether any chunk expires.
+      // A fact is one harvested line, compared without whitespace or punctuation: the chunker trims, drops separators,
+      // and prefixes a chunk with its headings and the tail of the chunk before it.
+      const flat = (s: string) => s.replace(/[^\p{L}\p{N}]+/gu, "");
+      const factsOf = (text: string) => [...new Set(text.split("\n").map(flat).filter(Boolean))];
+      // The facts of `text` that a document's chunks lack. A fact may straddle two consecutive chunks.
+      const lacking = (chunks: string[], text: string) => {
+        const parts = chunks.map(flat);
+        return factsOf(text).filter((f) => {
+          if (parts.some((p) => p.includes(f))) return false;
+          for (let i = 1; i < parts.length; i++) {
+            const head = parts[i - 1] ?? "";
+            const tail = parts[i] ?? "";
+            for (let n = 1; n < f.length; n++) if (head.endsWith(f.slice(0, n)) && tail.includes(f.slice(n))) return false;
+          }
+          return true;
+        });
+      };
+      // The whole document a row belongs to, whether any chunk expires, and whether every chunk was found. Chunks of an
+      // explicit key share it. An auto key (scope/source/id) differs per chunk, so its siblings are the rows of the same
+      // store: same name, scope, owner, source and totalChunks, one per chunkIndex, created nearest to this row.
       const docOf = async (id: string) => {
-        const row = (await q(`SELECT id, key, scope, agentId, content, expiresAt FROM agent_memory WHERE id = ? LIMIT 1`, [id]))[0];
+        const row = (await q(`SELECT id, key, name, scope, source, agentId, totalChunks, content, expiresAt, createdAt FROM agent_memory WHERE id = ? LIMIT 1`, [id]))[0];
         if (!row) return null;
-        const parts = row.key ? await q(`SELECT content, expiresAt FROM agent_memory WHERE key = ? AND scope = ? AND agentId IS ? ORDER BY chunkIndex`, [row.key, row.scope, row.agentId]) : [row];
-        return { id: String(row.id), text: parts.map((p: any) => String(p.content ?? "")).join("\n"), expiring: parts.some((p: any) => p.expiresAt != null) };
+        const total = Math.max(1, Number(row.totalChunks ?? 1));
+        let parts: any[] = [row];
+        if (row.key && row.key !== `${row.scope}/${row.source}/${row.id}`) {
+          parts = await q(`SELECT content, expiresAt FROM agent_memory WHERE key = ? AND scope = ? AND agentId IS ? ORDER BY chunkIndex`, [row.key, row.scope, row.agentId]);
+        } else if (total > 1) {
+          const at = Date.parse(String(row.createdAt));
+          const gap = (r: any) => Math.abs(Date.parse(String(r.createdAt)) - at);
+          const rows = await q(
+            `SELECT chunkIndex, content, expiresAt, createdAt FROM agent_memory WHERE name = ? AND scope = ? AND agentId IS ? AND source = ? AND totalChunks = ? AND (key IS NULL OR key = scope || '/' || source || '/' || id)`,
+            [row.name, row.scope, row.agentId, row.source, total],
+          );
+          parts = [];
+          for (let i = 0; i < total; i++) {
+            const near = rows.filter((r: any) => Number(r.chunkIndex) === i && gap(r) <= 60000).sort((x: any, y: any) => gap(x) - gap(y))[0];
+            if (near) parts.push(near);
+          }
+        }
+        const chunks = parts.map((p: any) => String(p.content ?? ""));
+        return { id: String(row.id), chunks, text: chunks.join("\n"), expiring: parts.some((p: any) => p.expiresAt != null), complete: parts.length === total };
       };
       const pinTags = ["dreaming", runId, "heartbeat", "heartbeat-pin"];
-      // Pin key (entry name and its updateOf) -> the row that now holds the text, and the text that must be in it.
-      const held = new Map<string, { id: string; snippet: string }>();
+      // Pin key (entry name and its updateOf) -> the row that now holds the text, and the text whose facts must be in it.
+      const held = new Map<string, { id: string; text: string }>();
       // Pin keys whose entry failed to write: an older row under the same name does not hold this run's text.
       const failed = new Set<string>();
       const memories: any[] = [];
@@ -801,16 +837,17 @@ export default async function (args: unknown, ctx: ScriptContext) {
           memories.push({ name, status: "refused" });
           continue;
         }
-        const snippet = content.trim().slice(0, 200);
         const keep = (id: string, status: string, extra: Record<string, unknown> = {}) => {
           memories.push({ name, id, status, ...extra });
-          if (isPin) for (const k of [name, target]) if (k) held.set(k, { id, snippet });
+          if (isPin) for (const k of [name, target]) if (k) held.set(k, { id, text: content });
         };
         try {
           const ex = await q(`SELECT id, name, totalChunks, content FROM agent_memory WHERE id = ? OR (name = ? AND chunkIndex = 0) ORDER BY createdAt DESC LIMIT 1`, [target || name, target || name]);
           const hit = ex[0];
           if (hit && (isPin || target)) {
-            if (String(hit.content ?? "").includes(snippet)) {
+            // Only a document that already holds every harvested fact counts; a shared opening is not enough.
+            const doc = await docOf(String(hit.id));
+            if (doc && !lacking(doc.chunks, content).length) {
               keep(String(hit.id), "exists: already holds it");
               continue;
             }
@@ -843,15 +880,16 @@ export default async function (args: unknown, ctx: ScriptContext) {
           if (isPin) for (const k of [name, target]) if (k) failed.add(k);
         }
       }
-      // Re-read every drained pin's memory before the prune: it must exist, hold the text this run wrote, and not expire.
-      // A reused hit that expires (task_completion, session_summary) gets a durable manual copy, or its facts vanish with the line.
+      // Re-read every drained pin's memory before the prune: it must exist, hold every fact this run harvested (or, when the
+      // pin only points at it, re-read whole), and not expire. A reused document that expires (task_completion,
+      // session_summary) gets a durable manual copy of all its chunks, or its facts vanish with the line.
       const missingPin: string[] = [];
       const durable = new Map<string, string>();
       for (const k of pinNames) {
         const h = held.get(k);
         const id = h?.id ?? String((await q(`SELECT id FROM agent_memory WHERE id = ? OR (name = ? AND chunkIndex = 0) ORDER BY createdAt DESC LIMIT 1`, [k, k]))[0]?.id ?? "");
         const doc = id && (h || !failed.has(k)) ? await docOf(id) : null;
-        if (!doc || (h && !doc.text.includes(h.snippet))) {
+        if (!doc || (h ? lacking(doc.chunks, h.text).length > 0 : !doc.complete)) {
           missingPin.push(k);
           continue;
         }
@@ -859,7 +897,7 @@ export default async function (args: unknown, ctx: ScriptContext) {
         try {
           const cid = await storeMemory(`${k.slice(0, 80)}-durable`, `Durable copy of memory ${doc.id}, which expires; kept because a drained heartbeat pin points at it.\n\n${doc.text}`, pinTags);
           const copy = await docOf(cid);
-          if (!copy || copy.expiring || !copy.text.includes(h?.snippet ?? doc.text.slice(0, 200))) throw new Error(`durable copy ${cid} did not re-read`);
+          if (!copy || copy.expiring || !copy.complete || lacking(copy.chunks, `${doc.text}\n${h?.text ?? ""}`).length) throw new Error(`durable copy ${cid} did not re-read`);
           durable.set(doc.id, cid);
           memories.push({ name: k, id: cid, status: "stored-durable-copy", from: doc.id });
         } catch (e: any) {

@@ -719,6 +719,115 @@ describe("dream-heartbeat closed-pin drain", () => {
       await setLeadHeartbeat(before);
     }
   }, 180_000);
+
+  test("a memory sharing only the first 200 characters is not proof: the tail lands before the pin leaves", async () => {
+    const before = await leadHeartbeat();
+    await setLeadHeartbeat(PIN_HB);
+    try {
+      const name = `hb-pin-prefix-${Date.now()}`;
+      const prefix = `Drained from Lead HEARTBEAT Tracked Items. ${"The rollback notes for the old migration live in the ops runbook. ".repeat(4)}`;
+      expect(prefix.length).toBeGreaterThan(200);
+      const id = await seedMemory(name, `${prefix}\nDecision: keep the 10-01 snapshot.`);
+      const tail = "Decision: drop the 10-01 snapshot after the 12-01 audit.";
+      const hd = {
+        draft: DRAINED_HB,
+        removed: pinRemoved(name),
+        movedToMemory: [{ name, content: `${prefix}\n${CLOSED_PIN}\n${tail}` }],
+      };
+
+      // Nothing can write the tail: the shared prefix does not count, so the pin stays.
+      const refused = await runRefusing(
+        ["memory_edit", "memory_store"],
+        await liveApplyArgs("hb-pin-prefix-refused", hd),
+      );
+      expect(refused.status).toBe("refused: pin-memory-missing");
+      expect(refused.missingPin).toEqual([name]);
+      expect(await leadHeartbeat()).toBe(PIN_HB);
+
+      const applied = await run("dream-heartbeat", await liveApplyArgs("hb-pin-prefix", hd));
+      expect(applied.errors).toEqual([]);
+      expect(applied.status).toBe("applied");
+      expect(applied.memories).toEqual([{ name, id, status: "updated" }]);
+      const content = String(memoryRows("id = ?", id)[0].content);
+      expect(content).toContain(tail);
+      expect(content).toContain(CLOSED_PIN);
+      expect(await leadHeartbeat()).toBe(DRAINED_HB);
+    } finally {
+      await setLeadHeartbeat(before);
+    }
+  }, 180_000);
+
+  test("a reused auto-key multi-chunk expiring memory is copied whole, including chunk 2", async () => {
+    const before = await leadHeartbeat();
+    await setLeadHeartbeat(PIN_HB);
+    try {
+      const reused = `hb-pin-chunks-${Date.now()}`;
+      const content = [
+        "## Background",
+        "The old migration moved the task tables to the new layout. ".repeat(20).trim(),
+        "",
+        "## Outcome",
+        "The rollout finished and the dashboards stayed green for a week. ".repeat(14).trim(),
+        CLOSED_PIN,
+      ].join("\n");
+      const res = await fetch(`${serverUrl()}/api/memory/index`, {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({ name: reused, content, scope: "swarm", source: "task_completion" }),
+      });
+      expect(res.status).toBe(202);
+      // Two chunks, each with its own auto key; only chunk 2 holds the pin, and chunk 1 alone fits one row.
+      const chunks = memoryRows("name = ? ORDER BY chunkIndex", reused);
+      expect(chunks.length).toBe(2);
+      expect(String(chunks[0].content)).not.toContain(CLOSED_PIN);
+      expect(String(chunks[0].content).length).toBeLessThan(1800);
+      expect(String(chunks[1].content)).toContain(CLOSED_PIN);
+      expect(chunks.every((c) => c.expiresAt != null)).toBe(true);
+      const keys = new Database(TEST_DB_PATH, { readonly: true });
+      try {
+        const k = keys.query("SELECT DISTINCT key FROM agent_memory WHERE name = ?").all(reused);
+        expect(k.length).toBe(2);
+      } finally {
+        keys.close();
+      }
+
+      const hd = { draft: DRAINED_HB, removed: pinRemoved(reused), movedToMemory: [] };
+      const applied = await run("dream-heartbeat", await liveApplyArgs("hb-pin-chunks", hd));
+      expect(applied.errors).toEqual([]);
+      expect(applied.status).toBe("applied");
+      const copy = applied.memories.find((m: any) => m.status === "stored-durable-copy");
+      expect(copy).toMatchObject({ name: reused, from: String(chunks[0].id) });
+      const copyRows = memoryRows("name = ? ORDER BY chunkIndex", `${reused}-durable`);
+      expect(copyRows.length).toBeGreaterThan(0);
+      expect(copyRows.every((r) => r.expiresAt == null)).toBe(true);
+      expect(copyRows.map((r) => String(r.content)).join("\n")).toContain(CLOSED_PIN);
+      expect(await leadHeartbeat()).toBe(DRAINED_HB);
+    } finally {
+      await setLeadHeartbeat(before);
+    }
+  }, 180_000);
+
+  test("a long harvested line that the chunker splits across chunks still re-reads", async () => {
+    const before = await leadHeartbeat();
+    await setLeadHeartbeat(PIN_HB);
+    try {
+      const name = `hb-pin-long-${Date.now()}`;
+      const long =
+        "The rollback of the old migration needs the snapshot and the audit trail. ".repeat(40);
+      const hd = {
+        draft: DRAINED_HB,
+        removed: pinRemoved(name),
+        movedToMemory: [{ name, content: `Closed pin.\n${long}\n${CLOSED_PIN}` }],
+      };
+      const applied = await run("dream-heartbeat", await liveApplyArgs("hb-pin-long", hd));
+      expect(applied.errors).toEqual([]);
+      expect(applied.status).toBe("applied");
+      expect(memoryRows("name = ?", name).length).toBeGreaterThan(1);
+      expect(await leadHeartbeat()).toBe(DRAINED_HB);
+    } finally {
+      await setLeadHeartbeat(before);
+    }
+  }, 180_000);
 });
 
 describe("dream-verify green dry run", () => {
