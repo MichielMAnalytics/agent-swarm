@@ -15,6 +15,7 @@ import {
 } from "../be/db";
 import { repointTrackerSyncBySwarmId } from "../be/db-queries/tracker";
 import { isAgentReachable } from "../be/runtime-pools/reachability";
+import { carryUnhandledSteering } from "../be/steering";
 import { dispatchPre } from "../extensions/dispatcher";
 import { resolveTemplate } from "../prompts/resolver";
 import {
@@ -179,13 +180,22 @@ export function getNextResumeGeneration(parent: Pick<AgentTask, "tags">): number
 export function inheritedModelSelection(
   parent: Pick<
     AgentTask,
-    "model" | "modelTier" | "modelSource" | "modelAlias" | "resolvedModel" | "claudeSessionId"
+    | "model"
+    | "modelTier"
+    | "modelSource"
+    | "modelAlias"
+    | "resolvedModel"
+    | "claudeSessionId"
+    | "profile"
   >,
-): Pick<CreateTaskOptions, "model" | "modelTier"> {
+): Pick<CreateTaskOptions, "model" | "modelTier" | "profile"> {
   const model = taskModelPin(parent);
+  // The task's own profile travels like its tier; an agent-default profile
+  // (`resolvedProfile` only) is re-resolved by the child's claim.
   return {
     ...(model ? { model } : {}),
     ...(parent.modelTier ? { modelTier: parent.modelTier } : {}),
+    ...(parent.profile ? { profile: parent.profile } : {}),
   };
 }
 
@@ -574,6 +584,8 @@ export async function createResumeFollowUp(args: {
     routingAffinity,
     ...inheritedModelSelection(parent),
   });
+  // The resume continues the work, so it takes over unaccepted steering.
+  await carryUnhandledSteering(parent.id, created.id);
 
   if (authorizationDecision) {
     try {

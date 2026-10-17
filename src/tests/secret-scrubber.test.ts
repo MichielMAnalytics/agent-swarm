@@ -103,7 +103,7 @@ describe("scrubSecrets — env-based replacement", () => {
       version: SCRUBBER_RULES_VERSION,
       keyVars: [...openAICompatibleKeyVars()].sort(),
     }).toEqual({
-      version: 8,
+      version: 9,
       keyVars: ["AI_GATEWAY_API_KEY", "HELMCODE_API_KEY", "HELMCODE_API_NAN", "NAN_API_KEY"],
     });
   });
@@ -436,6 +436,16 @@ describe("registerVolatileSecret", () => {
     expect(scrubSecrets(`echo ${member}`)).toBe("echo [REDACTED:HELMCODE_API_NAN]");
     // A non-secret key stays readable.
     expect(scrubSecrets("http://127.0.0.1:9/v1")).toBe("http://127.0.0.1:9/v1");
+  });
+
+  test("padded singleton values redact their trimmed form", () => {
+    const fromEnv = `opaque${randomToken(20)}`;
+    const fromMap = `opaque${randomToken(20)}`;
+    process.env.PADDED_API_KEY = `  ${fromEnv}\n`;
+    refreshSecretScrubberCache();
+    registerEnvSecrets({ HELMCODE_API_NAN: ` ${fromMap} ` });
+    expect(scrubSecrets(`key: ${fromEnv}`)).toBe("key: [REDACTED:PADDED_API_KEY]");
+    expect(scrubSecrets(`key: ${fromMap}`)).toBe("key: [REDACTED:HELMCODE_API_NAN]");
   });
 
   test("ignores values shorter than the minimum length", () => {

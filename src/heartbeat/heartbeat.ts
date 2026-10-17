@@ -43,6 +43,7 @@ import {
   releaseStaleOfferedTasksForOfflineAgents,
   releaseStaleProcessingInbox,
   releaseStaleReviewingTasks,
+  SUPERSEDED_RESUME_REPAIR_WINDOW_MS,
   settleSupersededTaskDependents,
   supersedeTask,
   updateAgentStatus,
@@ -58,7 +59,7 @@ import { remediateStalledRuntime } from "../be/runtime-pools/recovery";
 import { routePoolTasks } from "../be/runtime-pools/routing";
 import { getScript } from "../be/scripts/db";
 import { runSavedScriptAsAgent } from "../be/scripts/run-saved";
-import { promotePendingSteeringForTask } from "../be/steering";
+import { carryUnhandledSteering, promotePendingSteeringForTask } from "../be/steering";
 import type { HeartbeatAction, HeartbeatClassification } from "../extensions/contract";
 import { dispatchPre, extensionIdForAgent } from "../extensions/dispatcher";
 import { resolveTemplate } from "../prompts/resolver";
@@ -588,7 +589,7 @@ async function detectAndRemediateStalledTasks(findings: HeartbeatFindings): Prom
 
 /** Repair window: skip in-flight supersedes, stop at a day of history. */
 const ORPHAN_SUPERSEDE_MIN_AGE_MS = 60 * 1000;
-const ORPHAN_SUPERSEDE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const ORPHAN_SUPERSEDE_MAX_AGE_MS = SUPERSEDED_RESUME_REPAIR_WINDOW_MS;
 
 /**
  * Supersede and resume creation are separate writes. If the API process dies
@@ -1017,6 +1018,8 @@ export async function runRebootSweep(): Promise<void> {
               // Same work: a task-level model pin must survive the retry.
               ...inheritedModelSelection(task),
             });
+            // The retry continues the work, so it takes over unaccepted steering.
+            await carryUnhandledSteering(task.id, retryTask.id);
             if (authorization.decision) {
               await createLogEntry({
                 eventType: "task_recovery_authorization",

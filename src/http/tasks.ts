@@ -35,11 +35,13 @@ import {
   updateTaskTitle,
   updateTaskVcs,
 } from "../be/db";
+import { modelProfileRefError, taskProfileError } from "../be/db/model-profiles";
 import { explicitModelErrorForAgent } from "../be/model-validation";
 import {
   getTaskSteeringFields,
   markSteeringUndeliverable,
   requestSteering,
+  STEERING_MOVED_ERROR,
   SteeringRequestError,
 } from "../be/steering";
 import { getTaskCitations, TaskCitationSchema } from "../be/task-citations";
@@ -149,6 +151,13 @@ const SteeringMessageEnvelopeSchema = z.object({ message: SteeringMessageSchema 
 
 /** Shared by the steering-message list routes — `{ messages }`. */
 const SteeringMessagesListSchema = z.object({ messages: z.array(SteeringMessageSchema) });
+
+/**
+ * Optional `taskId` on the delivered/undeliverable callbacks: the task whose
+ * session received the message. A row handed to a successor since then
+ * answers 409 and stays untouched.
+ */
+const SteeringCallbackTaskIdSchema = z.string().optional();
 
 /** `POST /api/steering-messages/{id}/undeliverable` — promotion result. */
 const SteeringUndeliverableResponseSchema = z.object({
@@ -287,6 +296,8 @@ const createTask = route({
        */
       allowCustomModel: z.boolean().optional(),
       effort: ReasoningEffortSchema.optional(),
+      /** Model profile name, applied at claim. Exclusive with `model` and `modelTier`. */
+      profile: z.string().trim().min(1).optional(),
       /**
        * Create in `draft` status instead of the normal pending/unassigned/offered
        * status (#1240) — the task exists and is visible to its owner, but is not
@@ -459,7 +470,7 @@ const markSteeringDeliveredRoute = route({
   summary: "Mark a steering message delivered",
   tags: ["Tasks"],
   params: z.object({ id: z.string() }),
-  body: z.object({ mode: SteerModeSchema }),
+  body: z.object({ mode: SteerModeSchema, taskId: SteeringCallbackTaskIdSchema }),
   auth: { apiKey: true, agentId: true },
   rbac: {
     ungated:
@@ -473,6 +484,7 @@ const markSteeringDeliveredRoute = route({
     400: { description: "Missing X-Agent-ID header or validation error" },
     403: { description: "Steering message task is assigned to another agent" },
     404: { description: "Agent or steering message not found" },
+    409: { description: "Steering message moved to another task" },
   },
 });
 
@@ -508,7 +520,7 @@ const markSteeringUndeliverableRoute = route({
   summary: "Promote an undeliverable steering message",
   tags: ["Tasks"],
   params: z.object({ id: z.string() }),
-  body: z.object({ reason: z.string().min(1) }),
+  body: z.object({ reason: z.string().min(1), taskId: SteeringCallbackTaskIdSchema }),
   auth: { apiKey: true, agentId: true },
   rbac: {
     ungated:
@@ -522,6 +534,7 @@ const markSteeringUndeliverableRoute = route({
     400: { description: "Missing X-Agent-ID header or validation error" },
     403: { description: "Steering message task is assigned to another agent" },
     404: { description: "Agent or steering message not found" },
+    409: { description: "Steering message moved to another task" },
   },
 });
 
@@ -966,6 +979,15 @@ export async function handleTasks(
       jsonError(res, modelError, 400);
       return true;
     }
+    const profileError = await taskProfileError({
+      profile: parsed.body.profile,
+      ...splitLegacyModelAlias({ model: parsed.body.model, modelTier: parsed.body.modelTier }),
+      agentId: defaultAgentId,
+    });
+    if (profileError) {
+      jsonError(res, profileError, 400);
+      return true;
+    }
 
     const parentTask = parsed.body.parentTaskId
       ? await getTaskById(parsed.body.parentTaskId)
@@ -1057,6 +1079,7 @@ export async function handleTasks(
             modelTier: parsed.body.modelTier,
           }),
           effort: parsed.body.effort,
+          profile: parsed.body.profile,
         },
         { origin: "rest", allowCustomModel: parsed.body.allowCustomModel },
       );
@@ -1085,6 +1108,11 @@ export async function handleTasks(
       }
       if (error instanceof ExtensionAgentAssignmentError) {
         jsonError(res, error.message, 400);
+        return true;
+      }
+      // The profile was deleted between taskProfileError and the insert.
+      if (modelProfileRefError(error) === "missing") {
+        jsonError(res, `Unknown model profile "${parsed.body.profile}"`, 400);
         return true;
       }
       console.error("[HTTP] Failed to create task:", error);
@@ -1366,14 +1394,23 @@ export async function handleTasks(
       jsonError(res, "Steering message task is assigned to another agent", 403);
       return true;
     }
+    const expectedTaskId = parsed.body.taskId;
+    if (expectedTaskId && message.taskId !== expectedTaskId) {
+      jsonError(res, STEERING_MOVED_ERROR, 409);
+      return true;
+    }
     if (message.status !== "pending") {
       markSteeringDeliveredRoute.respond(res, 200, { message });
       return true;
     }
 
     const delivered =
-      (await markSteeringDelivered(message.id, parsed.body.mode)) ??
+      (await markSteeringDelivered(message.id, parsed.body.mode, expectedTaskId)) ??
       (await getSteeringMessageById(message.id));
+    if (expectedTaskId && delivered && delivered.taskId !== expectedTaskId) {
+      jsonError(res, STEERING_MOVED_ERROR, 409);
+      return true;
+    }
     if (!delivered) {
       jsonError(res, "Failed to mark steering message delivered", 500);
       return true;
@@ -1455,6 +1492,10 @@ export async function handleTasks(
       jsonError(res, "Steering message task is assigned to another agent", 403);
       return true;
     }
+    if (parsed.body.taskId && message.taskId !== parsed.body.taskId) {
+      jsonError(res, STEERING_MOVED_ERROR, 409);
+      return true;
+    }
     if (message.status !== "pending") {
       markSteeringUndeliverableRoute.respond(res, 200, {
         message,
@@ -1467,7 +1508,7 @@ export async function handleTasks(
       markSteeringUndeliverableRoute.respond(
         res,
         200,
-        await markSteeringUndeliverable(message.id, parsed.body.reason),
+        await markSteeringUndeliverable(message.id, parsed.body.reason, parsed.body.taskId),
       );
     } catch (error) {
       if (error instanceof SteeringRequestError) {

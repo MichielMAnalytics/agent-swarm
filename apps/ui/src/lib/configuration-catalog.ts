@@ -1128,6 +1128,15 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         docsUrl: `${DOCS}integrations/slack`,
       },
       {
+        key: "SLACK_STATUS_ICON_COMPLETED",
+        label: "Completed status icon",
+        description:
+          "Slack emoji shortcode for the done glyph in thread text: task tree, thread header and outcome cards. Bare name or :name:, same rules as the reaction keys. Unset or invalid keeps the stock check mark. Unlike reactions there is no fallback: a name the workspace lacks renders as literal :name:.",
+        kind: "string",
+        defaultValue: "white_check_mark",
+        docsUrl: `${DOCS}integrations/slack`,
+      },
+      {
         key: "GITHUB_DISABLE",
         label: "Disable GitHub",
         description:
@@ -1162,6 +1171,26 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         kind: "boolean",
         defaultValue: "false",
         docsUrl: `${DOCS}integrations/jira`,
+      },
+      {
+        key: "AZURE_DEVOPS_WORKITEM_STATE_STARTED",
+        label: "Azure Boards state on task start",
+        description:
+          "State to set on the linked Azure Boards work item when its swarm task starts, e.g. Active (Agile), Committed (Scrum) or Doing (Basic). Names depend on the project process. Empty leaves the state alone.",
+        kind: "string",
+        defaultValue: "",
+        placeholder: "Doing",
+        docsUrl: `${DOCS}integrations/azure-devops`,
+      },
+      {
+        key: "AZURE_DEVOPS_WORKITEM_STATE_DONE",
+        label: "Azure Boards state on task completion",
+        description:
+          "State to set on the linked Azure Boards work item when its swarm task completes, e.g. Resolved or Closed (Agile), Done (Scrum, Basic). Empty leaves the state alone.",
+        kind: "string",
+        defaultValue: "",
+        placeholder: "Done",
+        docsUrl: `${DOCS}integrations/azure-devops`,
       },
       {
         key: "AGENTMAIL_DISABLE",

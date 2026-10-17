@@ -232,6 +232,8 @@ export interface SwarmSdk {
   // --- config ---
   config_get(args?: { agentId?: string; repoId?: string; key?: string; includeSecrets?: boolean }): Promise<unknown>;
   config_list(args?: { scope?: "global" | "agent" | "repo"; scopeId?: string; key?: string; includeSecrets?: boolean }): Promise<unknown>;
+  // --- model profiles ---
+  modelProfile_list(args?: { harness?: string }): Promise<unknown>;
   // --- slack ---
   slack_read(args?: { inboxMessageId?: string; taskId?: string; channelId?: string; threadTs?: string; limit?: number; includeFiles?: boolean }): Promise<unknown>;
   slack_listChannels(args?: { types?: Array<"public" | "private" | "dm" | "mpim">; limit?: number }): Promise<unknown>;
@@ -493,12 +495,59 @@ export interface ScriptWorkflowSteps {
   humanInTheLoop(): Promise<never>;
 }
 
+export interface ScriptFsStat {
+  isFile: boolean;
+  isDirectory: boolean;
+  size: number;
+  /** ISO 8601. */
+  mtime: string;
+}
+
+/**
+ * One virtual filesystem per run. \`/afs\` is the agent's default agent-fs drive
+ * (when configured); every other path is in-memory scratch that dies with the run.
+ * Relative paths resolve against \`/afs\`. Text only (UTF-8).
+ */
+export interface ScriptFs {
+  readFile(path: string): Promise<string>;
+  writeFile(path: string, content: string): Promise<void>;
+  appendFile(path: string, content: string): Promise<void>;
+  readdir(path: string): Promise<string[]>;
+  stat(path: string): Promise<ScriptFsStat>;
+  exists(path: string): Promise<boolean>;
+  mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
+  rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
+  cp(src: string, dest: string, options?: { recursive?: boolean }): Promise<void>;
+  mv(src: string, dest: string): Promise<void>;
+}
+
+export interface ScriptShOptions {
+  /** Working directory for this command. Default \`/afs\` (or \`/\` without agent-fs). */
+  cwd?: string;
+  env?: Record<string, string>;
+  stdin?: string;
+}
+
+export interface ScriptShResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
 export interface ScriptContext {
   run?: ScriptRunContext;
   step?: ScriptWorkflowSteps;
   swarm: SwarmSdk & { config: SwarmConfig };
   api: ScriptApiRegistry;
   mcp: ScriptMcpRegistry;
+  /** The run's virtual filesystem. Same files as \`ctx.sh\` sees. */
+  fs: ScriptFs;
+  /**
+   * Runs bash (just-bash: a TypeScript reimplementation) over \`ctx.fs\`. Text
+   * tools only (grep, sed, awk, jq, sort, ...): no real binaries, no network.
+   * Files persist across calls in one run. cwd and env do not.
+   */
+  sh(command: string, options?: ScriptShOptions): Promise<ScriptShResult>;
   stdlib: ScriptStdlib;
   logger: ScriptLogger;
 }
