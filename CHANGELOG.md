@@ -9,6 +9,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Security
 - RBAC: running inline script source, saving scripts, launching durable script runs, exposing a script as an API, and opening an agent MCP session (`/mcp` with `X-Agent-ID`) now need the new `script.author` permission when the caller is a user token. The default `admin` role does not include it. Operators grant it with `agent-swarm rbac attach <user-id|email> script-author`. The operator key and agent tokens are unchanged.
 
+## [2.3.0] - 2026-10-18
+
+### Added
+- API: inbox items can move their read cursor back (mark unread), bulk inbox state updates in one call, and task key moves no longer bump task activity or lock key moves across namespaces (#2243).
+
+### Changed
+- Skills: dreaming-v2 seed patches for script, review and page QA lessons (#2230).
+- agent-fs pins bumped to 0.18.4 and `@desplega.ai/agent-fs-just-bash` to 0.18.2; worker image bumps amp (#2240, #2234, #2231).
+- Evals: benchmark 1.0 published from the weekly run (#2233).
+- Docs: heartbeat spec synced with #2217 and #2226 (#2235).
+
+### Fixed
+- Heartbeat: reported failures are tracked with checklist receipts, so shown failures stop reappearing as new (#2232).
+- UI: grids hide low-priority columns when too narrow (#2236); Settings and Usage side rails show from `lg` (#2239); the Approvals list picks its table layout by its own width (#2237); the workflow canvas and inspector stay inside the viewport (#2238); config descriptions stay on one line and debug results get room (#2242); the API keys rate-limit column no longer triggers AG Grid warning #48 (#2241).
+
 ## [2.2.0] - 2026-10-18
 
 ### Added
