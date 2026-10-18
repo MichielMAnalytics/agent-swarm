@@ -4167,6 +4167,7 @@ export interface paths {
                             id: string;
                             /** @description Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form. */
                             key: string;
+                            movedTaskIds?: string[];
                         };
                     };
                 };
@@ -4254,6 +4255,7 @@ export interface paths {
                             id: string;
                             /** @description Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form. */
                             key: string;
+                            movedTaskIds?: string[];
                         };
                     };
                 };
@@ -4329,6 +4331,8 @@ export interface paths {
                     "application/json": {
                         /** @description Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form. */
                         key: string;
+                        /** @description For tasks only, also move every descendant task recursively through parentTaskId. */
+                        cascade?: boolean;
                     };
                 };
             };
@@ -4345,6 +4349,7 @@ export interface paths {
                             id: string;
                             /** @description Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form. */
                             key: string;
+                            movedTaskIds?: string[];
                         };
                     };
                 };
@@ -7444,7 +7449,6 @@ export interface paths {
             requestBody?: {
                 content: {
                     "application/json": {
-                        userId: string;
                         /** @enum {string} */
                         itemType: "approval" | "credential_missing" | "broken_task" | "to_read" | "to_start_template" | "notification";
                         itemId: string;
@@ -7454,6 +7458,12 @@ export interface paths {
                         snoozeUntil?: string;
                         /** Format: date-time */
                         readAt?: string;
+                        /**
+                         * Format: date-time
+                         * @description Omit to preserve the read cursor, send null to clear it, or send a timestamp to set it, including an earlier time.
+                         */
+                        lastReadAt?: string | null;
+                        userId: string;
                     };
                 };
             };
@@ -7466,6 +7476,84 @@ export interface paths {
                     content: {
                         "application/json": {
                             item: components["schemas"]["InboxItemState"];
+                        };
+                    };
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        trace?: never;
+    };
+    "/api/inbox-state/bulk": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Upsert inbox-item state in one transaction */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        userId: string;
+                        items: {
+                            /** @enum {string} */
+                            itemType: "approval" | "credential_missing" | "broken_task" | "to_read" | "to_start_template" | "notification";
+                            itemId: string;
+                            /** @enum {string} */
+                            status: "open" | "snoozed" | "dismissed" | "done";
+                            /** Format: date-time */
+                            snoozeUntil?: string;
+                            /** Format: date-time */
+                            readAt?: string;
+                            /**
+                             * Format: date-time
+                             * @description Omit to preserve the read cursor, send null to clear it, or send a timestamp to set it, including an earlier time.
+                             */
+                            lastReadAt?: string | null;
+                        }[];
+                    };
+                };
+            };
+            responses: {
+                /** @description Upserted inbox state rows in request order */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            items: components["schemas"]["InboxItemState"][];
                         };
                     };
                 };
@@ -12821,6 +12909,7 @@ export interface paths {
                     "application/json": {
                         /** @enum {string} */
                         mode: "steer" | "queue";
+                        taskId?: string;
                     };
                 };
             };
@@ -12856,6 +12945,15 @@ export interface paths {
                 };
                 /** @description Agent or steering message not found */
                 404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Steering message moved to another task */
+                409: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -12964,6 +13062,7 @@ export interface paths {
                 content: {
                     "application/json": {
                         reason: string;
+                        taskId?: string;
                     };
                 };
             };
@@ -13000,6 +13099,15 @@ export interface paths {
                 };
                 /** @description Agent or steering message not found */
                 404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Steering message moved to another task */
+                409: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -25577,6 +25685,7 @@ export interface components {
             dismissedAt?: string;
             doneAt?: string;
             readAt?: string;
+            lastReadAt?: string;
             createdAt: string;
             lastUpdatedAt: string;
         };
