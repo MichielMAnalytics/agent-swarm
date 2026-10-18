@@ -3,9 +3,9 @@ import { expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { closeDb, getDb, initDb } from "../be/db";
 
-const MIGRATION = "src/be/migrations/223_swarm_config_exposure.sql";
+const MIGRATION = "src/be/migrations/228_swarm_config_exposure.sql";
 
-test("migration 223 keeps existing swarm_config rows and reads them as NULL exposure", async () => {
+test("migration 228 keeps existing swarm_config rows and reads them as NULL exposure", async () => {
   const db = new Database(":memory:");
   try {
     db.exec(`CREATE TABLE swarm_config (
@@ -44,7 +44,7 @@ test("migration 223 keeps existing swarm_config rows and reads them as NULL expo
 });
 
 test("a fresh database has the exposure column with its CHECK", async () => {
-  const path = `./test-migration-223-${crypto.randomUUID()}.sqlite`;
+  const path = `./test-migration-228-${crypto.randomUUID()}.sqlite`;
   initDb(path);
   try {
     const columns = getDb()
