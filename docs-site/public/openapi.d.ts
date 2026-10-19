@@ -965,17 +965,25 @@ export interface paths {
                         version: number;
                         migration?: {
                             [key: string]: {
-                                set: string | number | boolean;
+                                set: string | number | boolean | {
+                                    [key: string]: unknown;
+                                } | unknown[];
                             } | {
                                 from: string;
                                 map?: {
-                                    [key: string]: string | number | boolean;
+                                    [key: string]: string | number | boolean | {
+                                        [key: string]: unknown;
+                                    } | unknown[];
                                 };
-                                else?: string | number | boolean | null;
+                                else?: string | number | boolean | {
+                                    [key: string]: unknown;
+                                } | unknown[] | null;
                             } | {
                                 /** @enum {boolean} */
                                 coerce: true;
-                                else?: string | number | boolean | null;
+                                else?: string | number | boolean | {
+                                    [key: string]: unknown;
+                                } | unknown[] | null;
                             } | {
                                 /** @enum {boolean} */
                                 purge: true;
@@ -1152,17 +1160,25 @@ export interface paths {
                         definition?: unknown;
                         migration?: {
                             [key: string]: {
-                                set: string | number | boolean;
+                                set: string | number | boolean | {
+                                    [key: string]: unknown;
+                                } | unknown[];
                             } | {
                                 from: string;
                                 map?: {
-                                    [key: string]: string | number | boolean;
+                                    [key: string]: string | number | boolean | {
+                                        [key: string]: unknown;
+                                    } | unknown[];
                                 };
-                                else?: string | number | boolean | null;
+                                else?: string | number | boolean | {
+                                    [key: string]: unknown;
+                                } | unknown[] | null;
                             } | {
                                 /** @enum {boolean} */
                                 coerce: true;
-                                else?: string | number | boolean | null;
+                                else?: string | number | boolean | {
+                                    [key: string]: unknown;
+                                } | unknown[] | null;
                             } | {
                                 /** @enum {boolean} */
                                 purge: true;
@@ -1310,17 +1326,25 @@ export interface paths {
                         };
                         migration?: {
                             [key: string]: {
-                                set: string | number | boolean;
+                                set: string | number | boolean | {
+                                    [key: string]: unknown;
+                                } | unknown[];
                             } | {
                                 from: string;
                                 map?: {
-                                    [key: string]: string | number | boolean;
+                                    [key: string]: string | number | boolean | {
+                                        [key: string]: unknown;
+                                    } | unknown[];
                                 };
-                                else?: string | number | boolean | null;
+                                else?: string | number | boolean | {
+                                    [key: string]: unknown;
+                                } | unknown[] | null;
                             } | {
                                 /** @enum {boolean} */
                                 coerce: true;
-                                else?: string | number | boolean | null;
+                                else?: string | number | boolean | {
+                                    [key: string]: unknown;
+                                } | unknown[] | null;
                             } | {
                                 /** @enum {boolean} */
                                 purge: true;
@@ -13424,6 +13448,123 @@ export interface paths {
                                 /** @enum {string} */
                                 verified: "true" | "false" | "unchecked";
                             }[];
+                        };
+                    };
+                };
+                /** @description A user caller cannot read the task's session */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Task not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/lineage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the tree a task belongs to (ancestors and descendants)
+         * @description Follows `parentTaskId` up to the topmost ancestor, then returns every descendant of that root as slim task rows, the task's own subtree first. Bounded: at most 50 hops up, `maxDepth` levels down and about twice `maxNodes` rows; `truncated` is true when any task in the tree is missing from the response.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    maxNodes?: number;
+                    maxDepth?: number;
+                };
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The lineage tree as a flat list linked by `parentTaskId` */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            rootTaskId: string;
+                            tasks: {
+                                /** Format: uuid */
+                                id: string;
+                                /** @description Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form. */
+                                key: string;
+                                agentId: string | null;
+                                creatorAgentId?: string;
+                                task: string;
+                                title?: string;
+                                /** @enum {string} */
+                                status: "draft" | "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
+                                /**
+                                 * @default mcp
+                                 * @enum {string}
+                                 */
+                                source: "mcp" | "slack" | "api" | "ui" | "github" | "gitlab" | "azure-devops" | "agentmail" | "system" | "schedule" | "workflow" | "linear" | "jira" | "comb" | "chat";
+                                taskType?: string;
+                                /** @default [] */
+                                tags: string[];
+                                /** @default 50 */
+                                priority: number;
+                                /** @default [] */
+                                dependsOn: string[];
+                                offeredTo?: string;
+                                /** Format: date-time */
+                                acceptedAt?: string;
+                                parentTaskId?: string;
+                                scheduleId?: string;
+                                model?: string;
+                                /** @enum {string} */
+                                modelTier?: "smol" | "regular" | "smart" | "ultra";
+                                resolvedModel?: string;
+                                modelSource?: string;
+                                modelAlias?: string;
+                                /** @enum {string} */
+                                effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
+                                /** @enum {string} */
+                                resolvedEffort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
+                                /** @enum {string} */
+                                provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
+                                requestedByUserId?: string;
+                                progress?: string;
+                                /** Format: date-time */
+                                createdAt: string;
+                                /** Format: date-time */
+                                lastUpdatedAt: string;
+                                /** Format: date-time */
+                                finishedAt?: string;
+                                peakContextPercent?: number;
+                                totalCostUsd?: number;
+                                workflowRunId?: string;
+                            }[];
+                            truncated: boolean;
                         };
                     };
                 };

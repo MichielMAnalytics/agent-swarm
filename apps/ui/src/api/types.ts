@@ -910,6 +910,17 @@ export interface SessionsListResponse {
 }
 
 /**
+ * `GET /api/tasks/{id}/lineage`: the tree a task belongs to, as slim task rows
+ * linked by `parentTaskId`. Root first; always holds the path root → task.
+ */
+export interface TaskLineageResponse {
+  rootTaskId: string;
+  tasks: AgentTask[];
+  /** A server cap (depth, nodes or ancestors) cut the walk. */
+  truncated: boolean;
+}
+
+/**
  * Full chain payload from `GET /api/sessions/:rootTaskId`. The chain is
  * already ordered by `createdAt` server-side (via the recursive CTE) so the
  * UI can DFS from `root` without resorting.
@@ -3585,14 +3596,16 @@ export interface SwarmMetrics {
 // ─── Swarm apps (spike) ─────────────────────────────────────────────────────
 // Mirrors the frozen `AppDefinition` contract served by `/api/apps/*`.
 
-export type AppColumnKind = "string" | "number" | "boolean" | "date" | "enum";
+export type AppColumnKind = "string" | "number" | "boolean" | "date" | "enum" | "json";
+
+export type JsonDef = Record<string, unknown> | unknown[];
 
 export interface AppColumnDef {
   kind: AppColumnKind;
   required?: boolean;
   enum?: string[];
   index?: boolean;
-  default?: string | number | boolean;
+  default?: string | number | boolean | JsonDef;
 }
 
 export interface AppModelDef {
