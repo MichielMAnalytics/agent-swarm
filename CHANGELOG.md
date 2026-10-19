@@ -9,6 +9,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Security
 - RBAC: running inline script source, saving scripts, launching durable script runs, exposing a script as an API, and opening an agent MCP session (`/mcp` with `X-Agent-ID`) now need the new `script.author` permission when the caller is a user token. The default `admin` role does not include it. Operators grant it with `agent-swarm rbac attach <user-id|email> script-author`. The operator key and agent tokens are unchanged.
 
+## [2.4.0] - 2026-10-19
+
+### Added
+- Ranking: opt-in public install ranking on agent-swarm.dev/ranking. Admins click **Get ranked** in Settings → Configuration → Branding (requires telemetry plus org name and website), which sets `PUBLIC_RANKING_ENABLED`, stores the `telemetry_ranking` listing and sends `ranking.opted_in`; workers then send `ranking.usage` token counts. An install is listed once a `community/ranking/<domain>.json` PR merges, checked by the new Ranking entry workflow. New `/api/ranking` routes (#2248).
+- Apps: script actions receive a server-stamped `caller` that input cannot override; swarm-key callers with a registered `X-Agent-ID` are recorded as `agent:<id>` (#2251).
+
+### Changed
+- Worker image bumps amp to 0.0.1792324855-g9c86a5 (#2246).
+
+### Fixed
+- Slack: `slack-start-thread`, `slack-post` and `slack-read` resolve a user id through `conversations.open` to the bot's own DM, so posts and reads no longer fail with `channel_not_found` and replies reach the bot (#2250).
+- Slack: default message blocks from `slack-post`, `slack-reply`, `slack-update` and `slack-start-thread` split at Slack's 3,000-char section limit instead of failing with `invalid_blocks`, and splits keep emoji surrogate pairs whole (#2245).
+
 ## [2.3.0] - 2026-10-18
 
 ### Added

@@ -36,6 +36,8 @@ export const BUILTIN_ROLES = [
       "task.action.own",
       "task.fs.mutate",
       "favorite.write.own",
+      "session.share",
+      "session.presence",
     ],
   },
   {

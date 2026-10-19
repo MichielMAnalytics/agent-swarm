@@ -47,7 +47,7 @@ import {
   RawLlmConfigSchema,
   RawLlmOutputSchema,
 } from "../workflows/executors/raw-llm";
-import { route } from "./route-def";
+import { bodyTask, route } from "./route-def";
 import { rejectWithoutScriptAuthor } from "./script-author-gate";
 import { json, jsonError } from "./utils";
 
@@ -278,6 +278,7 @@ const agentTaskRoute = route({
   method: "post",
   path: "/api/internal/script-runs/{runId}/agent-task",
   pattern: ["api", "internal", "script-runs", null, "agent-task"],
+  session: bodyTask("parentTaskId"),
   operationId: "script_runs_internal_agent_task",
   summary: "Create or wait for a script workflow agent task step",
   tags: ["Script Runs"],
