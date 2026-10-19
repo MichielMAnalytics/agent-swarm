@@ -9,6 +9,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Security
 - RBAC: running inline script source, saving scripts, launching durable script runs, exposing a script as an API, and opening an agent MCP session (`/mcp` with `X-Agent-ID`) now need the new `script.author` permission when the caller is a user token. The default `admin` role does not include it. Operators grant it with `agent-swarm rbac attach <user-id|email> script-author`. The operator key and agent tokens are unchanged.
 
+## [2.4.1] - 2026-10-19
+
+### Added
+- Apps: agents and scripts can write app rows and run app actions through MCP tools and `ctx.swarm` (#2253).
+- UI: telemetry surfaces ask for company context (org name, website, team size, use case, referral, job function, contact email), with a peer benchmark and a fix-in-place setup badge (#2254).
+- Hooks: `gh pr create` on a configured repo is blocked until the PR body carries the PR room line (#2252).
+
+### Changed
+- Ranking: **Get ranked** alone lists the install at the next hourly refresh; no `community/ranking` PR into this repo is needed (#2259). The telemetry contract pin points at the merged proxy commit (#2260).
+- Worker image bumps claude-code to 2.1.303 and amp to 0.0.1792368068-g91990d (#2258).
+- Docs: release notes for the week of 2026-10-19 (#2255); the workflow retry tool says it resumes the failed run and can repeat the failed node's side effects (#2261).
+
+### Fixed
+- Workflows: an `agent-task` step cut by a deploy is re-dispatched once instead of failing the run or completing on a `[FAILED: ...]` stub (#2262).
+- Workflows: a crash after a wait resolves no longer strands the run; recovery completes the saved resolution (#2257).
+
 ## [2.4.0] - 2026-10-19
 
 ### Added
