@@ -634,8 +634,8 @@ describe("script connections", () => {
       markMigrationApplied(database, "220_model_profiles.sql");
       // 227 alters inbox_item_state, which this migration-112-only fixture does not create.
       markMigrationApplied(database, "227_inbox_item_state_last_read_at.sql");
-      // 228 alters model_profiles (made by the skipped 220) and scheduled_tasks.
-      markMigrationApplied(database, "228_model_profiles_pr2.sql");
+      // 231 alters model_profiles (made by the skipped 220) and scheduled_tasks.
+      markMigrationApplied(database, "231_model_profiles_pr2.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();

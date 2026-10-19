@@ -93,6 +93,7 @@ import { getRequestAuth } from "../utils/request-auth-context";
 import { isRuntimePoolsEnabled } from "../utils/runtime-pools-flag";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { route, runtimeInstanceHeader } from "./route-def";
+import { readableByFor, resolveSessionActor } from "./session-access";
 import { agentWithCapacity, json, jsonError } from "./utils";
 
 function singleHeaderValue(req: IncomingMessage, name: string): string | undefined {
@@ -867,7 +868,7 @@ export async function handleAgentsRest(
   res: ServerResponse,
   pathSegments: string[],
   queryParams: URLSearchParams,
-  _myAgentId: string | undefined,
+  myAgentId: string | undefined,
 ): Promise<boolean> {
   if (listAgents.match(req.method, pathSegments)) {
     const parsed = await listAgents.parse(req, res, pathSegments, queryParams);
@@ -876,7 +877,10 @@ export async function handleAgentsRest(
     // List responses default to slim (no identity markdown); `?fields=full` restores it.
     const slim = parsed.query.fields !== "full";
     const agents = includeTasks
-      ? await getAllAgentsWithTasks({ slim })
+      ? await getAllAgentsWithTasks({
+          slim,
+          readableBy: readableByFor(await resolveSessionActor(req, myAgentId)),
+        })
       : await getAllAgents({ slim });
     const [agentsWithCapacity, transports] = await Promise.all([
       Promise.all(agents.map(agentWithCapacity)),
@@ -1589,7 +1593,10 @@ export async function handleAgentsRest(
     if (!parsed) return true;
     const includeTasks = parsed.query.include === "tasks";
     const agent = includeTasks
-      ? await getAgentWithTasks(parsed.params.id)
+      ? await getAgentWithTasks(
+          parsed.params.id,
+          readableByFor(await resolveSessionActor(req, myAgentId)),
+        )
       : await getAgentById(parsed.params.id);
 
     if (!agent) {
