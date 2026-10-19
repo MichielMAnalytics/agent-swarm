@@ -191,9 +191,14 @@ describe("script.author gate for user principals", () => {
     expect(run.status).toBe(200);
     expect(run.body.result).toEqual({ ran: true });
     expect((await upsert(grantedUserToken, "gate-granted-upsert")).status).toBe(200);
-    expect((await launchDurableRun(grantedUserToken)).status).toBe(201);
     expect((await createScriptApi(grantedUserToken)).status).toBe(201);
-    expect(await mcpInitialize(grantedUserToken)).toBe(200);
+
+    // The grant does not reopen the agent-identity paths: a user token never
+    // sends X-Agent-ID to a durable run, nor opens the agent `/mcp` transport.
+    const durable = await launchDurableRun(grantedUserToken);
+    expect(durable.status).toBe(403);
+    expect(durable.body.error).toContain("cannot act as an agent");
+    expect(await mcpInitialize(grantedUserToken)).toBe(403);
   });
 
   test("operator key and agent tokens are unchanged (positive controls)", async () => {
