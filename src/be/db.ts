@@ -10,7 +10,7 @@ import {
 import { realtimeBus } from "../realtime/bus";
 import { slackChannelFromContextKey } from "../tasks/slack-routing";
 import { _resolveIntegrationType, emitIntegrationConnected, telemetry } from "../telemetry";
-import { scheduleOrgDomainRecompute } from "../telemetry-identity";
+import { invalidateTelemetryUserRole, scheduleOrgDomainRecompute } from "../telemetry-identity";
 import {
   emitTaskTelemetry,
   type TaskTelemetryEvent,
@@ -327,6 +327,7 @@ export {
   getSupersededTasksWithoutResume,
   getSupersededTasksWithUnsettledDependents,
   getTaskById,
+  getTaskLineage,
   getTaskStats,
   getTasksByAgentId,
   getTasksByStatus,
@@ -346,6 +347,7 @@ export {
   recordChatRelayError,
   resetTasksNotified,
   SUPERSEDED_RESUME_REPAIR_WINDOW_MS,
+  TASK_LINEAGE_LIMITS,
   type TaskFilters,
 } from "./db/tasks/read";
 
@@ -811,6 +813,9 @@ export async function getSlackOutcomeMessage(taskId: string): Promise<SlackMessa
  * subsequent re-defers to the latest wake, keeping the original card open.
  * `deferredAt` (not the `deferred` tag) identifies the deferring task,
  * because the wake-up task inherits the tag.
+ *
+ * CROSS JOIN and `+wake.taskType` pin the join order to the small chain. Without
+ * them the planner drives the outer join from every terminal task (~1s at 150k tasks).
  */
 export async function getResolvableDeferralOutcomes(
   limit = 50,
@@ -824,13 +829,13 @@ export async function getResolvableDeferralOutcomes(
            AND card.ts NOT LIKE 'pending:%'
          UNION
          SELECT chain.card_id, wake.id FROM chain
-         JOIN agent_tasks parent ON parent.id = chain.task_id AND parent.deferredAt IS NOT NULL
-         JOIN agent_tasks wake ON wake.parentTaskId = parent.id AND wake.taskType = 'deferred'
+         CROSS JOIN agent_tasks parent ON parent.id = chain.task_id AND parent.deferredAt IS NOT NULL
+         CROSS JOIN agent_tasks wake ON wake.parentTaskId = parent.id AND +wake.taskType = 'deferred'
        )
        SELECT card.*, wake.id AS wake_task_id
        FROM chain
-       JOIN slack_messages card ON card.id = chain.card_id
-       JOIN agent_tasks wake ON wake.id = chain.task_id AND wake.id != card.task_id
+       CROSS JOIN slack_messages card ON card.id = chain.card_id
+       CROSS JOIN agent_tasks wake ON wake.id = chain.task_id AND wake.id != card.task_id
        WHERE card.kind = 'outcome'
          AND card.finalized_at IS NOT NULL
          AND card.deferral_resolved_at IS NULL
@@ -12363,7 +12368,7 @@ export async function updateUser(
   id: string,
   data: Partial<{
     name: string;
-    email: string;
+    email: string | null;
     role: string;
     notes: string;
     emailAliases: string[];
@@ -12428,7 +12433,12 @@ export async function updateUser(
     `UPDATE users SET ${sets.join(", ")} WHERE id = ? RETURNING *`,
     params,
   );
-  if (row) getDbClient().afterCommit(scheduleOrgDomainRecompute);
+  if (row) {
+    getDbClient().afterCommit(() => {
+      invalidateTelemetryUserRole(id);
+      scheduleOrgDomainRecompute();
+    });
+  }
   return row ? rowToUser(row) : null;
 }
 
@@ -12565,7 +12575,12 @@ export async function deleteUser(id: string, replacementUserId?: string): Promis
     await reclassifyTaskHumanFree(reclassifySeedIds);
 
     const result = await tx.run("DELETE FROM users WHERE id = ?", [id]);
-    if (result.changes > 0) getDbClient().afterCommit(scheduleOrgDomainRecompute);
+    if (result.changes > 0) {
+      getDbClient().afterCommit(() => {
+        invalidateTelemetryUserRole(id);
+        scheduleOrgDomainRecompute();
+      });
+    }
     return result.changes > 0;
   });
 }
