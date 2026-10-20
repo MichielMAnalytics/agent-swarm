@@ -33440,6 +33440,12 @@
                               "max"
                             ]
                           },
+                          "profile": {
+                            "type": "string"
+                          },
+                          "resolvedProfile": {
+                            "type": "string"
+                          },
                           "provider": {
                             "type": "string",
                             "enum": [
