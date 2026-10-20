@@ -2659,6 +2659,9 @@
     "controllerId": {
       "exempt": "identifier"
     },
+    "parentTokenId": {
+      "exempt": "identifier"
+    },
     "id": {
       "exempt": "identifier"
     },
