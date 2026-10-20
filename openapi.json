@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Agent Swarm API",
-    "version": "2.3.0",
+    "version": "2.4.3",
     "description": "Multi-agent orchestration API for Claude Code, Codex, and Gemini CLI. Enables task distribution, agent communication, and service discovery.\n\nMCP tools are documented separately in [MCP.md](./MCP.md)."
   },
   "servers": [
@@ -613,6 +613,9 @@
           "bedrock": {
             "$ref": "#/components/schemas/AgentBedrockStatus"
           },
+          "opencodeGo": {
+            "$ref": "#/components/schemas/AgentOpencodeGoStatus"
+          },
           "acp": {
             "$ref": "#/components/schemas/AgentAcpStatus"
           }
@@ -764,6 +767,28 @@
           "region",
           "probedAt",
           "ready"
+        ]
+      },
+      "AgentOpencodeGoStatus": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "properties": {
+          "probedAt": {
+            "type": "number"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          }
+        },
+        "default": null,
+        "required": [
+          "probedAt"
         ]
       },
       "AgentAcpStatus": {
@@ -3963,6 +3988,67 @@
           "outputTokens",
           "cacheReadTokens",
           "cacheWriteTokens"
+        ]
+      },
+      "SessionOwner": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "SessionShares": {
+        "type": "object",
+        "properties": {
+          "everyone": {
+            "type": "string",
+            "enum": [
+              "none",
+              "read",
+              "write"
+            ]
+          },
+          "users": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "userId": {
+                  "type": "string"
+                },
+                "access": {
+                  "type": "string",
+                  "enum": [
+                    "read",
+                    "write"
+                  ]
+                },
+                "createdAt": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "userId",
+                "access",
+                "createdAt"
+              ]
+            }
+          }
+        },
+        "required": [
+          "everyone",
+          "users"
         ]
       },
       "Skill": {
@@ -7461,6 +7547,14 @@
                                 },
                                 {
                                   "type": "boolean"
+                                },
+                                {
+                                  "type": "object",
+                                  "additionalProperties": {}
+                                },
+                                {
+                                  "type": "array",
+                                  "items": {}
                                 }
                               ]
                             }
@@ -7489,6 +7583,14 @@
                                   },
                                   {
                                     "type": "boolean"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                  },
+                                  {
+                                    "type": "array",
+                                    "items": {}
                                   }
                                 ]
                               }
@@ -7503,6 +7605,14 @@
                                 },
                                 {
                                   "type": "boolean"
+                                },
+                                {
+                                  "type": "object",
+                                  "additionalProperties": {}
+                                },
+                                {
+                                  "type": "array",
+                                  "items": {}
                                 },
                                 {
                                   "type": "null"
@@ -7534,6 +7644,14 @@
                                 },
                                 {
                                   "type": "boolean"
+                                },
+                                {
+                                  "type": "object",
+                                  "additionalProperties": {}
+                                },
+                                {
+                                  "type": "array",
+                                  "items": {}
                                 },
                                 {
                                   "type": "null"
@@ -7989,6 +8107,14 @@
                                 },
                                 {
                                   "type": "boolean"
+                                },
+                                {
+                                  "type": "object",
+                                  "additionalProperties": {}
+                                },
+                                {
+                                  "type": "array",
+                                  "items": {}
                                 }
                               ]
                             }
@@ -8017,6 +8143,14 @@
                                   },
                                   {
                                     "type": "boolean"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                  },
+                                  {
+                                    "type": "array",
+                                    "items": {}
                                   }
                                 ]
                               }
@@ -8031,6 +8165,14 @@
                                 },
                                 {
                                   "type": "boolean"
+                                },
+                                {
+                                  "type": "object",
+                                  "additionalProperties": {}
+                                },
+                                {
+                                  "type": "array",
+                                  "items": {}
                                 },
                                 {
                                   "type": "null"
@@ -8062,6 +8204,14 @@
                                 },
                                 {
                                   "type": "boolean"
+                                },
+                                {
+                                  "type": "object",
+                                  "additionalProperties": {}
+                                },
+                                {
+                                  "type": "array",
+                                  "items": {}
                                 },
                                 {
                                   "type": "null"
@@ -8350,6 +8500,14 @@
                                 },
                                 {
                                   "type": "boolean"
+                                },
+                                {
+                                  "type": "object",
+                                  "additionalProperties": {}
+                                },
+                                {
+                                  "type": "array",
+                                  "items": {}
                                 }
                               ]
                             }
@@ -8378,6 +8536,14 @@
                                   },
                                   {
                                     "type": "boolean"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                  },
+                                  {
+                                    "type": "array",
+                                    "items": {}
                                   }
                                 ]
                               }
@@ -8392,6 +8558,14 @@
                                 },
                                 {
                                   "type": "boolean"
+                                },
+                                {
+                                  "type": "object",
+                                  "additionalProperties": {}
+                                },
+                                {
+                                  "type": "array",
+                                  "items": {}
                                 },
                                 {
                                   "type": "null"
@@ -8423,6 +8597,14 @@
                                 },
                                 {
                                   "type": "boolean"
+                                },
+                                {
+                                  "type": "object",
+                                  "additionalProperties": {}
+                                },
+                                {
+                                  "type": "array",
+                                  "items": {}
                                 },
                                 {
                                   "type": "null"
@@ -15281,6 +15463,520 @@
           },
           "404": {
             "description": "Budget not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/used-by": {
+      "post": {
+        "summary": "Grant or revoke the 'used by' logo consent",
+        "description": "Records consent to show the organization's logo on agent-swarm.dev. A grant requires a valid contact email. It sends organization identity, contact details, and an optional quote to the proxy for manual review. This explicit admin action works when telemetry is off. A revoke clears the stored contact details and quote.",
+        "tags": [
+          "Telemetry"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "granted": {
+                    "type": "boolean"
+                  },
+                  "contactEmail": {
+                    "type": "string",
+                    "maxLength": 320,
+                    "format": "email"
+                  },
+                  "contactFunction": {
+                    "type": "string",
+                    "enum": [
+                      "engineer",
+                      "eng_lead",
+                      "founder",
+                      "product",
+                      "ops",
+                      "other"
+                    ]
+                  },
+                  "quote": {
+                    "type": "string",
+                    "maxLength": 280
+                  }
+                },
+                "required": [
+                  "granted"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Consent recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "granted": {
+                      "type": "boolean"
+                    },
+                    "changedAt": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "granted",
+                    "changedAt"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid contact details, or missing organization name or website",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Only a config admin can change the consent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The telemetry proxy did not accept the consent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ranking": {
+      "get": {
+        "summary": "Public ranking state",
+        "description": "Whether this install can join the public agent-swarm.dev ranking (telemetry on, organization name and website set), whether it is opted in, and its stored listing. Only a config admin can read it.",
+        "tags": [
+          "Telemetry"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ranking state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "eligible": {
+                      "type": "boolean"
+                    },
+                    "missing": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "SWARM_ORG_NAME",
+                          "SWARM_ORG_WEBSITE"
+                        ]
+                      }
+                    },
+                    "telemetryOn": {
+                      "type": "boolean"
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "name": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "domain": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "listing": {
+                      "type": [
+                        "object",
+                        "null"
+                      ],
+                      "properties": {
+                        "v": {
+                          "type": "number",
+                          "enum": [
+                            1
+                          ]
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "domain": {
+                          "type": "string"
+                        },
+                        "category": {
+                          "type": "string",
+                          "enum": [
+                            "engineering",
+                            "product",
+                            "marketing",
+                            "support",
+                            "operations",
+                            "other"
+                          ]
+                        },
+                        "subcategory": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "description": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sourceCodeUrl": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "updatedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "v",
+                        "name",
+                        "domain",
+                        "category",
+                        "subcategory",
+                        "description",
+                        "sourceCodeUrl",
+                        "updatedAt"
+                      ]
+                    },
+                    "listingMatchesDomain": {
+                      "type": "boolean"
+                    },
+                    "verifyUrl": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "eligible",
+                    "missing",
+                    "telemetryOn",
+                    "enabled",
+                    "name",
+                    "domain",
+                    "listing",
+                    "listingMatchesDomain",
+                    "verifyUrl"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Only a config admin can read the ranking state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ranking/opt-in": {
+      "post": {
+        "summary": "Opt this install into the public ranking",
+        "description": "Builds the telemetry_ranking listing from the organization name and website plus the chosen category, stores it, turns PUBLIC_RANKING_ENABLED on and sends ranking.opted_in. That is the whole opt-in: the install shows on agent-swarm.dev/ranking at the next hourly refresh.",
+        "tags": [
+          "Telemetry"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "category": {
+                    "type": "string",
+                    "enum": [
+                      "engineering",
+                      "product",
+                      "marketing",
+                      "support",
+                      "operations",
+                      "other"
+                    ]
+                  },
+                  "subcategory": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "description": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "sourceCodeUrl": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "category"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Opted in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "domain": {
+                      "type": "string"
+                    },
+                    "listing": {
+                      "type": "object",
+                      "properties": {
+                        "v": {
+                          "type": "number",
+                          "enum": [
+                            1
+                          ]
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "domain": {
+                          "type": "string"
+                        },
+                        "category": {
+                          "type": "string",
+                          "enum": [
+                            "engineering",
+                            "product",
+                            "marketing",
+                            "support",
+                            "operations",
+                            "other"
+                          ]
+                        },
+                        "subcategory": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "description": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sourceCodeUrl": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "updatedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "v",
+                        "name",
+                        "domain",
+                        "category",
+                        "subcategory",
+                        "description",
+                        "sourceCodeUrl",
+                        "updatedAt"
+                      ]
+                    },
+                    "verifyUrl": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "domain",
+                    "listing",
+                    "verifyUrl"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A listing field is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Only a config admin can opt in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "telemetry_off: telemetry is off or the install has no ID. org_identity_missing: the organization name or website is not set (`missing` lists which).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ranking/opt-out": {
+      "post": {
+        "summary": "Leave the public ranking",
+        "description": "Turns PUBLIC_RANKING_ENABLED off and sends ranking.opted_out, so workers stop sending ranking.usage. The install leaves agent-swarm.dev/ranking at the next hourly refresh.",
+        "tags": [
+          "Telemetry"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Opted out",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean",
+                      "enum": [
+                        false
+                      ]
+                    }
+                  },
+                  "required": [
+                    "enabled"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Only a config admin can opt out",
             "content": {
               "application/json": {
                 "schema": {
@@ -30646,7 +31342,7 @@
     "/api/tasks": {
       "get": {
         "summary": "List tasks with filters",
-        "description": "Returns tasks with the full `task` text replaced by a bounded `taskPreview` and completion/integration blobs dropped by default — list views only need the preview. Pass `fields=full` to restore the full `AgentTask`, or `fields=timeline` for the narrow shape the dashboard timeline draws. Fetch a single task in full via `GET /api/tasks/{id}`. `total` (the filtered row count, ignoring limit/offset) is computed only with `includeTotal=true`.",
+        "description": "Returns tasks with the full `task` text replaced by a bounded `taskPreview` and completion/integration blobs dropped by default — list views only need the preview. Pass `fields=full` to restore the full `AgentTask`, or `fields=timeline` for the narrow shape the dashboard timeline draws. Every shape gives a user caller only tasks of sessions they can read. Fetch a single task in full via `GET /api/tasks/{id}`. `total` (the filtered row count, ignoring limit/offset) is computed only with `includeTotal=true`.",
         "tags": [
           "Tasks"
         ],
@@ -32322,6 +33018,312 @@
                       ]
                     }
                   ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A user caller cannot read the task's session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Task not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}/lineage": {
+      "get": {
+        "summary": "Get the tree a task belongs to (ancestors and descendants)",
+        "description": "Follows `parentTaskId` up to the topmost ancestor, then returns every descendant of that root as slim task rows, the task's own subtree first. Bounded: at most 50 hops up, `maxDepth` levels down and about twice `maxNodes` rows; `truncated` is true when any task in the tree is missing from the response.",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            },
+            "required": false,
+            "name": "maxNodes",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 30
+            },
+            "required": false,
+            "name": "maxDepth",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The lineage tree as a flat list linked by `parentTaskId`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "rootTaskId": {
+                      "type": "string"
+                    },
+                    "tasks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "format": "uuid"
+                          },
+                          "key": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 255,
+                            "description": "Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form."
+                          },
+                          "agentId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "creatorAgentId": {
+                            "type": "string"
+                          },
+                          "task": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "draft",
+                              "backlog",
+                              "unassigned",
+                              "offered",
+                              "reviewing",
+                              "pending",
+                              "in_progress",
+                              "paused",
+                              "completed",
+                              "failed",
+                              "cancelled",
+                              "superseded"
+                            ]
+                          },
+                          "source": {
+                            "type": "string",
+                            "enum": [
+                              "mcp",
+                              "slack",
+                              "api",
+                              "ui",
+                              "github",
+                              "gitlab",
+                              "azure-devops",
+                              "agentmail",
+                              "system",
+                              "schedule",
+                              "workflow",
+                              "linear",
+                              "jira",
+                              "comb",
+                              "chat"
+                            ],
+                            "default": "mcp"
+                          },
+                          "taskType": {
+                            "type": "string",
+                            "maxLength": 50
+                          },
+                          "tags": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "default": []
+                          },
+                          "priority": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "default": 50
+                          },
+                          "dependsOn": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "default": []
+                          },
+                          "offeredTo": {
+                            "type": "string"
+                          },
+                          "acceptedAt": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "parentTaskId": {
+                            "type": "string"
+                          },
+                          "scheduleId": {
+                            "type": "string"
+                          },
+                          "model": {
+                            "type": "string"
+                          },
+                          "modelTier": {
+                            "type": "string",
+                            "enum": [
+                              "smol",
+                              "regular",
+                              "smart",
+                              "ultra"
+                            ]
+                          },
+                          "resolvedModel": {
+                            "type": "string"
+                          },
+                          "modelSource": {
+                            "type": "string"
+                          },
+                          "modelAlias": {
+                            "type": "string"
+                          },
+                          "effort": {
+                            "type": "string",
+                            "enum": [
+                              "off",
+                              "low",
+                              "medium",
+                              "high",
+                              "xhigh",
+                              "max"
+                            ]
+                          },
+                          "resolvedEffort": {
+                            "type": "string",
+                            "enum": [
+                              "off",
+                              "low",
+                              "medium",
+                              "high",
+                              "xhigh",
+                              "max"
+                            ]
+                          },
+                          "provider": {
+                            "type": "string",
+                            "enum": [
+                              "claude",
+                              "codex",
+                              "pi",
+                              "devin",
+                              "claude-managed",
+                              "opencode",
+                              "acp",
+                              "dsh",
+                              "amp",
+                              "cursor",
+                              "grok"
+                            ]
+                          },
+                          "requestedByUserId": {
+                            "type": "string"
+                          },
+                          "progress": {
+                            "type": "string"
+                          },
+                          "createdAt": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "lastUpdatedAt": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "finishedAt": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "peakContextPercent": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 100
+                          },
+                          "totalCostUsd": {
+                            "type": "number",
+                            "minimum": 0
+                          },
+                          "workflowRunId": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "key",
+                          "agentId",
+                          "task",
+                          "status",
+                          "createdAt",
+                          "lastUpdatedAt"
+                        ]
+                      }
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "rootTaskId",
+                    "tasks",
+                    "truncated"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A user caller cannot read the task's session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -36422,6 +37424,7 @@
     "/api/realtime/ticket": {
       "post": {
         "summary": "Issue a one-shot dashboard realtime ticket",
+        "description": "The ticket authorizes one dashboard socket for presence rooms: Comb drives (`comb.presence`) and sessions (`session.presence`). An operator-key tab's picked user (`X-Swarm-User-Id`) rides on the ticket so session presence can check that user's access.",
         "tags": [
           "Rooms"
         ],
@@ -36454,17 +37457,7 @@
             }
           },
           "403": {
-            "description": "Comb presence is not allowed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Comb is not enabled",
+            "description": "Presence is not allowed",
             "content": {
               "application/json": {
                 "schema": {
@@ -47167,6 +48160,18 @@
             "required": false,
             "name": "fields",
             "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "mine",
+                "shared"
+              ]
+            },
+            "required": false,
+            "name": "scope",
+            "in": "query"
           }
         ],
         "responses": {
@@ -47458,7 +48463,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Root task + chain (ordered by createdAt)",
+            "description": "Root task + chain (ordered by createdAt), plus the caller's `access` and the session `owner`",
             "content": {
               "application/json": {
                 "schema": {
@@ -47656,11 +48661,24 @@
                           }
                         ]
                       }
+                    },
+                    "access": {
+                      "type": "string",
+                      "enum": [
+                        "owner",
+                        "write",
+                        "read"
+                      ]
+                    },
+                    "owner": {
+                      "$ref": "#/components/schemas/SessionOwner"
                     }
                   },
                   "required": [
                     "root",
-                    "chain"
+                    "chain",
+                    "access",
+                    "owner"
                   ]
                 }
               }
@@ -47676,8 +48694,215 @@
               }
             }
           },
+          "403": {
+            "description": "The caller has no access to this session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Root task not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{rootTaskId}/shares": {
+      "get": {
+        "summary": "List a session's active shares",
+        "description": "Active shares only. `everyone` is the access every user has; `users` are per-person shares. A session with no shares is private to its owner.",
+        "tags": [
+          "Sessions"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "rootTaskId",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Active shares",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionShares"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller has no access to this session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Root task not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Set who can view or edit a session",
+        "description": "Owner only. The body is the full desired state: users left out lose access. Changed targets have their active share revoked and a new one inserted in one transaction; shares are never deleted.",
+        "tags": [
+          "Sessions"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "rootTaskId",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "everyone": {
+                    "type": "string",
+                    "enum": [
+                      "none",
+                      "read",
+                      "write"
+                    ]
+                  },
+                  "users": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "userId": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "access": {
+                          "type": "string",
+                          "enum": [
+                            "read",
+                            "write"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "userId",
+                        "access"
+                      ]
+                    },
+                    "maxItems": 500
+                  }
+                },
+                "required": [
+                  "everyone",
+                  "users"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Active shares after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionShares"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error or unknown user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Only the session owner can share it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Root task not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The session has no owner, so it is already open to everyone",
             "content": {
               "application/json": {
                 "schema": {
@@ -53420,7 +54645,8 @@
                     "type": "string",
                     "enum": [
                       "banner",
-                      "settings"
+                      "settings",
+                      "benchmark"
                     ],
                     "default": "banner"
                   }
@@ -54524,105 +55750,10 @@
         }
       }
     },
-    "/api/used-by": {
-      "post": {
-        "summary": "Grant or revoke the 'used by' logo consent",
-        "description": "Records whether agent-swarm.dev may show this organization's logo as a company that uses Agent Swarm. Sends the organization name and website to the telemetry proxy, where a person approves each logo by hand. An explicit admin action, so it is not gated by the telemetry opt-out.",
-        "tags": [
-          "Telemetry"
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "granted": {
-                    "type": "boolean"
-                  }
-                },
-                "required": [
-                  "granted"
-                ]
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Consent recorded",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "granted": {
-                      "type": "boolean"
-                    },
-                    "changedAt": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "granted",
-                    "changedAt"
-                  ]
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Organization name or website is not set (a revoke falls back to the identity of the last grant)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Only a config admin can change the consent",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "502": {
-            "description": "The telemetry proxy did not accept the consent",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/fleet-benchmark": {
       "get": {
         "summary": "Compare this swarm with similar swarms",
-        "description": "Places this swarm's tasks per week and task success rate (last 30 days) in the fleet percentiles published by the telemetry proxy, against swarms with the same agent count when enough exist. Needs telemetry on and an organization name; otherwise `state` says what is missing and the proxy is not called. `unavailable` also covers an install whose first event the proxy saw cannot be established locally (until 30 days after the first accepted event). The fleet numbers are cached for a day.",
+        "description": "Compares local task volume and success rate with fleet percentiles over the last 30 days. Comparisons require telemetry, an organization name, and a known proxy ingest date. A website, team size, and use case enable full comparisons with peer filters. The response includes the proxy's peer group when available. With telemetry off, it returns local DB counts without a proxy request. The fleet cache key includes the peer filters.",
         "tags": [
           "Telemetry"
         ],
@@ -54647,6 +55778,41 @@
                         "no_org_name",
                         "not_enough_tasks",
                         "unavailable"
+                      ]
+                    },
+                    "level": {
+                      "type": "string",
+                      "enum": [
+                        "basic",
+                        "full"
+                      ]
+                    },
+                    "peerGroup": {
+                      "type": [
+                        "object",
+                        "null"
+                      ],
+                      "properties": {
+                        "teamSize": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "useCase": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "orgs": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "teamSize",
+                        "useCase",
+                        "orgs"
                       ]
                     },
                     "local": {
@@ -54754,6 +55920,8 @@
                   },
                   "required": [
                     "state",
+                    "level",
+                    "peerGroup",
                     "local",
                     "minFinishedTasks",
                     "generatedAt",
@@ -55043,7 +56211,8 @@
                     "minLength": 1
                   },
                   "email": {
-                    "type": "string"
+                    "type": "string",
+                    "format": "email"
                   },
                   "role": {
                     "type": "string"
@@ -55823,7 +56992,11 @@
                     "minLength": 1
                   },
                   "email": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "format": "email"
                   },
                   "role": {
                     "type": "string"

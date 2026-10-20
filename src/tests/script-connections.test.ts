@@ -634,8 +634,10 @@ describe("script connections", () => {
       markMigrationApplied(database, "220_model_profiles.sql");
       // 227 alters inbox_item_state, which this migration-112-only fixture does not create.
       markMigrationApplied(database, "227_inbox_item_state_last_read_at.sql");
-      // 228 alters swarm_config, which this migration-112-only fixture does not create.
-      markMigrationApplied(database, "228_swarm_config_exposure.sql");
+      // 231 indexes agent_tasks columns that this fixture's id-only agent_tasks lacks.
+      markMigrationApplied(database, "231_slack_tasks_last_updated_index.sql");
+      // 234 alters swarm_config, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "234_swarm_config_exposure.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();

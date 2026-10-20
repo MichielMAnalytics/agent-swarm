@@ -408,6 +408,15 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
     icon: Cpu,
     entries: [
       {
+        key: "PR_ROOM_REPOS",
+        label: "PR room repositories",
+        description:
+          "Comma-separated owner/repo list requiring a PR room marker before Claude or Codex workers create a pull request.",
+        kind: "string",
+        defaultValue: "",
+        docsUrl: `${DOCS}ui/configuration#pr-rooms`,
+      },
+      {
         key: "RUNTIME_POOLS_ENABLED",
         label: "Runtime pools (beta)",
         description:
@@ -984,6 +993,16 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         kind: "number",
         defaultValue: "3",
         placeholder: "3",
+      },
+      {
+        key: "APPS_JSON_COLUMN_MAX_BYTES",
+        label: "App json column size cap",
+        description:
+          "Maximum serialized size in bytes of a Swarm Apps json column value or default. Default 262144 (256 KB); accepts 1024 through 16777216 (16 MB). Applies on the next config reload.",
+        kind: "number",
+        defaultValue: "262144",
+        placeholder: "262144",
+        docsUrl: `${DOCS}apps/concepts`,
       },
     ],
   },
@@ -1587,7 +1606,8 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
       {
         key: "SWARM_ORG_NAME",
         label: "Organization name",
-        description: "Name shown in the dashboard header, the status page, and outbound messages.",
+        description:
+          "Name shown in the dashboard header, the status page, and outbound messages. Required for the public ranking, which shows it as your listing's name.",
         kind: "string",
         defaultValue: "Swarm",
         placeholder: "Swarm",
@@ -1597,10 +1617,47 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "SWARM_ORG_WEBSITE",
         label: "Company website",
         description:
-          "Your company's website, stored as a bare hostname such as example.com. When the logo below is empty, the dashboard uses this site's logo. Sent with telemetry as org_website when telemetry is on.",
+          "Your company's website, stored as a bare hostname such as example.com. When the logo below is empty, the dashboard uses this site's logo. Sent with telemetry as org_website when telemetry is on. Required for the public ranking; changing it leaves the ranking until you click Get ranked again.",
         kind: "string",
         placeholder: "example.com",
         docsUrl: `${DOCS}reference/telemetry`,
+      },
+      {
+        key: "SWARM_ORG_TEAM_SIZE",
+        label: "Company team size",
+        description: "Company team size used to select peers for the fleet benchmark.",
+        kind: "enum",
+        options: ["1", "2-10", "11-50", "51+"],
+        defaultValue: "",
+        docsUrl: `${DOCS}ui/configuration#company-profile`,
+      },
+      {
+        key: "SWARM_ORG_USE_CASE",
+        label: "Primary use case",
+        description: "Primary use case used to select peers for the fleet benchmark.",
+        kind: "enum",
+        options: ["features", "bugs", "review", "ops", "docs", "data"],
+        defaultValue: "",
+        docsUrl: `${DOCS}ui/configuration#company-profile`,
+      },
+      {
+        key: "SWARM_ORG_ACQUISITION_SOURCE",
+        label: "How you heard about us",
+        description: "How your company discovered Agent Swarm. Leave empty if unknown.",
+        kind: "enum",
+        options: [
+          "search",
+          "github",
+          "social",
+          "colleague",
+          "newsletter",
+          "event",
+          "ai_assistant",
+          "hacker_news",
+          "other",
+        ],
+        defaultValue: "",
+        docsUrl: `${DOCS}ui/configuration#company-profile`,
       },
       {
         key: "SWARM_BRAND_COLOR",
