@@ -7,6 +7,7 @@ import {
   closeDb,
   completeTask,
   createAgent,
+  createScheduledTask,
   createTaskExtended,
   createUser,
   getDbClient,
@@ -24,6 +25,7 @@ import { formatChatRelayText, formatChatTaskTag } from "../integrations/chat-sdk
 import { CHAT_CHANNELS_NAMESPACE, routeChatMessage } from "../integrations/chat-sdk/router";
 import { getChatInstance } from "../integrations/chat-sdk/runtime";
 import { isChatThreadBuffered } from "../integrations/chat-sdk/thread-buffer";
+import { createStandaloneScheduleTask } from "../scheduler/schedule-task";
 import { chatSdkContextKey } from "../tasks/context-key";
 import { registerDeferTaskTool } from "../tools/defer-task";
 import type { Agent } from "../types";
@@ -305,6 +307,52 @@ describe("Chat SDK inbound pipeline", () => {
     expect(followUp?.dependsOn).toEqual([first!.id]);
     expect(followUp?.parentTaskId).toBe(first!.id);
     expect(followUp?.task).toContain("include the changelog");
+  });
+
+  test("a deferred wake-up is the thread's chat task: steering, a follow-up dependency and /cancel reach it", async () => {
+    await postTelegramUpdate(telegramUpdate(dm(2040), "check the deploy"));
+    await flushChatBuffers();
+    const [first] = await chatTasks(2040);
+    await completeTask(first!.id, "Deferred.", { deferredAt: new Date().toISOString() });
+    const schedule = await createScheduledTask({
+      name: `deferred-${first!.id.slice(0, 8)}-${crypto.randomUUID()}`,
+      taskTemplate: "Check the deploy and answer.",
+      targetType: "agent-task",
+      scheduleType: "one_time",
+      nextRunAt: new Date().toISOString(),
+      targetAgentId: lead.id,
+      createdByAgentId: lead.id,
+      taskType: "deferred",
+      parentTaskId: first!.id,
+    });
+    const wakeUp = await createStandaloneScheduleTask(schedule);
+    expect(wakeUp.source).toBe("schedule");
+    expect(wakeUp.contextKey).toBe(chatSdkContextKey("telegram:2040"));
+
+    // In progress: a plain message steers the wake-up.
+    await startTask(wakeUp.id);
+    await postTelegramUpdate(telegramUpdate(dm(2040), "use the staging cluster"));
+    await flushChatBuffers();
+    expect(await chatTasks(2040)).toHaveLength(1);
+    expect(await steeringRows(wakeUp.id)).toEqual([
+      { body: "use the staging cluster", source: "chat" },
+    ]);
+
+    // Pending: a new message becomes a follow-up that waits for it.
+    await getDbClient().run("UPDATE agent_tasks SET status = 'pending' WHERE id = ?", [wakeUp.id]);
+    await postTelegramUpdate(telegramUpdate(dm(2040), "and the canary"));
+    await flushChatBuffers();
+    const tasks = await chatTasks(2040);
+    expect(tasks).toHaveLength(2);
+    expect((await getTaskById(tasks[1]!.id))?.dependsOn).toEqual([wakeUp.id]);
+
+    // /cancel stops the follow-up and the wake-up.
+    const cancel = telegramUpdate(dm(2040), "/cancel", {
+      entities: [{ type: "bot_command", offset: 0, length: "/cancel".length }],
+    });
+    await postTelegramUpdate(cancel);
+    expect((await getTaskById(wakeUp.id))?.status).toBe("cancelled");
+    expect((await getTaskById(tasks[1]!.id))?.status).toBe("cancelled");
   });
 
   test("a document attachment becomes a task attachment and a [File: ...] line", async () => {
