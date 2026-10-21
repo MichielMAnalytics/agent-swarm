@@ -1,4 +1,4 @@
-import { createTaskExtended, getDbClient, getTaskById } from "@/be/db";
+import { createTaskExtended, getAgentById, getDbClient, getTaskById } from "@/be/db";
 import { carryUnhandledSteering } from "@/be/steering";
 import { chatThreadOfContextKey, scheduleContextKey } from "@/tasks/context-key";
 import {
@@ -8,14 +8,42 @@ import {
 import type { AgentTask, ScheduledTask } from "@/types";
 
 /**
+ * Whether the task's own answer is posted to its chat thread. Mirrors the
+ * relay triggers (migration 235): a delegated worker task, or its resume,
+ * reports through the Lead follow-up instead.
+ */
+async function answersInChat(task: AgentTask): Promise<boolean> {
+  if (task.source === "chat") return true;
+  if (task.source === "system" && task.taskType === "follow-up") return true;
+  // Only a wake-up that passed `scheduleTaskContextKey` has a chat key.
+  if (task.source === "schedule" && task.taskType === "deferred") return true;
+  if (task.source === "system" && task.taskType === "resume" && task.agentId) {
+    return (await getAgentById(task.agentId))?.isLead === true;
+  }
+  return false;
+}
+
+/**
  * A defer-task wake-up of a chat task stays in its chat thread, so the chat
  * relay posts the real answer there (and `/status` and `/cancel` see it).
- * Every other firing gets the schedule's own key.
+ * Only the deferring agent continuing its own task gets the thread: a schedule
+ * re-targeted or re-owned after the deferral, or the deferral of a task that
+ * never answered in chat, fires like any other schedule. Every other firing
+ * gets the schedule's own key.
  */
 async function scheduleTaskContextKey(schedule: ScheduledTask): Promise<string> {
   if (schedule.taskType === "deferred" && schedule.parentTaskId) {
-    const parentKey = (await getTaskById(schedule.parentTaskId))?.contextKey;
-    if (parentKey && chatThreadOfContextKey(parentKey)) return parentKey;
+    const parent = await getTaskById(schedule.parentTaskId);
+    if (
+      parent?.contextKey &&
+      chatThreadOfContextKey(parent.contextKey) &&
+      parent.agentId &&
+      schedule.targetAgentId === parent.agentId &&
+      schedule.createdByAgentId === parent.agentId &&
+      (await answersInChat(parent))
+    ) {
+      return parent.contextKey;
+    }
   }
   return scheduleContextKey({ scheduleId: schedule.id });
 }

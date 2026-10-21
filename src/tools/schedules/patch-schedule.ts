@@ -174,6 +174,19 @@ export const registerPatchScheduleTool = (server: McpServer) => {
         return toolErr("Agent not found.");
       }
 
+      // A deferral continues its owner's task, in that task's chat thread when
+      // it has one (src/scheduler/schedule-task.ts). Only the owner or a lead
+      // may change it.
+      if (
+        schedule.taskType === "deferred" &&
+        schedule.createdByAgentId !== caller.id &&
+        !caller.isLead
+      ) {
+        return toolErr(
+          `Schedule "${schedule.name}" defers another agent's task. Only that agent or a lead can change it.`,
+        );
+      }
+
       // Reject updates on completed one-time schedules
       if (schedule.scheduleType === "one_time" && !schedule.enabled && schedule.lastRunAt) {
         return toolErr(

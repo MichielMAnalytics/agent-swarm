@@ -6,7 +6,10 @@
 --    transaction, so this trigger drops the obligation before it commits.
 -- 2. The wake-up task (`source='schedule'`, `taskType='deferred'`) keeps the
 --    chat contextKey of the task it continues (src/scheduler/schedule-task.ts),
---    and relays like a chat task: it carries the real answer.
+--    and relays like a chat task: it carries the real answer. The scheduler
+--    grants the key only to the deferring agent continuing a task that itself
+--    answered in chat; the triggers also require that the wake-up runs as the
+--    same agent on the same thread as its parent.
 
 CREATE TRIGGER drop_chat_relay_on_defer
 AFTER UPDATE OF deferredAt ON agent_tasks
@@ -33,7 +36,16 @@ WHEN OLD.status NOT IN ('completed', 'failed', 'cancelled', 'superseded')
   AND (
     NEW.source = 'chat'
     OR (NEW.source = 'system' AND NEW.taskType = 'follow-up')
-    OR (NEW.source = 'schedule' AND NEW.taskType = 'deferred')
+    OR (
+      NEW.source = 'schedule'
+      AND NEW.taskType = 'deferred'
+      AND EXISTS (
+        SELECT 1 FROM agent_tasks parent
+        WHERE parent.id = NEW.parentTaskId
+          AND parent.agentId = NEW.agentId
+          AND parent.contextKey = NEW.contextKey
+      )
+    )
     OR (
       NEW.source = 'system'
       AND NEW.taskType = 'resume'
@@ -52,7 +64,16 @@ WHEN NEW.status IN ('completed', 'failed', 'cancelled')
   AND (
     NEW.source = 'chat'
     OR (NEW.source = 'system' AND NEW.taskType = 'follow-up')
-    OR (NEW.source = 'schedule' AND NEW.taskType = 'deferred')
+    OR (
+      NEW.source = 'schedule'
+      AND NEW.taskType = 'deferred'
+      AND EXISTS (
+        SELECT 1 FROM agent_tasks parent
+        WHERE parent.id = NEW.parentTaskId
+          AND parent.agentId = NEW.agentId
+          AND parent.contextKey = NEW.contextKey
+      )
+    )
     OR (
       NEW.source = 'system'
       AND NEW.taskType = 'resume'
