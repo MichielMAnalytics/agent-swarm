@@ -40005,6 +40005,16 @@
               }
             }
           },
+          "403": {
+            "description": "Deferral owned by another agent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Schedule not found",
             "content": {
@@ -40391,6 +40401,16 @@
           },
           "400": {
             "description": "Validation error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Deferral owned by another agent",
             "content": {
               "application/json": {
                 "schema": {
