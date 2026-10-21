@@ -76,6 +76,10 @@ export class SwarmScriptExecutor extends BaseExecutor<
   readonly configSchema = SwarmScriptConfigSchema;
   readonly outputSchema = SwarmScriptOutputSchema;
 
+  override runsCallerCode(): boolean {
+    return true;
+  }
+
   protected async execute(
     config: SwarmScriptConfig,
     context: Readonly<Record<string, unknown>>,

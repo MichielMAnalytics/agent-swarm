@@ -77,6 +77,10 @@ export class ScriptExecutor extends BaseExecutor<
   readonly configSchema = ScriptConfigSchema;
   readonly outputSchema = ScriptOutputSchema;
 
+  override runsCallerCode(): boolean {
+    return true;
+  }
+
   protected async execute(
     config: z.infer<typeof ScriptConfigSchema>,
     _context: Readonly<Record<string, unknown>>,

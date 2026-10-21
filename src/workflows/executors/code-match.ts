@@ -38,6 +38,11 @@ export class CodeMatchExecutor extends BaseExecutor<
   readonly configSchema = CodeMatchConfigSchema;
   readonly outputSchema = CodeMatchOutputSchema;
 
+  /** `code` is compiled with `new Function` in the API process. */
+  override runsCallerCode(): boolean {
+    return true;
+  }
+
   protected async execute(
     config: z.infer<typeof CodeMatchConfigSchema>,
     context: Readonly<Record<string, unknown>>,

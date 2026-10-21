@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { z } from "zod";
 import { closeDb, initDb } from "../be/db";
+import { definitionDispatchesScript } from "../http/script-author-gate";
 import type { ExecutorMeta, WorkflowDefinition } from "../types";
 import {
   findEntryNodes,
@@ -15,7 +16,7 @@ import {
   type ExecutorInput,
   type ExecutorResult,
 } from "../workflows/executors/base";
-import { ExecutorRegistry } from "../workflows/executors/registry";
+import { createExecutorRegistry, ExecutorRegistry } from "../workflows/executors/registry";
 import { SwarmScriptExecutor } from "../workflows/executors/swarm-script";
 
 const TEST_DB_PATH = "./test-workflow-registry.sqlite";
@@ -143,6 +144,65 @@ describe("Workflow Registry & Definition (Phase 1)", () => {
     test("has() returns false for unknown type", () => {
       const registry = new ExecutorRegistry();
       expect(registry.has("nonexistent")).toBe(false);
+    });
+
+    // A new executor fails this test until it declares whether it runs caller code, which
+    // decides whether saving or triggering it needs script.author.
+    test("every built-in executor declares whether it runs caller code", () => {
+      const registry = createExecutorRegistry(mockDeps);
+      const classification = Object.fromEntries(
+        registry.types().map((type) => [type, registry.get(type).runsCallerCode({})]),
+      );
+      expect(classification).toEqual({
+        "property-match": false,
+        "code-match": true,
+        notify: false,
+        "raw-llm": false,
+        "system-one-decision": false,
+        "system-one-extraction": false,
+        script: true,
+        "swarm-script": true,
+        vcs: false,
+        validate: false,
+        "agent-task": false,
+        foreach: false,
+        "human-in-the-loop": false,
+        wait: false,
+        "sub-workflow": false,
+      });
+      const wait = registry.get("wait");
+      expect(wait.runsCallerCode({ mode: "event", filter: "(p) => true" })).toBe(true);
+      expect(wait.runsCallerCode({ mode: "event", filter: { status: "completed" } })).toBe(false);
+    });
+
+    test("the script-author predicate finds caller code anywhere in a definition", async () => {
+      const notify = { id: "n", type: "notify", config: { channel: "swarm", template: "hi" } };
+      const scriptValidation = { executor: "script", config: { runtime: "bash", script: "true" } };
+      const dispatches = (nodes: unknown[]) =>
+        definitionDispatchesScript({ nodes } as WorkflowDefinition);
+
+      expect(await dispatches([notify])).toBe(false);
+      expect(await dispatches([{ ...notify, validation: { config: { schema: {} } } }])).toBe(false);
+      expect(await dispatches([{ ...notify, validation: scriptValidation }])).toBe(true);
+      expect(
+        await dispatches([
+          { ...notify, validation: { executor: "code-match", config: { code: "() => true" } } },
+        ]),
+      ).toBe(true);
+      // A validation nested in a foreach body.
+      expect(
+        await dispatches([
+          {
+            id: "f",
+            type: "foreach",
+            config: {
+              over: [],
+              itemKey: "id",
+              body: { type: "agent-task", config: { validation: scriptValidation } },
+            },
+          },
+        ]),
+      ).toBe(true);
     });
   });
 

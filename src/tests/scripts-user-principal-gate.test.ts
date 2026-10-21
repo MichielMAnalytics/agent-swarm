@@ -422,6 +422,91 @@ describe("script.author gate for user principals", () => {
       }
     });
 
+    describe("validations and nodes that compile caller code", () => {
+      const cases: Array<{ name: string; patch: Record<string, unknown> }> = [
+        {
+          name: "a script step validation",
+          patch: {
+            validation: { executor: "script", config: { runtime: "bash", script: "true" } },
+          },
+        },
+        {
+          name: "a swarm-script step validation",
+          patch: {
+            validation: { executor: "swarm-script", config: { scriptName: "gate-api-target" } },
+          },
+        },
+        {
+          name: "a code-match node",
+          patch: {
+            type: "code-match",
+            config: { code: "(input) => true", outputPorts: ["true"] },
+          },
+        },
+      ];
+
+      for (const { name, patch } of cases) {
+        const node = { ...NOTIFY_NODE, ...patch };
+        const patchNode = async (bearer: string) => {
+          const target = await workflowId([NOTIFY_NODE]);
+          const res = await send("PATCH", `/api/workflows/${target}/nodes/n`, bearer, patch);
+          return { res, target };
+        };
+
+        test(`create: ${name} needs script.author`, async () => {
+          const denied = await createWorkflow(defaultUserToken, [node]);
+          expect(denied.status).toBe(403);
+          expect(denied.body.error).toContain("script.author");
+        });
+
+        test(`node patch: ${name} needs script.author`, async () => {
+          const { res, target } = await patchNode(defaultUserToken);
+          expect(res.status).toBe(403);
+          const unchanged = await api(server.base, "GET", `/api/workflows/${target}`);
+          expect(unchanged.body.definition.nodes).toEqual([NOTIFY_NODE]);
+        });
+
+        test(`trigger: ${name} needs script.author`, async () => {
+          const saved = await workflowId([node]);
+          const refused = await send("POST", `/api/workflows/${saved}/trigger`, defaultUserToken);
+          expect(refused.status).toBe(403);
+          expect(refused.body.runId).toBeUndefined();
+        });
+
+        test(`${name}: operator key and agent token keep every path (positive controls)`, async () => {
+          const saved = await workflowId([node]);
+          for (const bearer of [E2E_API_KEY, agentToken]) {
+            expect((await createWorkflow(bearer, [node])).status).toBe(201);
+            expect((await patchNode(bearer)).res.status).toBe(200);
+            expect((await send("POST", `/api/workflows/${saved}/trigger`, bearer)).status).toBe(
+              201,
+            );
+          }
+        });
+      }
+
+      test("a wait node needs script.author only for a string filter", async () => {
+        const waitNode = (filter: unknown) => ({
+          id: "w",
+          type: "wait",
+          config: { mode: "event", eventName: "task.completed", filter },
+        });
+        const stringFilter = await createWorkflow(defaultUserToken, [
+          waitNode("(payload) => true"),
+        ]);
+        expect(stringFilter.status).toBe(403);
+        expect(stringFilter.body.error).toContain("script.author");
+
+        // An object filter is matched as data, so it stays open.
+        expect(
+          (await createWorkflow(defaultUserToken, [waitNode({ status: "completed" })])).status,
+        ).toBe(201);
+        expect((await createWorkflow(E2E_API_KEY, [waitNode("(payload) => true")])).status).toBe(
+          201,
+        );
+      });
+    });
+
     test("schedules that run script code need script.author", async () => {
       const scriptTarget = { targetType: "script", scriptName: "gate-scheduled-script" };
       const denied = await createSchedule(defaultUserToken, scriptTarget);

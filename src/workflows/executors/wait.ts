@@ -62,6 +62,15 @@ export class WaitExecutor extends BaseExecutor<typeof WaitConfigSchema, typeof W
   readonly configSchema = WaitConfigSchema;
   readonly outputSchema = WaitOutputSchema;
 
+  /** A string `filter` is compiled with `new Function` in the API process; an object filter is data. */
+  override runsCallerCode(config: unknown): boolean {
+    return (
+      !!config &&
+      typeof config === "object" &&
+      typeof (config as { filter?: unknown }).filter === "string"
+    );
+  }
+
   protected async execute(
     config: WaitConfig,
     _context: Readonly<Record<string, unknown>>,

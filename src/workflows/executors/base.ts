@@ -90,6 +90,16 @@ export abstract class BaseExecutor<
   }
 
   /**
+   * Whether a node (or step validation) with this raw config runs code the workflow author
+   * supplied: a script, a stored swarm script, or JS compiled from config. Saving or triggering
+   * such a workflow needs `script.author` (`src/http/script-author-gate.ts`). Override this in
+   * any executor that evaluates caller code; `workflow-registry.test.ts` pins every built-in.
+   */
+  runsCallerCode(_config: unknown): boolean {
+    return false;
+  }
+
+  /**
    * An executor that parks its step on a human-in-the-loop approval decides the
    * step's output and port once a person answers. `parkedOutput` is the step
    * output it stored before it parked. Return null to keep the default: the
