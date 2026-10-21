@@ -15,6 +15,7 @@ import {
 import { explicitModelErrorForAgent } from "@/be/model-validation";
 import { mergeScheduleTiming, validateRecurringTiming } from "@/be/schedules/validate";
 import { getScript } from "@/be/scripts/db";
+import { can } from "@/rbac";
 import { calculateNextRun } from "@/scheduler";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 import {
@@ -179,8 +180,12 @@ export const registerPatchScheduleTool = (server: McpServer) => {
       // may change it.
       if (
         schedule.taskType === "deferred" &&
-        schedule.createdByAgentId !== caller.id &&
-        !caller.isLead
+        !can({
+          principal: { kind: "agent", agentId: caller.id, isLead: caller.isLead },
+          verb: "schedule.deferral.update.any",
+          resource: { kind: "owned", ownerAgentId: schedule.createdByAgentId },
+          source: "mcp",
+        }).allow
       ) {
         return toolErr(
           `Schedule "${schedule.name}" defers another agent's task. Only that agent or a lead can change it.`,
