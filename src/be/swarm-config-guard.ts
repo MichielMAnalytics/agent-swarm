@@ -1,8 +1,14 @@
 import { validateChatSdkAdaptersValue } from "../integrations/chat-sdk/schema";
+import { parseTelemetryRanking, TELEMETRY_RANKING_KEY } from "../ranking/telemetry-ranking";
 import { validateQuickJSPoolSize } from "../scripts-runtime/executors/quickjs-pool-config";
 import { normalizeSlackReactionShortcode } from "../slack/reaction-shortcode";
 import { ProviderNameSchema } from "../types";
 import { API_DRAIN_MAX_MS_LIMIT } from "../utils/api-drain";
+import {
+  COMPANY_ACQUISITION_SOURCES,
+  COMPANY_TEAM_SIZES,
+  COMPANY_USE_CASES,
+} from "../utils/company-profile";
 import { envExportRestrictedError, isEnvExportRestrictedKey } from "../utils/config-env-export";
 import { validateEgressAllowlist } from "../utils/egress-guard";
 import { parseEnabledTools } from "../utils/enabled-tools";
@@ -62,22 +68,35 @@ const RESERVED_KEYS = new Set([
 // the agent-fs bootstrap admin key would let a compromised worker administer the
 // shared org. The API materializes these into its own process.env at boot via
 // getInjectableGlobalConfigs, so no HTTP consumer legitimately needs them.
-const API_ONLY_CONFIG_KEYS = new Set(["API_AGENT_FS_API_KEY", "SLACK_SIGNING_SECRET"]);
+const API_ONLY_CONFIG_KEYS = new Set([
+  "API_AGENT_FS_API_KEY",
+  "SLACK_SIGNING_SECRET",
+  "TRANSCRIPTION_API_KEY",
+]);
 
 export function isApiOnlyConfigKey(key: string): boolean {
   return API_ONLY_CONFIG_KEYS.has(key);
 }
 
 /** Config rows owned by dedicated API surfaces, not the generic config API. */
-export const INTERNAL_CONFIG_KEYS = new Set(["onboarding_state", "runtime_owner_id"]);
+export const INTERNAL_CONFIG_KEYS = new Set([
+  "onboarding_state",
+  "runtime_owner_id",
+  TELEMETRY_RANKING_KEY,
+]);
 
 export function isInternalConfigKey(key: string): boolean {
   return INTERNAL_CONFIG_KEYS.has(key.toLowerCase());
 }
 
 export function internalConfigKeyError(key: string): Error {
+  const lower = key.toLowerCase();
   const owner =
-    key.toLowerCase() === "runtime_owner_id" ? "the runtime supervisor" : "/api/onboarding";
+    lower === "runtime_owner_id"
+      ? "the runtime supervisor"
+      : lower === TELEMETRY_RANKING_KEY
+        ? "/api/ranking"
+        : "/api/onboarding";
   return new Error(`Key '${key}' is managed by ${owner}`);
 }
 
@@ -124,6 +143,41 @@ export const DB_RETENTION_TUNING_BOUNDS = {
   DB_RETENTION_MAX_STATEMENT_MS: { min: 25, max: 5_000 },
 } as const;
 
+/**
+ * Bounds for the Swarm Apps json column size cap (`APPS_JSON_COLUMN_MAX_BYTES`).
+ *
+ * `src/apps/definition.ts` reads the knob against exactly these at call time
+ * and falls back to its 256 KB default outside them; VALIDATED_KEYS below
+ * rejects out-of-range writes with the same numbers, so the config API cannot
+ * accept a cap the row store would silently ignore.
+ */
+export const APPS_JSON_COLUMN_MAX_BYTES_BOUNDS = { min: 1_024, max: 16_777_216 } as const;
+
+/**
+ * Bounds for the Codex OAuth keep-warm age threshold
+ * (`CODEX_OAUTH_KEEP_WARM_MAX_AGE_HOURS`).
+ *
+ * `src/http/codex-oauth-keep-warm.ts` reads the knob against exactly these at
+ * call time and falls back to its default outside them. The 216 h (9 day)
+ * ceiling stays under the 9.5 day point where task-time near-expiry refresh
+ * takes over, so every accepted value still changes when a slot refreshes.
+ */
+export const CODEX_OAUTH_KEEP_WARM_MAX_AGE_HOURS_BOUNDS = { min: 1, max: 216 } as const;
+
+/**
+ * Decision hosts `SYSTEM_ONE_DEFAULT_PROVIDER` may name: `SYSTEM_ONE_PROVIDER_IDS`
+ * in `src/workflows/executors/system-one-providers.ts`, listed here because that
+ * module's credential readers would pull the LLM stack into every `db.ts` import.
+ * A test keeps the two lists equal.
+ */
+export const SYSTEM_ONE_DEFAULT_PROVIDER_OPTIONS = [
+  "typesafe",
+  "openrouter",
+  "laya",
+  "openai",
+  "cloudflare",
+] as const;
+
 /** Build `{ KEY: validator }` entries accepting only boolean literals. */
 function booleanValidators(keys: string[]): Record<string, ConfigValidator> {
   const message = (key: string) =>
@@ -141,7 +195,8 @@ function booleanValidators(keys: string[]): Record<string, ConfigValidator> {
 
 /** Build a single `{ KEY: validator }` entry restricted to `options`. */
 function enumValidator(key: string, options: string[]): Record<string, ConfigValidator> {
-  const message = `Invalid ${key} value (must be one of: ${options.join(", ")})`;
+  const listed = options.filter(Boolean).join(", ");
+  const message = `Invalid ${key} value (must be one of: ${listed}${options.includes("") ? ", or empty" : ""})`;
   return {
     [key]: (value: unknown) => {
       if (typeof value !== "string") return message;
@@ -301,6 +356,16 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
       return "Invalid TASK_TOOL_MANIFESTS (expected JSON with taskTypes and/or schedules maps, each selecting at most 16 known swarm tools)";
     }
   },
+  // Owned by /api/ranking (an internal key); parsed here as defense in depth.
+  [TELEMETRY_RANKING_KEY.toUpperCase()]: (value) => {
+    try {
+      if (typeof value !== "string") throw new Error("Expected JSON string");
+      parseTelemetryRanking(value);
+      return null;
+    } catch {
+      return "Invalid telemetry_ranking (expected the v1 ranking listing JSON)";
+    }
+  },
   // MCP tool allowlist: comma-separated names or a JSON array of strings.
   // Unknown names are accepted here and warned about at session init.
   SWARM_ENABLED_TOOLS: (value) => {
@@ -352,6 +417,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   },
   ...enumValidator("CLAUDE_TRANSPORT", ["cli", "sdk"]),
   ...enumValidator("SCRIPT_EXECUTOR", ["native", "quickjs"]),
+  ...enumValidator("TRANSCRIPTION_PROVIDER", ["openai", "elevenlabs"]),
   SCRIPT_QUICKJS_POOL_SIZE: validateQuickJSPoolSize,
   // Native script sandbox uids. The base must stay clear of system uids, so
   // the shared workflow uid (base - 1) is never root.
@@ -376,6 +442,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   // model's weekly window (Fable/Opus/Sonnet). fallback: legacy random pick.
   ...enumValidator("MODEL_WINDOW_EXHAUSTED_POLICY", ["fail", "fallback"]),
   ...enumValidator("HEARTBEAT_CHECKLIST_GATE_MODE", ["shadow", "enforce"]),
+  ...enumValidator("SYSTEM_ONE_DEFAULT_PROVIDER", [...SYSTEM_ONE_DEFAULT_PROVIDER_OPTIONS]),
   // Codex credits-exhausted cooldown (ms). Permissive on range here (positive
   // integer) — the worker clamps to [5m, 7d] via resolveCodexCreditsExhaustedCooldownMs.
   CODEX_CREDITS_EXHAUSTED_COOLDOWN_MS: (value) => {
@@ -419,8 +486,12 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
       ? null
       : "Invalid SWARM_ORG_WEBSITE (must be a public hostname such as example.com, without scheme, www, path or port)";
   },
+  ...enumValidator("SWARM_ORG_TEAM_SIZE", ["", ...COMPANY_TEAM_SIZES]),
+  ...enumValidator("SWARM_ORG_USE_CASE", ["", ...COMPANY_USE_CASES]),
+  ...enumValidator("SWARM_ORG_ACQUISITION_SOURCE", ["", ...COMPANY_ACQUISITION_SOURCES]),
   ...booleanValidators([
     "SWARM_USED_BY_CONSENT",
+    "PUBLIC_RANKING_ENABLED",
     "SWARM_DEV_MODE",
     "MULTI_RUNTIME_ENABLED",
     "STEERING_ENABLED",
@@ -516,6 +587,16 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   // sweep keep running for the default 30000ms.
   ...boundedIntegerValidatorsFor(DB_RETENTION_TUNING_BOUNDS),
   ...boundedIntegerValidators(
+    ["APPS_JSON_COLUMN_MAX_BYTES"],
+    APPS_JSON_COLUMN_MAX_BYTES_BOUNDS.min,
+    APPS_JSON_COLUMN_MAX_BYTES_BOUNDS.max,
+  ),
+  ...boundedIntegerValidators(
+    ["CODEX_OAUTH_KEEP_WARM_MAX_AGE_HOURS"],
+    CODEX_OAUTH_KEEP_WARM_MAX_AGE_HOURS_BOUNDS.min,
+    CODEX_OAUTH_KEEP_WARM_MAX_AGE_HOURS_BOUNDS.max,
+  ),
+  ...boundedIntegerValidators(
     [
       "SESSION_LOG_RETENTION_DAYS",
       "AGENT_LOG_RETENTION_DAYS",
@@ -539,6 +620,9 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   // default in thread-buffer.ts; above 10 minutes a
   // reply waits longer than any operator expects.
   ...boundedIntegerValidators(["CHAT_SDK_BUFFER_MS"], 1, 600_000),
+  // Minutes a Chat SDK thread keeps its owner after the owner's task ends.
+  // 0 keeps it only while the task is open; a day is the longest useful window.
+  ...boundedIntegerValidators(["CHAT_SDK_OWNER_WINDOW_MIN"], 0, 1440),
   // Below ~100 tokens the preamble can't fit a useful summary; above 20000
   // (~80k chars) it risks the SIGTERM-143 context-saturation failure mode
   // the cap exists to prevent (see context-preamble.ts).

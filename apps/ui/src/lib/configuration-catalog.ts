@@ -374,7 +374,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "HEARTBEAT_CHECKLIST_GATE_SCRIPT",
         label: "Checklist gate script",
         description:
-          "Name of a global script run as the Lead before each recurring checklist task. It returns { quiet: boolean, reason?, summary? }. A failure, a timeout (60s, credential setup included), or any other shape never skips a task. Unset runs the built-in heartbeat-jev-gate when a global TYPESAFE_API_KEY or OPENROUTER_API_KEY is set. Set off to turn the gate off.",
+          "Name of a global script run as the Lead before each recurring checklist task. It returns { quiet: boolean, reason?, summary? }. A failure, a timeout (60s, credential setup included), or any other shape never skips a task. Unset runs the built-in heartbeat-jev-gate when a global TYPESAFE_API_KEY or OPENROUTER_API_KEY is set, or CLOUDFLARE_API_TOKEN (or CLOUDFLARE_API_KEY) with CLOUDFLARE_ACCOUNT_ID. Set off to turn the gate off.",
         kind: "string",
         defaultValue: "",
         placeholder: "heartbeat-jev-gate",
@@ -407,6 +407,26 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
       "The tool surface exposed to workers, plus the model gateway they route through. Provider and model selection are configured per agent, not here — anything set globally would become the default for EVERY agent, so those knobs are deliberately left to each agent's own configuration. The gateway base URL is the exception: it is a deployment-wide routing endpoint, not a model choice.",
     icon: Cpu,
     entries: [
+      {
+        key: "PR_ROOM_REPOS",
+        label: "PR room repositories",
+        description:
+          "Comma-separated owner/repo list requiring a PR room marker before Claude or Codex workers create a pull request.",
+        kind: "string",
+        defaultValue: "",
+        docsUrl: `${DOCS}ui/configuration#pr-rooms`,
+      },
+      {
+        key: "CODEX_OAUTH_KEEP_WARM_MAX_AGE_HOURS",
+        label: "Codex OAuth keep-warm age",
+        description:
+          "The Codex keep-warm sweep refreshes a ChatGPT pool slot once its token is older than this. Accepts 1 to 216.",
+        kind: "number",
+        unit: "h",
+        defaultValue: "120",
+        placeholder: "120",
+        docsUrl: `${DOCS}ui/configuration#codex-oauth-keep-warm`,
+      },
       {
         key: "RUNTIME_POOLS_ENABLED",
         label: "Runtime pools (beta)",
@@ -985,6 +1005,16 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         defaultValue: "3",
         placeholder: "3",
       },
+      {
+        key: "APPS_JSON_COLUMN_MAX_BYTES",
+        label: "App json column size cap",
+        description:
+          "Maximum serialized size in bytes of a Swarm Apps json column value or default. Default 262144 (256 KB); accepts 1024 through 16777216 (16 MB). Applies on the next config reload.",
+        kind: "number",
+        defaultValue: "262144",
+        placeholder: "262144",
+        docsUrl: `${DOCS}apps/concepts`,
+      },
     ],
   },
   {
@@ -1223,6 +1253,50 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         docsUrl: `${DOCS}integrations/chat-sdk`,
       },
       {
+        key: "CHAT_SDK_OWNER_WINDOW_MIN",
+        label: "Chat SDK owner window",
+        description:
+          "Telegram groups only: how long after a chat task ends the group still routes follow-ups to the same agent, and the requester's plain messages still count. 0 keeps it only while the task is open. DMs and other adapters' threads keep their owner.",
+        kind: "number",
+        unit: "min",
+        defaultValue: "15",
+        placeholder: "15",
+        docsUrl: `${DOCS}integrations/chat-sdk`,
+      },
+      {
+        key: "TRANSCRIPTION_PROVIDER",
+        label: "Transcription provider",
+        description:
+          "Request shape for voice-note transcription. openai covers OpenAI, Groq and self-hosted whisper; elevenlabs is ElevenLabs speech-to-text. Transcription stays off until the TRANSCRIPTION_API_KEY secret is set. Applies to the next voice note.",
+        kind: "enum",
+        options: ["openai", "elevenlabs"],
+        defaultValue: "openai",
+        restartRequired: false,
+        docsUrl: `${DOCS}integrations/chat-sdk#voice-notes`,
+      },
+      {
+        key: "TRANSCRIPTION_BASE_URL",
+        label: "Transcription base URL",
+        description:
+          "Base URL of the transcription service. Empty uses the provider's default: https://api.openai.com/v1 for openai, https://api.elevenlabs.io/v1 for elevenlabs.",
+        kind: "string",
+        defaultValue: "",
+        placeholder: "https://api.openai.com/v1",
+        restartRequired: false,
+        docsUrl: `${DOCS}integrations/chat-sdk#voice-notes`,
+      },
+      {
+        key: "TRANSCRIPTION_MODEL",
+        label: "Transcription model",
+        description:
+          "Model name sent to the transcription service. Empty uses the provider's default: whisper-1 for openai, scribe_v2 for elevenlabs.",
+        kind: "string",
+        defaultValue: "",
+        placeholder: "whisper-1",
+        restartRequired: false,
+        docsUrl: `${DOCS}integrations/chat-sdk#voice-notes`,
+      },
+      {
         key: "ADDITIVE_SLACK",
         label: "Additive Slack mode",
         description:
@@ -1433,6 +1507,16 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         restartRequired: true,
       },
       {
+        key: "SYSTEM_ONE_DEFAULT_PROVIDER",
+        label: "Default SystemOne provider",
+        description:
+          "Decision host for a system-one-decision node or system-one-decide call that names no provider: typesafe or openrouter (Jev), cloudflare (Clef), laya, or openai. A node that names its provider keeps it. Each host needs its own credential on the Secrets page; cloudflare also needs CLOUDFLARE_ACCOUNT_ID. Applies to the next decision, with no workflow edit.",
+        kind: "enum",
+        options: ["typesafe", "openrouter", "cloudflare", "laya", "openai"],
+        defaultValue: "typesafe",
+        docsUrl: `${DOCS}concepts/workflows`,
+      },
+      {
         key: "SCRIPT_EXECUTOR",
         label: "Script executor",
         description:
@@ -1617,7 +1701,8 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
       {
         key: "SWARM_ORG_NAME",
         label: "Organization name",
-        description: "Name shown in the dashboard header, the status page, and outbound messages.",
+        description:
+          "Name shown in the dashboard header, the status page, and outbound messages. Required for the public ranking, which shows it as your listing's name.",
         kind: "string",
         defaultValue: "Swarm",
         placeholder: "Swarm",
@@ -1627,10 +1712,47 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "SWARM_ORG_WEBSITE",
         label: "Company website",
         description:
-          "Your company's website, stored as a bare hostname such as example.com. When the logo below is empty, the dashboard uses this site's logo. Sent with telemetry as org_website when telemetry is on.",
+          "Your company's website, stored as a bare hostname such as example.com. When the logo below is empty, the dashboard uses this site's logo. Sent with telemetry as org_website when telemetry is on. Required for the public ranking; changing it leaves the ranking until you click Get ranked again.",
         kind: "string",
         placeholder: "example.com",
         docsUrl: `${DOCS}reference/telemetry`,
+      },
+      {
+        key: "SWARM_ORG_TEAM_SIZE",
+        label: "Company team size",
+        description: "Company team size used to select peers for the fleet benchmark.",
+        kind: "enum",
+        options: ["1", "2-10", "11-50", "51+"],
+        defaultValue: "",
+        docsUrl: `${DOCS}ui/configuration#company-profile`,
+      },
+      {
+        key: "SWARM_ORG_USE_CASE",
+        label: "Primary use case",
+        description: "Primary use case used to select peers for the fleet benchmark.",
+        kind: "enum",
+        options: ["features", "bugs", "review", "ops", "docs", "data"],
+        defaultValue: "",
+        docsUrl: `${DOCS}ui/configuration#company-profile`,
+      },
+      {
+        key: "SWARM_ORG_ACQUISITION_SOURCE",
+        label: "How you heard about us",
+        description: "How your company discovered Agent Swarm. Leave empty if unknown.",
+        kind: "enum",
+        options: [
+          "search",
+          "github",
+          "social",
+          "colleague",
+          "newsletter",
+          "event",
+          "ai_assistant",
+          "hacker_news",
+          "other",
+        ],
+        defaultValue: "",
+        docsUrl: `${DOCS}ui/configuration#company-profile`,
       },
       {
         key: "SWARM_BRAND_COLOR",

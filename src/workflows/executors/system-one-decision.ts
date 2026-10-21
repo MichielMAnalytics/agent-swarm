@@ -1,6 +1,5 @@
 import { z } from "zod";
 import type { ExecutorMeta } from "../../types";
-import { getOpenRouterAttributionHeaders } from "../../utils/openrouter-base-url";
 import { scrubSecrets } from "../../utils/secret-scrubber";
 import {
   type ApprovalOutcome,
@@ -17,19 +16,28 @@ import {
   HumanInTheLoopExecutor,
   NotificationConfigSchema,
 } from "./human-in-the-loop";
+import { SYSTEM_ONE_EXTRACTION_NODE_TYPE } from "./system-one-extraction";
 import {
+  resolveSystemOneDefaultProvider,
   resolveSystemOneTarget,
-  SYSTEM_ONE_DEFAULT_PROVIDER,
   SYSTEM_ONE_PROVIDER_IDS,
   SYSTEM_ONE_PROVIDERS,
   type SystemOneProvider,
   type SystemOneProviderId,
-  systemOneKeyRejectedMessage,
   systemOneModelProblem,
   systemOneProviderOf,
   systemOneQuestionLimitProblem,
 } from "./system-one-providers";
-import { cloudflareErrorCode, SYSTEM_ONE_WIRE, SystemOneWireError } from "./system-one-wire";
+import {
+  SYSTEM_ONE_DEFAULT_MAX_RETRIES,
+  SYSTEM_ONE_DEFAULT_TIMEOUT_MS,
+  SYSTEM_ONE_MAX_RETRIES_LIMIT,
+  SYSTEM_ONE_MAX_TIMEOUT_MS,
+  SYSTEM_ONE_MIN_TIMEOUT_MS,
+  type SystemOneTransportOptions,
+  sendSystemOneRequest,
+} from "./system-one-transport";
+import { SYSTEM_ONE_WIRE, SystemOneWireError } from "./system-one-wire";
 
 // ─── Constants ──────────────────────────────────────────────
 
@@ -43,11 +51,13 @@ export const SYSTEM_ONE_DECISION_NODE_TYPE = "system-one-decision";
 export const SYSTEM_ONE_ENDPOINT = SYSTEM_ONE_PROVIDERS.typesafe.endpoint;
 export const SYSTEM_ONE_API_KEY_CONFIG_KEY = SYSTEM_ONE_PROVIDERS.typesafe.keyName;
 
-export const SYSTEM_ONE_DEFAULT_TIMEOUT_MS = 30_000;
-export const SYSTEM_ONE_MIN_TIMEOUT_MS = 1_000;
-export const SYSTEM_ONE_MAX_TIMEOUT_MS = 300_000;
-export const SYSTEM_ONE_DEFAULT_MAX_RETRIES = 2;
-export const SYSTEM_ONE_MAX_RETRIES_LIMIT = 3;
+export {
+  SYSTEM_ONE_DEFAULT_MAX_RETRIES,
+  SYSTEM_ONE_DEFAULT_TIMEOUT_MS,
+  SYSTEM_ONE_MAX_RETRIES_LIMIT,
+  SYSTEM_ONE_MAX_TIMEOUT_MS,
+  SYSTEM_ONE_MIN_TIMEOUT_MS,
+};
 
 /** Choice: 2-255 options, Score: 2-10 levels (TypeSafe primitive limits; 2 is our authoring floor). */
 const CHOICE_MIN_OPTIONS = 2;
@@ -55,14 +65,8 @@ const CHOICE_MAX_OPTIONS = 255;
 const SCORE_MIN_LEVELS = 2;
 const SCORE_MAX_LEVELS = 10;
 
-/** Room left before the engine watchdog fires so the executor can report its own failure. */
-const DEADLINE_MARGIN_MS = 250;
-const BACKOFF_BASE_MS = 500;
-const BACKOFF_CAP_MS = 8_000;
 /** A returned distribution must sum to 1 within this tolerance. It is checked, never normalized. */
 const DISTRIBUTION_TOLERANCE = 0.02;
-const MAX_RESPONSE_CHARS = 1_048_576;
-const MAX_ERROR_BODY_CHARS = 65_536;
 
 /** Output ports of a node that sets `humanReview`, the same names `human-in-the-loop` uses. */
 const REVIEW_PORTS = ["approved", "rejected", "timeout"] as const;
@@ -160,7 +164,11 @@ export type SystemOneHumanReview = z.infer<typeof HumanReviewSchema>;
 
 export const SystemOneDecisionConfigSchema = z
   .strictObject({
-    provider: z.enum(SYSTEM_ONE_PROVIDER_IDS).default(SYSTEM_ONE_DEFAULT_PROVIDER),
+    /**
+     * Decision host. Unset means the `SYSTEM_ONE_DEFAULT_PROVIDER` global config
+     * value, read at run time (`typesafe` when that is unset too).
+     */
+    provider: z.enum(SYSTEM_ONE_PROVIDER_IDS).optional(),
     /** Provider-specific model id. Unset means the provider's default. */
     model: z.string().min(1).optional(),
     state: SystemOneStateSchema,
@@ -231,7 +239,9 @@ export const SystemOneDecisionConfigSchema = z
       }
     }
     // Provider limits. A {{token}} model is skipped at save and checked again at run,
-    // where the interpolated config is parsed by this same schema.
+    // where the interpolated config is parsed by this same schema. With no provider
+    // the default is read at run time, so `decide` checks the limits there.
+    if (config.provider === undefined) return;
     const modelProblem = systemOneModelProblem(
       config.provider,
       config.model ?? (SYSTEM_ONE_PROVIDERS[config.provider] as SystemOneProvider).defaultModel,
@@ -316,8 +326,18 @@ interface RetryShape {
   maxRetries?: number;
 }
 
+/** Node types that call a System One host: paid, non-idempotent, with their own transient retries. */
+const SYSTEM_ONE_NODE_LABELS: Record<string, string> = {
+  [SYSTEM_ONE_DECISION_NODE_TYPE]: "SystemOne Decision",
+  [SYSTEM_ONE_EXTRACTION_NODE_TYPE]: "SystemOne Extraction",
+};
+
+export function isSystemOneNodeType(type: string): boolean {
+  return Object.hasOwn(SYSTEM_ONE_NODE_LABELS, type);
+}
+
 /**
- * Why a `system-one-decision` node may not carry an engine retry policy.
+ * Why a `system-one-decision` (or `system-one-extraction`) node may not carry an engine retry policy.
  *
  * The executor owns its transient retries (`config.maxRetries`). Engine retries
  * are not status-aware, so a node-level or validation retry would re-send 401 / 422
@@ -329,18 +349,18 @@ export function systemOneRetryViolations(node: {
   retry?: RetryShape | null;
   validation?: { retry?: RetryShape | null } | null;
 }): string[] {
-  if (node.type !== SYSTEM_ONE_DECISION_NODE_TYPE) return [];
+  if (!isSystemOneNodeType(node.type)) return [];
   const violations: string[] = [];
   const attempts = (retry: RetryShape | null | undefined) =>
     retry ? (retry.maxRetries ?? ENGINE_RETRY_DEFAULT) : 0;
   if (attempts(node.retry) > 0) {
     violations.push(
-      `Node "${node.id}" (system-one-decision) must not set retry.maxRetries > 0: the system-one-decision executor retries transient transport errors itself (config.maxRetries), and engine retries would re-send rejected requests`,
+      `Node "${node.id}" (${node.type}) must not set retry.maxRetries > 0: the ${node.type} executor retries transient transport errors itself (config.maxRetries), and engine retries would re-send rejected requests`,
     );
   }
   if (attempts(node.validation?.retry) > 0) {
     violations.push(
-      `Node "${node.id}" (system-one-decision) must not set validation.retry.maxRetries > 0: a validation-driven retry would send another paid request`,
+      `Node "${node.id}" (${node.type}) must not set validation.retry.maxRetries > 0: a validation-driven retry would send another paid request`,
     );
   }
   return violations;
@@ -397,11 +417,17 @@ export function systemOneStaticShapeViolations(node: {
   return violations;
 }
 
-/** The engine fails a system-one-decision step before dispatch when any config token is unresolved. */
-export function systemOneUnresolvedError(nodeId: string, tokens: string[]): string {
+/** The engine fails a System One step before dispatch when any config token is unresolved. */
+export function systemOneUnresolvedError(
+  nodeId: string,
+  tokens: string[],
+  nodeType: string = SYSTEM_ONE_DECISION_NODE_TYPE,
+): string {
   const rendered = [...new Set(tokens)].map((token) => `{{${token}}}`).join(", ");
+  const label =
+    SYSTEM_ONE_NODE_LABELS[nodeType] ?? SYSTEM_ONE_NODE_LABELS[SYSTEM_ONE_DECISION_NODE_TYPE];
   return (
-    `SystemOne Decision node "${nodeId}" has unresolved interpolation token(s): ${rendered}. ` +
+    `${label} node "${nodeId}" has unresolved interpolation token(s): ${rendered}. ` +
     "No request was sent. Declare the value in the node's inputs mapping or fix the path."
   );
 }
@@ -795,79 +821,13 @@ export function resolveReviewedDecision(
 
 // ─── Transport ──────────────────────────────────────────────
 
-export interface SystemOneDecisionExecutorOptions {
-  /** Transport. Tests inject a fake; production uses the global `fetch`. */
-  fetch?: typeof fetch;
+export interface SystemOneDecisionExecutorOptions extends SystemOneTransportOptions {
   /** Credential lookup for any provider. Defaults to each provider's own source (see `SYSTEM_ONE_PROVIDERS`). */
   getApiKey?: (provider: SystemOneProviderId) => Promise<string | null | undefined>;
   /** Base-URL lookup for a provider with no fixed host (`laya`). Defaults to its global config value. */
   getServerUrl?: (provider: SystemOneProviderId) => Promise<string | null | undefined>;
   /** Environment the OpenRouter credential is resolved from. Defaults to `process.env`. */
   env?: NodeJS.ProcessEnv;
-  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
-  now?: () => number;
-  random?: () => number;
-}
-
-type Attempt =
-  | { kind: "ok"; text: string; requestId?: string }
-  | { kind: "timeout" }
-  | { kind: "fail"; message: string; retryable: boolean; retryAfterMs?: number };
-
-const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
-const ERROR_CODE_RE = /^[A-Za-z0-9._:-]{1,64}$/;
-
-function readRequestId(headers: Headers): string | undefined {
-  // Cloudflare marks every response with `cf-ray` and sends no request id.
-  const value = headers.get("x-request-id") ?? headers.get("request-id") ?? headers.get("cf-ray");
-  return value && REQUEST_ID_RE.test(value) ? value : undefined;
-}
-
-/** Retry-After as delta-seconds or an HTTP date, in ms. Undefined when absent or unparseable. */
-function parseRetryAfter(value: string | null, now: number): number | undefined {
-  if (!value) return undefined;
-  const trimmed = value.trim();
-  if (/^\d+(\.\d+)?$/.test(trimmed)) return Math.round(Number(trimmed) * 1000);
-  const at = Date.parse(trimmed);
-  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
-}
-
-/** Only a short identifier from the provider's error envelope. Never its message or echoed request. */
-function readErrorCode(text: string): string | undefined {
-  if (text.length === 0 || text.length > MAX_ERROR_BODY_CHARS) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-  if (!isRecord(parsed)) return undefined;
-  const nested = isRecord(parsed.error) ? parsed.error : undefined;
-  const detail = isRecord(parsed.detail) ? parsed.detail : undefined;
-  for (const candidate of [
-    nested?.code,
-    nested?.type,
-    detail?.error_type,
-    parsed.code,
-    parsed.type,
-  ]) {
-    if (typeof candidate === "string" && ERROR_CODE_RE.test(candidate)) return candidate;
-  }
-  // Cloudflare's envelope: `{ success: false, errors: [{ code: 10000, message }] }`.
-  return cloudflareErrorCode(parsed);
-}
-
-function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) return resolve();
-    const timer = setTimeout(done, ms);
-    function done() {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", done);
-      resolve();
-    }
-    signal.addEventListener("abort", done, { once: true });
-  });
 }
 
 // ─── Executor ───────────────────────────────────────────────
@@ -893,6 +853,11 @@ export class SystemOneDecisionExecutor extends BaseExecutor<
     return { db: this.deps.db, env: this.options.env ?? process.env };
   }
 
+  /** The provider a config without `provider` uses, read now so a settings change applies at once. */
+  private defaultProvider(): Promise<SystemOneProviderId> {
+    return resolveSystemOneDefaultProvider(this.providerContext());
+  }
+
   private resolveTarget(id: SystemOneProviderId, model?: string) {
     return resolveSystemOneTarget(id, this.providerContext(), {
       apiKey: this.options.getApiKey,
@@ -909,9 +874,10 @@ export class SystemOneDecisionExecutor extends BaseExecutor<
     nodes: readonly ExecutorReadinessNode[],
   ): Promise<ExecutorReadinessProblem[]> {
     const nodeIdsByProvider = new Map<SystemOneProviderId, string[]>();
+    const defaultId = await this.defaultProvider();
     for (const node of nodes) {
       // An unknown provider is a config error the schema reports; it names no credential.
-      const id = systemOneProviderOf(node.config);
+      const id = systemOneProviderOf(node.config, defaultId);
       if (id) nodeIdsByProvider.set(id, [...(nodeIdsByProvider.get(id) ?? []), node.id]);
     }
     const problems: ExecutorReadinessProblem[] = [];
@@ -949,29 +915,44 @@ export class SystemOneDecisionExecutor extends BaseExecutor<
    */
   async decide(
     config: SystemOneDecisionConfig,
-  ): Promise<{ ok: true; output: SystemOneDecisionOutput } | { ok: false; error: string }> {
-    const providerId = config.provider;
+  ): Promise<
+    | { ok: true; output: SystemOneDecisionOutput }
+    | { ok: false; error: string; deploymentRefused?: true }
+  > {
+    const providerId = config.provider ?? (await this.defaultProvider());
     const provider: SystemOneProvider = SYSTEM_ONE_PROVIDERS[providerId];
 
     // A provider with no default sends no `model` when the node sets none.
     const model = config.model ?? provider.defaultModel;
     const modelProblem = systemOneModelProblem(providerId, model);
     if (modelProblem) return { ok: false, error: modelProblem };
+    // Checked at save only for a named provider; a defaulted one is checked here.
+    const limitProblem = systemOneQuestionLimitProblem(
+      providerId,
+      Object.keys(config.questions).length,
+    );
+    if (limitProblem) return { ok: false, error: limitProblem };
     const target = await this.resolveTarget(providerId, model);
-    if (!target.ok) return { ok: false, error: target.error };
-    const { apiKey, endpoint } = target;
+    if (!target.ok) return target;
+    const { apiKey, endpoint, keyName } = target;
 
     const wire = provider.wire ?? SYSTEM_ONE_WIRE;
     const body = JSON.stringify(wire.buildRequest(config, model));
 
     const scrub = (message: string) => message.split(apiKey).join("[REDACTED]");
-    const sent = await this.send(
-      providerId,
-      endpoint,
-      apiKey,
-      body,
-      config.timeoutMs,
-      config.maxRetries,
+    const sent = await sendSystemOneRequest(
+      {
+        providerId,
+        capability: "decide",
+        endpoint,
+        apiKey,
+        keyName,
+        body,
+        timeoutMs: config.timeoutMs,
+        maxRetries: config.maxRetries,
+        env: this.providerContext().env,
+      },
+      this.options,
     );
     if (!sent.ok) return { ok: false, error: scrub(sent.error) };
 
@@ -1100,164 +1081,5 @@ export class SystemOneDecisionExecutor extends BaseExecutor<
     approval: ResolvedApproval,
   ): ApprovalOutcome | null {
     return resolveReviewedDecision(parkedOutput, approval);
-  }
-
-  /**
-   * POST once, retrying only transient failures inside one time budget.
-   * Retries: connection errors, HTTP 408 / 429 / 5xx (incl. 529). Never: 401, 422,
-   * other 4xx, redirects, or a bad success body (the caller validates that).
-   */
-  private async send(
-    providerId: SystemOneProviderId,
-    endpoint: string,
-    apiKey: string,
-    body: string,
-    timeoutMs: number,
-    maxRetries: number,
-  ): Promise<{ ok: true; text: string; requestId?: string } | { ok: false; error: string }> {
-    const doFetch = this.options.fetch ?? fetch;
-    const sleep = this.options.sleep ?? defaultSleep;
-    const now = this.options.now ?? Date.now;
-    const random = this.options.random ?? Math.random;
-
-    const deadlineAt = now() + timeoutMs - DEADLINE_MARGIN_MS;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.max(0, deadlineAt - now()));
-    const timedOut = () =>
-      ({
-        ok: false,
-        error: `SystemOne request exceeded its ${timeoutMs}ms time budget`,
-      }) as const;
-
-    try {
-      for (let attempt = 0; ; attempt++) {
-        const result = await this.attemptOnce(
-          doFetch,
-          providerId,
-          endpoint,
-          apiKey,
-          body,
-          controller.signal,
-          now,
-        );
-        if (result.kind === "ok") {
-          return { ok: true, text: result.text, requestId: result.requestId };
-        }
-        if (result.kind === "timeout" || controller.signal.aborted) return timedOut();
-
-        const attempts = attempt + 1;
-        const suffix = attempts > 1 ? ` after ${attempts} attempts` : "";
-        if (!result.retryable || attempt >= maxRetries) {
-          return { ok: false, error: `${result.message}${suffix}` };
-        }
-
-        const backoff = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** attempt);
-        const delay = result.retryAfterMs ?? Math.round(backoff * (0.5 + random() * 0.5));
-        if (delay >= deadlineAt - now()) {
-          return {
-            ok: false,
-            error: `${result.message}${suffix}; the ${delay}ms retry delay does not fit the ${timeoutMs}ms time budget`,
-          };
-        }
-        await sleep(delay, controller.signal);
-        if (controller.signal.aborted) return timedOut();
-      }
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  private async attemptOnce(
-    doFetch: typeof fetch,
-    providerId: SystemOneProviderId,
-    endpoint: string,
-    apiKey: string,
-    body: string,
-    signal: AbortSignal,
-    now: () => number,
-  ): Promise<Attempt> {
-    let res: Response;
-    try {
-      res = await doFetch(endpoint, {
-        method: "POST",
-        headers: {
-          ...getOpenRouterAttributionHeaders(endpoint, this.providerContext().env),
-          "content-type": "application/json",
-          accept: "application/json",
-          authorization: `Bearer ${apiKey}`,
-        },
-        body,
-        redirect: "manual",
-        signal,
-      });
-    } catch (err) {
-      if (signal.aborted) return { kind: "timeout" };
-      const code = (err as { code?: unknown })?.code;
-      const detail = typeof code === "string" && /^[A-Z0-9_]{3,40}$/.test(code) ? ` (${code})` : "";
-      return {
-        kind: "fail",
-        message: `SystemOne request failed: network error${detail}`,
-        retryable: true,
-      };
-    }
-
-    const requestId = readRequestId(res.headers);
-    const withId = (message: string) => (requestId ? `${message} [request ${requestId}]` : message);
-
-    if (res.status >= 200 && res.status < 300) {
-      let text: string;
-      try {
-        text = await res.text();
-      } catch {
-        if (signal.aborted) return { kind: "timeout" };
-        return {
-          kind: "fail",
-          message: withId("SystemOne response body could not be read"),
-          retryable: true,
-        };
-      }
-      if (text.length > MAX_RESPONSE_CHARS) {
-        return {
-          kind: "fail",
-          message: withId("SystemOne response exceeded the size limit"),
-          retryable: false,
-        };
-      }
-      return { kind: "ok", text, requestId };
-    }
-
-    if (res.status >= 300 && res.status < 400) {
-      return {
-        kind: "fail",
-        message: withId(
-          `SystemOne request was redirected (HTTP ${res.status}); redirects are refused`,
-        ),
-        retryable: false,
-      };
-    }
-
-    let errorText = "";
-    try {
-      errorText = await res.text();
-    } catch {
-      if (signal.aborted) return { kind: "timeout" };
-    }
-    const code = readErrorCode(errorText);
-    // The host answered but does not accept the key: name it, never retry.
-    if (res.status === 401 || res.status === 403) {
-      return {
-        kind: "fail",
-        message: withId(systemOneKeyRejectedMessage(providerId, res.status, code)),
-        retryable: false,
-      };
-    }
-    const detail = code ? ` (${code})` : "";
-    const retryable = res.status === 408 || res.status === 429 || res.status >= 500;
-    return {
-      kind: "fail",
-      message: withId(`SystemOne API returned HTTP ${res.status}${detail}`),
-      retryable,
-      retryAfterMs: retryable ? parseRetryAfter(res.headers.get("retry-after"), now()) : undefined,
-    };
   }
 }

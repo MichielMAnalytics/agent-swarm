@@ -13,6 +13,7 @@
     "Markdown",
     "SearchInput",
     "Select",
+    "NumberInput",
     "Button",
     "Metric",
     "Alert",
@@ -48,7 +49,7 @@
   ],
   "components": {
     "Stack": {
-      "description": "THE primary layout primitive — a flex column (default) or row of its children. `gap`/`padding` use the shared spacing scale (none|xs|sm|md|lg|xl, default gap md); `align` is the cross axis, `justify` the main axis, `wrap` lets a row reflow. For rows, set `collapseBelow` (sm|md|lg) so the row stacks vertically on narrow viewports — filter bars should always set it. `motion` (rise|fade|none, default rise) is the entrance of the direct children on first paint: a 200ms fade plus a 4px rise, staggered 30ms; it never replays on data polls, nested Stacks inherit the parent's entrance, and reduced-motion viewers get a short fade. Use this as the page root and for every section; `Container` is the legacy 2-prop alias kept for older pages.",
+      "description": "THE primary layout primitive — a flex column (default) or row of its children. `gap`/`padding` use the shared spacing scale (none|xs|sm|md|lg|xl, default gap md); `align` is the cross axis, `justify` the main axis, `wrap` lets a row reflow. For rows, set `collapseBelow` (sm|md|lg) so the row stacks vertically on narrow viewports — filter bars should always set it. `motion` (rise|fade|none, default rise) is the entrance of the direct children on first paint: a 200ms fade plus a 4px rise, staggered 30ms; it never replays on data polls, nested Stacks inherit the parent's entrance, and reduced-motion viewers get a short fade. Use this as the page root and for every section; `Container` is the legacy 2-prop alias kept for older pages. `fill: true` makes this Stack grow to fill the remaining height of a `fill`-aware parent instead of sizing to content — chain it from the page root down to a scrolling leaf to build a viewport-height layout with no page scroll; a non-`fill` sibling keeps its natural height and the `fill` sibling absorbs whatever is left.",
       "slots": ["default"],
       "props": {
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -84,6 +85,9 @@
           "motion": {
             "type": "string",
             "enum": ["rise", "fade", "none"]
+          },
+          "fill": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false
@@ -144,7 +148,7 @@
       }
     },
     "Split": {
-      "description": "Two-pane layout. POSITIONAL children: the FIRST child is the left pane, the SECOND is the right pane, and any further children stack inside the right pane. `ratio` sizes them (1-1|1-2|2-1|1-3|3-1, default 2-1 = wide left). Below `collapseBelow` (sm|md|lg, default md) the panes stack vertically; `reverse` only flips that stacked order (right pane first on narrow screens).",
+      "description": "Two-pane layout. POSITIONAL children: the FIRST child is the left pane, the SECOND is the right pane, and any further children stack inside the right pane. `ratio` sizes them (1-1|1-2|2-1|1-3|3-1, default 2-1 = wide left). Below `collapseBelow` (sm|md|lg, default md) the panes stack vertically; `reverse` only flips that stacked order (right pane first on narrow screens). `fill: true` makes this Split grow to fill the remaining height of a `fill`-aware parent (same contract as `Stack.fill`) — both panes stretch to the full row height, so nesting a `fill` Split inside one pane of another `fill` Split is the standard way to build a 3+ column viewport-height layout (ratio is only ever 2 panes).",
       "slots": ["default"],
       "props": {
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -168,6 +172,9 @@
           "padding": {
             "type": "string",
             "enum": ["none", "xs", "sm", "md", "lg", "xl"]
+          },
+          "fill": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false
@@ -385,7 +392,7 @@
       }
     },
     "Select": {
-      "description": "Dropdown filter/picker. `options` are plain strings or `{ value, label?, icon?, hint? }` objects. Writes the chosen value into state at `/ui/<id>/value` (clearing writes `null`); bind it into a Table with `\"filters\": { \"<column>\": { \"$state\": \"/ui/<id>/value\" } }`. `clearable` (default true) shows a clear button. `searchable` adds a type-to-filter field (on by default past 8 options; `searchPlaceholder` sets its hint). `multiple` picks several: the value is a string array (empty = nothing picked), which a Table filter reads as \"cell is one of\".",
+      "description": "Dropdown filter/picker. `options` are plain strings or `{ value, label?, icon?, hint? }` objects. Writes the chosen value into state at `/ui/<id>/value` (clearing writes `null`); bind it into a Table with `\"filters\": { \"<column>\": { \"$state\": \"/ui/<id>/value\" } }`. `clearable` (default true) shows a clear button. `searchable` adds a type-to-filter field (on by default past 8 options; `searchPlaceholder` sets its hint). `multiple` picks several: the value is a string array (empty = nothing picked), which a Table filter reads as \"cell is one of\". `defaultValue` seeds `/ui/<id>/value` the first time it is read, before any interaction (a one-entry array with `multiple`).",
       "props": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -482,9 +489,38 @@
           },
           "searchPlaceholder": {
             "type": "string"
+          },
+          "defaultValue": {
+            "type": "string"
           }
         },
         "required": ["id", "options"],
+        "additionalProperties": false
+      }
+    },
+    "NumberInput": {
+      "description": "Labelled numeric text field (decimal keyboard on touch devices, no debounce). Writes the parsed number into state at `/ui/<id>/value` on every change, or `null` when the field is empty; non-numeric text (a bare '-' mid-edit, letters) leaves the stored value untouched until it parses. `min`/`max` clamp the stored value, and the visible text snaps to that clamped value when the field loses focus.",
+      "props": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "placeholder": {
+            "type": "string"
+          },
+          "min": {
+            "type": "number"
+          },
+          "max": {
+            "type": "number"
+          }
+        },
+        "required": ["id"],
         "additionalProperties": false
       }
     },
@@ -1243,7 +1279,7 @@
       }
     },
     "Table": {
-      "description": "Data table. Bind `data`/`loading`/`error` to a named query (`/queries/<name>/...`). `rowActions` chains receive `{ \"$row\": \"<col>\" }` (or `{ \"$row\": \"\" }` for the whole row) and `{ \"$rowIndex\": true }`. Destructive row actions always confirm via a dialog; override the copy with `confirm: { title, description, confirmLabel }`. `search` (case-insensitive substring across every listed column) and `filters` (per-column equality, `null`/`\"\"` disables one; an array means \"one of\", which is what a multiple `Chips` writes, and an empty array disables it) narrow the polled rows client-side — bind them to a `SearchInput` / `Select` via `/ui/<id>/value`, or pin a constant (e.g. `\"filters\": { \"pinned\": true }`). Columns take `pinned: \"left\"|\"right\"` to survive horizontal scroll; `pagination` pages large row sets (auto past 200 rows); `density: \"compact\"` tightens row height. Column kinds: `status` (lifecycle values like pending/in_progress/completed/failed get the dashboard status icon, anything else a `tones` pill), `user` / `agent` (avatar + name), `relative` (smart time with the exact time on hover), `duration` (ms → 1m 23s), `progress` (bar, `max` default 100), `copy` (value + copy button), `switch` (runs the column's `onChange` chain with `$row` set to the new value; read-only without it), `link` (http(s) URL, opens in a new tab). Columns also take `align`, `truncate: \"middle\"` (ids, paths), a header `icon` and `tooltip` (a row field shown on hover). `onRowClick` runs a chain with `$row` when a row is clicked — pair it with `app.navigate` + a Drawer and bind `selectedId` to the drawer param to highlight the open row. `rowId` names the id field (default `id`). Below 768px the table renders as a phone list (`mobile: \"list\"`, fields picked by `mobileFields: { title, subtitle?, meta?, status? }`); `mobile: \"scroll\"` keeps the grid. `emptyState: { icon?, title, body? }` replaces the empty message. Row actions take `icon` and `placement: \"menu\"` (collected into a More menu).",
+      "description": "Data table. Bind `data`/`loading`/`error` to a named query (`/queries/<name>/...`). `rowActions` chains receive `{ \"$row\": \"<col>\" }` (or `{ \"$row\": \"\" }` for the whole row) and `{ \"$rowIndex\": true }`. Destructive row actions always confirm via a dialog; override the copy with `confirm: { title, description, confirmLabel }`. `search` (case-insensitive substring across every listed column) and `filters` (per-column equality, `null`/`\"\"` disables one; an array means \"one of\", which is what a multiple `Chips` writes, and an empty array disables it) narrow the polled rows client-side — bind them to a `SearchInput` / `Select` via `/ui/<id>/value`, or pin a constant (e.g. `\"filters\": { \"pinned\": true }`). Columns take `pinned: \"left\"|\"right\"` to survive horizontal scroll; `pagination` pages large row sets (auto past 200 rows); `density: \"compact\"` tightens row height. Column kinds: `status` (lifecycle values like pending/in_progress/completed/failed get the dashboard status icon, anything else a `tones` pill), `user` / `agent` (avatar + name), `relative` (smart time with the exact time on hover), `duration` (ms → 1m 23s), `progress` (bar, `max` default 100), `copy` (value + copy button), `switch` (runs the column's `onChange` chain with `$row` set to the new value; read-only without it), `link` (http(s) URL, opens in a new tab), `json` (compact single-line `JSON.stringify` preview, truncated). Columns also take `align`, `truncate: \"middle\"` (ids, paths), a header `icon` and `tooltip` (a row field shown on hover). `onRowClick` runs a chain with `$row` when a row is clicked — pair it with `app.navigate` + a Drawer and bind `selectedId` to the drawer param to highlight the open row. `rowId` names the id field (default `id`). Below 768px the table renders as a phone list (`mobile: \"list\"`, fields picked by `mobileFields: { title, subtitle?, meta?, status? }`); `mobile: \"scroll\"` keeps the grid. `emptyState: { icon?, title, body? }` replaces the empty message. Row actions take `icon` and `placement: \"menu\"` (collected into a More menu).",
       "props": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -1287,7 +1323,8 @@
                     "progress",
                     "copy",
                     "switch",
-                    "link"
+                    "link",
+                    "json"
                   ]
                 },
                 "tones": {
@@ -2506,6 +2543,9 @@
               "type": "string"
             },
             "additionalProperties": {}
+          },
+          "parentTaskId": {
+            "type": "string"
           }
         },
         "required": ["name"],

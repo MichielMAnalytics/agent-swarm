@@ -24,6 +24,11 @@ ARG SKILLS_CLI_VERSION=1.5.20
 # image into Debian-based images.
 FROM ghcr.io/j178/prek:v${PREK_VERSION} AS prek
 
+# Static ffmpeg for the full image. A registry image pinned by digest replaces
+# the johnvansickle.com tarball (single host; its outage blocked deploys).
+# Bump the tag and the multi-arch index digest together.
+FROM mwader/static-ffmpeg:7.0.2@sha256:d9b22f65c2049d73bf8ae556bb4c5c7d45e9fb85939d87951ed98f22b0f19105 AS ffmpeg
+
 # ─── Stage: builder ──────────────────────────────────────────────────────────
 FROM oven/bun:1.4.3 AS builder
 WORKDIR /build
@@ -129,7 +134,7 @@ RUN if ! gh extension install github/gh-stack; then \
     fi
 
 # Install Claude CLI (pinned version — bump ARG to update)
-ARG CLAUDE_CODE_VERSION=2.1.302
+ARG CLAUDE_CODE_VERSION=2.1.306
 USER root
 RUN HOME=/root NPM_CONFIG_CACHE=/tmp/npm-cache \
     npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
@@ -194,7 +199,7 @@ RUN mkdir -p /home/worker/.codex && \
 # build). The CLI, needed only by the ACP target, must run its postinstall to
 # fetch its platform binary, so it installs as `worker` into ~/.opencode.
 # One version for both: they ship from the same release.
-ARG OPENCODE_VERSION=2.0.32
+ARG OPENCODE_VERSION=2.1.2
 RUN NPM_CONFIG_CACHE=/tmp/npm-cache-worker \
     npm install -g --prefix /home/worker/.opencode @opencode/cli@${OPENCODE_VERSION} \
     && rm -rf /tmp/npm-cache-worker /home/worker/.npm \
@@ -235,7 +240,7 @@ ARG SKILLS_CLI_VERSION
 # agent-fs version pins BOTH the skill source tag (here) and the CLI in
 # /opt/global-deps (below). Bump with `bun run bump:agent-fs` so the chart,
 # Compose, and docs pins move in lockstep with this ARG.
-ARG AGENT_FS_VERSION=0.17.5
+ARG AGENT_FS_VERSION=0.18.5
 RUN npx -y skills@${SKILLS_CLI_VERSION} add desplega-ai/agent-fs@v${AGENT_FS_VERSION} --skill agent-fs -g -a claude-code -y \
     && test -e /home/worker/.claude/skills/agent-fs/SKILL.md \
     && rm -rf /home/worker/.npm
@@ -543,24 +548,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # agent-browser recording needs ffmpeg, but not ffprobe or the distro codec deps.
-# Keep the pinned static binary in the full image only.
-# Bump the version and both SHA-256 pins together. These pins are trust-on-first-use.
-# Older versions move from releases/ to old-releases/; verify either download.
-ARG FFMPEG_VERSION=7.0.2
-ARG FFMPEG_SHA256_AMD64=abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67
-ARG FFMPEG_SHA256_ARM64=f4149bb2b0784e30e99bdda85471c9b5930d3402014e934a5098b41d0f7201b1
-RUN case "$TARGETARCH" in \
-      amd64) ffmpeg_sha256="$FFMPEG_SHA256_AMD64" ;; \
-      arm64) ffmpeg_sha256="$FFMPEG_SHA256_ARM64" ;; \
-      *) echo "Unsupported ffmpeg architecture: $TARGETARCH" >&2; exit 1 ;; \
-    esac \
-    && (curl -fsSL "https://johnvansickle.com/ffmpeg/releases/ffmpeg-${FFMPEG_VERSION}-${TARGETARCH}-static.tar.xz" -o /tmp/ffmpeg.tar.xz \
-      || curl -fsSL "https://johnvansickle.com/ffmpeg/old-releases/ffmpeg-${FFMPEG_VERSION}-${TARGETARCH}-static.tar.xz" -o /tmp/ffmpeg.tar.xz) \
-    && echo "$ffmpeg_sha256  /tmp/ffmpeg.tar.xz" | sha256sum -c - \
-    && tar -xJf /tmp/ffmpeg.tar.xz -C /usr/local/bin --strip-components=1 \
-      "ffmpeg-${FFMPEG_VERSION}-${TARGETARCH}-static/ffmpeg" \
-    && test -x /usr/local/bin/ffmpeg \
-    && rm /tmp/ffmpeg.tar.xz
+# Keep the pinned static binary (from the ffmpeg stage) in the full image only.
+COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
 
 # Keep dsh and its transitive lifecycle scripts out of the shared root install.
 # Verify the pinned npm release tarball before installing without lifecycle hooks.
@@ -581,9 +570,9 @@ RUN curl -fsSL "https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-${DSH_VERSION}
 # "disabled". Bump AMP_VERSION, both SHA-512 pins and AMP_PACKAGE in
 # src/providers/amp-adapter.ts together. The vendor licence is proprietary
 # (https://ampcode.com/terms): confirm it before publishing this image.
-ARG AMP_VERSION=0.0.1792238457-g6ec988
-ARG AMP_SHA512_AMD64=28cf3b4cc585c06ce3c39a2a9686ea226e2bedfb36b2b3f5a8c1235deb472de540765d687b2f6c36c58e61a57f34a104ad0ccfc4ea61e616c4654f1e75e582a9
-ARG AMP_SHA512_ARM64=cc73cf2bbf8052cdf2ae3d45d9b2a743d14eb980f5155fbeceb1fc565d4905efd53365cb08ab85a108734fd9b974838b24c9fe1502ac2454595e6c0682497393
+ARG AMP_VERSION=0.0.1792555249-g702cd1
+ARG AMP_SHA512_AMD64=8cfe25f96c276d380234ea9bbe0630dd6a8c7d4f20a2dc5443d4c7207a7f1e576cbbf8572308cccafbfb55e63cb665714b5d85239657603b08e53b51767f35d9
+ARG AMP_SHA512_ARM64=8952badda7241787b0fca7467009afca0f733d984f15288bc402c9e2f4353b17c8f60c3c99eece0c06ae5094db5e06c33fc553abc51f413e8e8f6844d29f4cc2
 RUN case "$TARGETARCH" in \
       amd64) amp_platform=linux-x64; amp_sha512="$AMP_SHA512_AMD64" ;; \
       arm64) amp_platform=linux-arm64; amp_sha512="$AMP_SHA512_ARM64" ;; \
@@ -599,7 +588,7 @@ RUN case "$TARGETARCH" in \
 # carries its JS. Its native helpers (ripgrep, tree-sitter) ship in a platform
 # package the binary cannot embed, so install it here and point the SDK at it.
 # Bump CURSOR_SDK_VERSION with package.json and src/providers/cursor-adapter.ts.
-ARG CURSOR_SDK_VERSION=1.0.38
+ARG CURSOR_SDK_VERSION=1.0.40
 RUN case "$TARGETARCH" in \
       amd64) cursor_platform="linux-x64" ;; \
       arm64) cursor_platform="linux-arm64" ;; \
@@ -618,7 +607,7 @@ ENV CURSOR_RIPGREP_PATH=/opt/cursor-sdk/platform/bin/rg \
 # Gemini CLI (Apache-2.0) for HARNESS_PROVIDER=acp with ACP_TARGET=gemini; the
 # adapter launches `gemini --acp`. Its own prefix keeps the ~100 MB install out
 # of the shared global-deps layer. Lifecycle scripts are not needed for ACP.
-ARG GEMINI_CLI_VERSION=0.64.0
+ARG GEMINI_CLI_VERSION=0.65.0
 RUN HOME=/root NPM_CONFIG_CACHE=/tmp/npm-cache npm install \
       --prefix /opt/gemini-cli --ignore-scripts --no-audit --no-fund \
       "@google/gemini-cli@${GEMINI_CLI_VERSION}" \
@@ -631,7 +620,7 @@ RUN HOME=/root NPM_CONFIG_CACHE=/tmp/npm-cache npm install \
 # than the CLI, with that licence included. npm keeps LICENSE.md in the
 # package dir; the copy under /usr/share/doc makes it easy to find. The adapter
 # sets COPILOT_AUTO_UPDATE=false, so the pinned binary is the one that runs.
-ARG COPILOT_CLI_VERSION=1.0.98
+ARG COPILOT_CLI_VERSION=1.0.101
 RUN HOME=/root NPM_CONFIG_CACHE=/tmp/npm-cache npm install \
       --prefix /opt/copilot-cli --no-audit --no-fund "@github/copilot@${COPILOT_CLI_VERSION}" \
     && ln -sf /opt/copilot-cli/node_modules/.bin/copilot /usr/local/bin/copilot \
@@ -641,8 +630,8 @@ RUN HOME=/root NPM_CONFIG_CACHE=/tmp/npm-cache npm install \
     && rm -rf /tmp/npm-cache /root/.npm /root/.cache /root/.copilot
 # Qwen Code (Apache-2.0), the `qwen` ACP target (`qwen --acp`). Its own prefix
 # keeps the ~120 MB bundle out of the shared global-deps layer. Lifecycle
-# scripts are not needed for ACP (verified on 0.25.2), so none run as root.
-ARG QWEN_CODE_VERSION=0.25.2
+# scripts are not needed for ACP (verified on 0.25.3), so none run as root.
+ARG QWEN_CODE_VERSION=0.25.3
 RUN HOME=/root NPM_CONFIG_CACHE=/tmp/npm-cache npm install \
       --prefix /opt/qwen-code --ignore-scripts --no-audit --no-fund \
       "@qwen-code/qwen-code@${QWEN_CODE_VERSION}" \
@@ -671,9 +660,9 @@ RUN case "$TARGETARCH" in \
 # manifest lists. `kiro-cli` dispatches to `kiro-cli-chat`, so both are kept;
 # the terminal helper is not needed for ACP. Bump KIRO_CLI_VERSION and both
 # pins together. Proprietary (AWS): confirm its licence before publishing.
-ARG KIRO_CLI_VERSION=2.32.0
-ARG KIRO_CLI_SHA256_AMD64=05989f9bfe465b304e8d1b2dba50aec2b84fcc1deaa4c0773af3f539d6e0d312
-ARG KIRO_CLI_SHA256_ARM64=98e5b923c7ed8bf589eb9b9d823e6611cba96f26c719cdb053959897738623ec
+ARG KIRO_CLI_VERSION=2.33.0
+ARG KIRO_CLI_SHA256_AMD64=fdce2898458e23346e63c7a87959cf458290bc44c080951b099c03862056933b
+ARG KIRO_CLI_SHA256_ARM64=0c2c765027ca8414fbce96ec484e7e92c80a341fadd854ab417007e9271634e2
 RUN case "$TARGETARCH" in \
       amd64) kiro_arch=x86_64; kiro_sha256="$KIRO_CLI_SHA256_AMD64" ;; \
       arm64) kiro_arch=aarch64; kiro_sha256="$KIRO_CLI_SHA256_ARM64" ;; \

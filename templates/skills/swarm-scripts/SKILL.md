@@ -71,7 +71,7 @@ export default async function (args: z.infer<typeof argsSchema>, ctx: ScriptCont
 - `agentId` is propagated through the `X-Agent-ID` header, so SDK calls run as you. `taskId` is not ambient: pass it in `args` when the script calls `task_storeProgress`.
 - A script invoked from a workflow node may run under a workflow identity.
 - Return compact structured data. Raw logs, full HTML, big JSON arrays, and file contents stay inside the script.
-- Limits: about 30 s wall clock (up to 5 minutes where the tool exposes it), 1 MB stdout. Never sleep or loop past about 25 s. Chain `wait-for-task` calls instead. The cap also applies to a script called through `ctx.step.swarmScript`; the step's `timeoutMs` does not extend it. A long LLM call, such as a 2,000-word draft, goes in a `ctx.step.rawLlm` step inside `launch-script-run`, never in a called script.
+- Limits: about 30 s wall clock (up to 5 minutes where the tool exposes it), 1 MB stdout. Never sleep or loop past about 25 s. Chain `wait-for-task` calls instead. The cap also applies to a script called through `ctx.step.swarmScript`; the step's `timeoutMs` does not extend it. A long LLM call, such as a 2,000-word draft, goes in a `ctx.step.rawLlm` step inside `launch-script-run`, never in a called script. A `targetType: "script"` schedule gets 60 s; a manual `script-run` gets 30 s, so a candidate that finishes well under 30 s by hand has margin on the schedule. A nested `ctx.swarm.script_run` gets its own 30 s but runs inside its caller's remaining time: run slow children as sibling calls from the outer script, not deeper in the chain.
 
 ### What `ctx` holds
 
@@ -104,6 +104,9 @@ const { stdout, exitCode } = await ctx.sh("grep -rn TODO /afs/notes | sort | hea
 
 `launch-script-run` runs a script as a durable, journaled run with a different `ctx`: `ctx.run` (`id`, `agentId`, `args`) and `ctx.step.rawLlm(label, config)`, `ctx.step.agentTask(label, config)`, `ctx.step.swarmScript(label, config)`, plus `ctx.swarm.*`, `ctx.stdlib`, `ctx.logger`. Durable runs have no `ctx.api`, no `ctx.mcp`, no `ctx.fs`, no `ctx.sh`, and no `ctx.swarm.config`. A configured `ctx.step.agentTask` `agentId` records `human_pinned` unless `routingReason` is supplied. Call a connection or the drive from an inner script through `ctx.step.swarmScript`. See the `script-workflows` skill.
 
+- Each `ctx.step.agentTask` step is a normal worker task (`taskType: "script-run-step"`). When it finishes, the lead gets the usual "Worker task completed — review needed" follow-up, even while the run is still awaiting that step. The step config has no `followUpConfig` field, so a value passed there is dropped. Let the script's own judge step be the gate and close those follow-ups with a one-line accept.
+- When a crash supersedes an in-flight step and resumes it as a new task, the run does not follow the new task id: it can stay `failed` (for example `write EPIPE`) while the resumed task completes. Check the resumed task's output before you re-launch the run.
+
 ## Inline script pattern
 
 ```typescript
@@ -132,7 +135,7 @@ Order of preference:
 
 1. A registered connection: `ctx.api.<slug>.<operationId>({ path, query, header, body })` (OpenAPI), `ctx.api.<slug>.graphql(query, variables)` (GraphQL), `ctx.mcp.<slug>.<toolName>(args)` (MCP, proxied server-side, returns the raw MCP envelope: read `res.structuredContent ?? res.content?.[0]?.text`). Credentials attach at egress. The script never sees them. OAuth tokens refresh on their own.
 2. A credential binding placeholder in a hand-written request: `Authorization: Bearer [REDACTED:GITHUB_TOKEN]`. The runtime substitutes the value at egress, only for the binding's allowed hosts.
-3. `ctx.swarm.config.get("KEY")` for a config value you pass to `ctx.stdlib.fetch` as a header value. Unwrap it with `ctx.stdlib.Redacted.value(...)` inside the header itself (a wrapped value sends the literal `<redacted>`), and never log it. Secret values are scrubbed from run output.
+3. `ctx.swarm.config.get("KEY")` for a config value you pass to `ctx.stdlib.fetch` as a header value. Unwrap it with `ctx.stdlib.Redacted.value(...)` inside the header itself (a wrapped value sends the literal `<redacted>`), and never log it. Secret values are scrubbed from run output. Not available in `launch-script-run` (durable runs have no `ctx.swarm.config`): collect there without secrets, then pass the run's output to a short `script-run` that makes the authenticated calls.
 
 A raw secret, or the output of `get-config` with `includeSecrets: true`, must not appear in script source, script `args`, a schedule's `taskTemplate` or `scriptArgs`, or a task description. Those are stored as plain text and replayed on every run.
 
@@ -173,6 +176,9 @@ function rowsToObjects(res: any): any[] {
 - `script_run` returns an envelope (`result`, `truncated`, `durationMs`, `stdout`, `stderr`, `exitCode`). The callee payload is at `.result`. Take key names from a real response: a guessed key that is absent reads as a false zero.
 - An `argsSchema` validation error fires before the body runs and repeats on every retry. Fix the args instead of retrying.
 - Write a dedup or idempotency marker only after the step succeeds. A marker written after a failure blocks the next real attempt.
+- `kv_set` returns `success: false` instead of throwing when a key has a character outside `[a-zA-Z0-9._:/-]` (for example `#` or `|` from a git ref). Check `success` after every write.
+- `script_run` without `scope` runs an agent-scoped row of the same name before the global one, so a stale private copy silently wins. Pass `scope: "global"` for a shared script.
+- A nested `script_run` does not overlap with the caller's own `ctx.stdlib.fetch` calls: started alongside them it added about 8 s to one measured run. Start it after the caller's own queries.
 
 Common tables: `agent_tasks`, `session_logs`, `agent_memory`, `scheduled_tasks`, `agents`. `session_logs` has no `tool_name` column. Tool names sit inside the `content` JSON column. Extract them with `instr` and `substr` in SQL, or parse the JSON in the script.
 

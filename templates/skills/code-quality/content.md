@@ -22,6 +22,7 @@ The task's `vcsProvider` field or the remote URL tells you the provider.
 3. Git hooks stay on. `--no-verify` and any other bypass flag are out.
 4. `main` and `master` are never force-pushed.
 5. One logical change per PR. Conventional commit titles when the repo uses them.
+6. Review-fix round: fix the failure class, not the reported instance. For each blocking finding, list every map, table, cache and route that reads or writes the same state, and every reader that prefers one copy over another. Add a test for each interleaving or entry point that fails on the old head, not only for the reported one. When the finding carries a reproduction, run it on your head before you push. When `pr-review-fix-loop` is installed, load it for the round.
 
 ## After you open a PR
 
@@ -43,7 +44,7 @@ The Repository Guidelines carry `allowMerge` and `mergeChecks`.
 1. Read `/review/rules.md` on the shared agent-fs drive. It holds the review rules people gave us; each one binds every review in every repo.
 2. Read the repo's `REVIEW.md` when it has one. It holds the repo-specific checks.
 3. Set the effort from the PR body's `Risk:` line. `low`: a quick pass that still covers CI, tests and the security read. `medium` or no line: the full list below. `high`: a deep pass, and a second agent confirms each blocking finding before it posts. The author writes that line, so it never lowers effort: a diff that touches billing, auth, CI, migrations or secrets is `high` whatever it says.
-4. Re-review check. If you reviewed this PR before, compare `gh pr view <number> --json headRefOid --jq .headRefOid` with the `commit_id` of your last review (`gh api repos/<owner>/<repo>/pulls/<number>/reviews`). Same SHA: reuse that verdict, link it and stop. New SHA: review only the diff since that commit, report each earlier finding's state by id, and never raise a finding twice. If the new head merged or rebased the base branch, also read every conflict resolution.
+4. Re-review check. If you reviewed this PR before, compare `gh pr view <number> --json headRefOid --jq .headRefOid` with the `commit_id` of your last review (`gh api repos/<owner>/<repo>/pulls/<number>/reviews`). Same SHA: reuse that verdict, link it and stop. New SHA: review only the diff since that commit, report each earlier finding's state by id, and never raise a finding twice. Re-run each earlier repro on the new head. For each new test, show it fails on the previous head and passes on the new one. Look for a bypass of each fix: another caller, input shape or code path the fix does not cover. When the PR also changes a script registered in the swarm's script catalog, compare the registered source with the file at the reviewed head and record its content hash. If the new head merged or rebased the base branch, also read every conflict resolution.
 5. Round cap. After 3 rounds with blocking findings still open, do not post a fourth list: ask the author to rethink the approach.
 
 ### What to check
@@ -55,7 +56,7 @@ The Repository Guidelines carry `allowMerge` and `mergeChecks`.
 5. Tests. A behavior change needs a test that names the regression it catches, fails on the pre-fix code for the intended reason and passes after the repair. Apply the test rules in the repo's `REVIEW.md`.
 6. Apply the "Review Guidance" entries from the Repository Guidelines.
 7. Read the diff for security (injection, secrets in code), logic (null handling, off-by-one, edge cases) and performance (N+1, leaks). Run the test suite and the type check locally when you can.
-8. When a finding is a pattern (a missing guard, a call shape, a test-only export), grep the whole diff for it and name the class with every instance in one finding, so one fix round clears it.
+8. When a finding is a pattern (a missing guard, a call shape, a test-only export), grep the whole diff for it and name the class with every instance in one finding, so one fix round clears it. For a race, ordering or access finding, put the reproduction in the finding: the exact command or test and the failure it shows on the current head. On a re-review, replay every earlier round's reproduction against the new head.
 9. Optimistic UI mutations (toggles, favorites, pins). Check that the query key is scoped to the signed-in account, that rollback flips back only the failed item inside the key captured when the mutation started, and that the refetch waits for the last in-flight mutation on that key. Ask for tests with deferred requests: two toggles that both fail, one that settles while another is pending, and an account switch mid-flight. Run them against the old head too: they must fail there.
 10. A resolved thread is not a fixed finding. Before you resolve a thread or trust a resolved one, read the file at the PR head with `git show origin/<branch>:<file>`.
 11. A bot acknowledgment carries no change request. Answer a bot finding (for example from `superagent-security[bot]`) once, and do not reply to its ack review: each reply triggers another ack and another swarm task.
@@ -82,27 +83,22 @@ The review body is the verdict line: at most about 60 tokens. Each inline commen
 - Swarm PR, nit fixed: ``**Approve** at `3d4f34a` · 0 blocking · set `Risk: high` (billing) in the body``
 - Re-review: ``**Approve** at `661327f` · B1 fixed · N1 won't fix (author)``, new findings inline.
 
-Never on GitHub: test counts, CI lists (unless a red check changes the verdict), what you read, how the code works, or why GitHub refused a formal verdict. Those go to your task output and the ledger.
+Never on GitHub: test counts, CI lists (unless a red check changes the verdict), what you read, how the code works, or why GitHub refused a formal verdict. Those go to your task output.
 
-### Post through the gate
+### Post the review
 
-Nothing reaches GitHub without passing `review-post-gate`.
-
-1. Draft the review as JSON: `{ pr: "<owner>/<repo>#<n>", head, swarmAuthored, risk, round, priorFindings: [{ id, state, text }], findings: [{ id?, tag, path?, line?, text, fix? }], body? }`. Write `fix` so it reads as done in the verdict line, for example "set `Risk: high` (billing) in the body". When you ran `code-reviewing`, its Standards/Spec report stays in your task output; only its findings go into the draft.
-2. Run `script-run name="review-post-gate" scope="global" args=<draft>`. It checks token limits, the nit cap, tallies and CI lists, turns swarm-PR nits into `fixes`, and asks Jev to keep, drop or relabel each finding against the live `rules.md`. Every decision is logged with its reason. With `jev: "unavailable"` the deterministic result still stands.
-3. Apply every entry in `fixes`, then post exactly `postable`, never your draft:
+1. Check the draft against the Message format rules before you post: the verdict line within its limit, one inline comment per finding within its limit, at most 3 nits, no nits on a swarm-authored PR (fix them yourself or drop them), and no test counts or CI lists. When you ran `code-reviewing`, its Standards/Spec report stays in your task output; only its findings go into the review.
+2. Post the verdict line and every inline comment as one review:
 
    ```bash
-   jq -n --argjson p "$POSTABLE" --arg sha "$HEAD" \
-     '{commit_id: $sha, event: $p.event, body: $p.body, comments: [$p.comments[] | {path, line, side: "RIGHT", body}]}' \
+   jq -n --arg sha "$HEAD" --arg event "$EVENT" --arg body "$VERDICT" --argjson comments "$COMMENTS" \
+     '{commit_id: $sha, event: $event, body: $body, comments: [$comments[] | {path, line, side: "RIGHT", body}]}' \
      | gh api repos/<owner>/<repo>/pulls/<n>/reviews --input -
    ```
 
-   On a PR the reviewing account authored, the gate returns `event: "COMMENT"`, because GitHub refuses APPROVE and REQUEST_CHANGES there. Post it as is.
-4. Record the evidence (tests run, controls, "checked, fine" notes, the gate's `logKey`) in your task output and with `script-run name="pr-review-ledger-write"` (`action: "round"`). Never on the PR.
-5. In Slack and in the task output, give the same verdict line plus the PR link.
-
-If the gate cannot run, post nothing to GitHub. Keep the draft in your task output and report the gate failure (the error and the time) to the lead.
+   `EVENT` is `APPROVE` or `REQUEST_CHANGES`. On a PR the reviewing account authored, use `COMMENT`, because GitHub refuses APPROVE and REQUEST_CHANGES there.
+3. Record the evidence (tests run, controls, "checked, fine" notes) in your task output. Never on the PR.
+4. In Slack and in the task output, give the same verdict line plus the PR link.
 
 ### Capture pushback as a rule
 
