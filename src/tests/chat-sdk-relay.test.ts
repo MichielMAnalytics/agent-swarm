@@ -29,7 +29,7 @@ import {
 } from "../integrations/chat-sdk/relay";
 import { createStandaloneScheduleTask } from "../scheduler/schedule-task";
 import { chatSdkContextKey } from "../tasks/context-key";
-import { createResumeFollowUp } from "../tasks/worker-follow-up";
+import { createResumeFollowUp, createWorkerTaskFollowUp } from "../tasks/worker-follow-up";
 import type { Agent, AgentTask } from "../types";
 import { startTelegramHarness, type TelegramHarness } from "./chat-sdk-harness";
 import { loadBundleFixture } from "./fixtures/extensions/load";
@@ -541,45 +541,151 @@ describe("chat relay watcher", () => {
     expect(wakeUp.contextKey).toBe(`task:schedule:${schedule.id}`);
   });
 
-  test("a delegated worker's deferral wakes up outside the chat and stays silent", async () => {
-    const worker = await createAgent({
-      id: crypto.randomUUID(),
-      name: "ChatRelayDeferringWorker",
-      isLead: false,
-      status: "idle",
-      maxTasks: 5,
-    });
-    const chatId = nextChatId;
-    const leadTask = await createChatTask(chatId, { askMessageId: 43 });
-    const delegated = await createTaskExtended("worker part", {
-      agentId: worker.id,
-      creatorAgentId: lead.id,
-      source: "mcp",
-      parentTaskId: leadTask.id,
-    });
-    expect(delegated.contextKey).toBe(leadTask.contextKey);
-    await completeTask(delegated.id, "Checking back later.", {
-      deferredAt: new Date().toISOString(),
-    });
-    const schedule = await createScheduledTask({
-      name: `deferred-${delegated.id.slice(0, 8)}-${crypto.randomUUID()}`,
-      taskTemplate: "resume the worker part",
-      targetType: "agent-task",
-      scheduleType: "one_time",
-      nextRunAt: new Date().toISOString(),
-      targetAgentId: worker.id,
-      createdByAgentId: worker.id,
-      taskType: "deferred",
-      parentTaskId: delegated.id,
-    });
-    const wakeUp = await createStandaloneScheduleTask(schedule);
-    // The worker reports through the Lead, as its delegated task did.
-    expect(wakeUp.contextKey).toBe(`task:schedule:${schedule.id}`);
-    await completeTask(wakeUp.id, "RAW PRIVATE WORKER RESULT");
+  describe("a delegated worker's deferral", () => {
+    let worker: Agent;
+    let otherWorker: Agent;
 
-    expect(await obligation(wakeUp.id)).toBeNull();
-    await processPendingChatRelays();
-    expect(sendsTo(chatId)).toHaveLength(0);
+    beforeAll(async () => {
+      worker = await createAgent({
+        id: crypto.randomUUID(),
+        name: "ChatRelayDeferringWorker",
+        isLead: false,
+        status: "idle",
+        maxTasks: 5,
+      });
+      otherWorker = await createAgent({
+        id: crypto.randomUUID(),
+        name: "ChatRelayRetargetWorker",
+        isLead: false,
+        status: "idle",
+        maxTasks: 5,
+      });
+    });
+
+    /** A Lead chat ask (anchored on message 43) delegated to `worker`. */
+    async function delegate(
+      chatId: number,
+    ): Promise<{ leadTask: AgentTask; delegated: AgentTask }> {
+      const leadTask = await createChatTask(chatId, { askMessageId: 43 });
+      const delegated = await createTaskExtended("worker part", {
+        agentId: worker.id,
+        creatorAgentId: lead.id,
+        source: "mcp",
+        parentTaskId: leadTask.id,
+      });
+      expect(delegated.contextKey).toBe(leadTask.contextKey);
+      return { leadTask, delegated };
+    }
+
+    /** What defer-task books for `task`, fired by the scheduler. */
+    async function deferAndWake(
+      task: AgentTask,
+      options: { targetAgentId?: string } = {},
+    ): Promise<AgentTask> {
+      await completeTask(task.id, "Checking back later.", {
+        deferredAt: new Date().toISOString(),
+      });
+      const schedule = await createScheduledTask({
+        name: `deferred-${task.id.slice(0, 8)}-${crypto.randomUUID()}`,
+        taskTemplate: "resume the worker part",
+        targetType: "agent-task",
+        scheduleType: "one_time",
+        nextRunAt: new Date().toISOString(),
+        targetAgentId: options.targetAgentId ?? task.agentId ?? undefined,
+        createdByAgentId: task.agentId ?? undefined,
+        taskType: "deferred",
+        parentTaskId: task.id,
+      });
+      const wakeUp = await createStandaloneScheduleTask(schedule);
+      // The worker reports through the Lead, as its delegated task did.
+      expect(wakeUp.contextKey).toBe(`task:schedule:${schedule.id}`);
+      return wakeUp;
+    }
+
+    /**
+     * Completes the worker's `task` with raw output, then runs its Lead
+     * follow-up to a reviewed answer. Returns what reached the chat.
+     */
+    async function reportThroughLead(
+      task: AgentTask,
+      chatId: number,
+      leadTask: AgentTask,
+    ): Promise<Array<Record<string, unknown>>> {
+      const completed = await completeTask(task.id, "RAW PRIVATE WORKER RESULT");
+      expect(completed).not.toBeNull();
+      expect(await obligation(task.id)).toBeNull();
+      const followUp = await createWorkerTaskFollowUp({
+        task: completed!,
+        status: "completed",
+        output: completed!.output,
+      });
+      await processPendingChatRelays();
+      expect(sendsTo(chatId)).toHaveLength(0);
+
+      expect(followUp?.agentId).toBe(lead.id);
+      expect(followUp?.contextKey).toBe(leadTask.contextKey);
+      expect(followUp?.mentionMessageId).toBe(`${chatId}:43`);
+      await completeTask(followUp!.id, "REVIEWED LEAD ANSWER");
+      await processPendingChatRelays();
+      return sendsTo(chatId);
+    }
+
+    function expectOneReviewedAnswer(sends: Array<Record<string, unknown>>): void {
+      expect(sends).toHaveLength(1);
+      expect(sentText(sends[0] ?? {})).toContain("REVIEWED LEAD ANSWER");
+      expect(sentText(sends[0] ?? {})).not.toContain("RAW PRIVATE WORKER RESULT");
+      expect(sends[0]?.reply_parameters).toEqual({
+        message_id: 43,
+        allow_sending_without_reply: true,
+      });
+    }
+
+    test("control: an undeferred worker reports one reviewed answer", async () => {
+      const chatId = nextChatId;
+      const { leadTask, delegated } = await delegate(chatId);
+      expectOneReviewedAnswer(await reportThroughLead(delegated, chatId, leadTask));
+    });
+
+    test("wakes up outside the chat, stays silent and reports through the Lead", async () => {
+      const chatId = nextChatId;
+      const { leadTask, delegated } = await delegate(chatId);
+      const wakeUp = await deferAndWake(delegated);
+      expectOneReviewedAnswer(await reportThroughLead(wakeUp, chatId, leadTask));
+    });
+
+    test("a repeated deferral still reports through the Lead", async () => {
+      const chatId = nextChatId;
+      const { leadTask, delegated } = await delegate(chatId);
+      const firstWake = await deferAndWake(delegated);
+      const secondWake = await deferAndWake(firstWake);
+      expect(await obligation(firstWake.id)).toBeNull();
+      expectOneReviewedAnswer(await reportThroughLead(secondWake, chatId, leadTask));
+    });
+
+    test("a resume of the wake-up still reports through the Lead", async () => {
+      const chatId = nextChatId;
+      const { leadTask, delegated } = await delegate(chatId);
+      const wakeUp = await deferAndWake(delegated);
+      await startTask(wakeUp.id);
+      await supersedeTask(wakeUp.id, { reason: "graceful_shutdown", resumeTaskId: null });
+      const result = await createResumeFollowUp({
+        parentId: wakeUp.id,
+        reason: "graceful_shutdown",
+      });
+      expect(result.kind).toBe("created");
+      if (result.kind !== "created") return;
+      expect(result.task.agentId).toBe(worker.id);
+      expect(result.task.contextKey).toBe(wakeUp.contextKey);
+      expectOneReviewedAnswer(await reportThroughLead(result.task, chatId, leadTask));
+    });
+
+    test("a wake-up re-targeted to another worker reports through the Lead", async () => {
+      const chatId = nextChatId;
+      const { leadTask, delegated } = await delegate(chatId);
+      const wakeUp = await deferAndWake(delegated, { targetAgentId: otherWorker.id });
+      expect(wakeUp.agentId).toBe(otherWorker.id);
+      expectOneReviewedAnswer(await reportThroughLead(wakeUp, chatId, leadTask));
+    });
   });
 
   test("a deferred wake-up that runs as another agent than its parent is not relayed", async () => {
