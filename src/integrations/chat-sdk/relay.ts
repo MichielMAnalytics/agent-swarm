@@ -15,6 +15,7 @@ import { shortId } from "./commands";
 import { chatMessageLimit, splitChatMessage } from "./limits";
 import { errorMessage } from "./logger";
 import { postChatMessage } from "./outbound";
+import { taskOutputChatFiles } from "./outbound-files";
 import { getChatInstance, getChatSdkHealth } from "./runtime";
 import { sweepExpired } from "./state";
 import { stopTypingKeepalive } from "./typing";
@@ -102,7 +103,8 @@ export function formatChatRelayMessages(
  *
  * Delivery is at-least-once: a chunk failure re-posts the earlier chunks on
  * retry, and a crash between the send and `markChatRelayDelivered` re-sends the
- * message.
+ * message. The task's output attachments go after the text; a file that cannot
+ * be sent gets a note in the thread and does not fail the delivery.
  *
  * Once `signal` aborts, no further row is claimed. A send already in flight is
  * not cancelled (`postChatMessage` takes no signal); its row keeps the claim
@@ -153,6 +155,7 @@ export async function processPendingChatRelays(
         threadId: target.threadId,
         text: formatChatRelayMessages(task, target.adapter, agent?.name),
         taskId: task.id,
+        files: await taskOutputChatFiles(task.id),
         // The inbound message this task answers. A lead follow-up, resume or
         // defer wake-up inherits it from its parent, so it answers the same ask.
         replyToMessageId: task.mentionMessageId,

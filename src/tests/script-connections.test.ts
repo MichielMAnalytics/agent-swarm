@@ -638,8 +638,8 @@ describe("script connections", () => {
       markMigrationApplied(database, "231_slack_tasks_last_updated_index.sql");
       // 232 rebuilds session_tokens with the 207 columns, which this fixture skipped.
       markMigrationApplied(database, "232_agent_session_tokens.sql");
-      // 234 reads agent_tasks.deferredAt, which this migration-112-only fixture does not create.
-      markMigrationApplied(database, "234_chat_relay_defer.sql");
+      // 235 reads agent_tasks.deferredAt, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "235_chat_relay_defer.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
