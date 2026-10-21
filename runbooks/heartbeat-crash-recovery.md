@@ -63,6 +63,46 @@ untaken ports cannot start sibling branches or replay a completed downstream
 node. Steps without a selected port retain the live walker's default successor
 behavior. Waiting runs reconcile finished tasks, approvals, and durable waits.
 
+The last pass, `recoverForeachFanouts`, re-drives `foreach` fan-outs. It covers
+runs in `running` or `waiting` whose open foreach parent has a queued
+(`pending`) child, or a `running` child that no drive in this process owns. Every
+item settles through `settleForeachChild`, which writes the child and runs the
+join in one transaction. So a crash leaves a child queued, orphaned, or
+waiting, never half-joined.
+
+```
+# recoverIncompleteRuns, after the task / approval / wait / child-run passes:
+recoverForeachFanouts():
+  for each (run, foreachId) with a latest child row pending, or running and unowned,
+      where run.status in (running, waiting):
+    runForeachDrive(run, foreachId):    # holds the run, like a walk
+      claim, in one BEGIN IMMEDIATE transaction over latest attempt rows:
+        inFlight = running + waiting children
+        pending → running while inFlight < config.concurrency (unbounded when absent)
+        plus unowned running rows (already counted in inFlight)
+      start each claimed child:
+        instant body → run it, settle completed/failed   # re-runs an orphan: at-least-once
+        async body   → executor dedupes on the child step id (task, child run,
+                       approval, wait), so a reconnect never duplicates; park waiting
+      joined → walk the parent's successors (or finalize)
+      else   → park the run waiting if nothing is running
+```
+
+A claimed child that never started goes back to `pending`, so a run retry starts
+it. Under fail-fast, a failed item cancels every `pending` sibling instead, and
+in-flight siblings finish and record their outcome without reviving the run. Two
+recovery sweeps in a row never start more items than the cap: the cap counts the
+child rows, not in-process state.
+
+| Crash point | State left | Reconnect |
+|---|---|---|
+| During materialization | No child rows (one transaction) | The re-walk re-executes the parent and inserts the full set |
+| After claim, before start | Child `running`, no invocation | The sweep re-drives it; the executor dedupes on the child step id |
+| During execution (async) | Child `waiting` | The task, approval, wait and child-run passes settle it through `settleForeachChild` |
+| During execution (instant) | Child `running`, no owner | The sweep re-runs it once: at-least-once, like a top-level instant node |
+| During collection | Settle and join committed together | The join is idempotent (parent already `completed`); a missed drive is caught by the sweep |
+| During a run retry | One transaction adds every attempt row and resets the run | A second retry finds the run not `failed` and stops |
+
 This ownership guard is process-local, not a distributed lease. It assumes one
 API workflow engine owns the database; multiple worker runtimes do not create
 multiple API engines. Separate API processes sharing a database would need
