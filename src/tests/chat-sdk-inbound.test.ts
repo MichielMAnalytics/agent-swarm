@@ -20,7 +20,7 @@ import {
 import { linkIdentity } from "../be/users";
 import { resetFileStorageProviderForTests } from "../fs/registry";
 import { drainBackground } from "../integrations/chat-sdk/background";
-import { formatChatRelayText } from "../integrations/chat-sdk/relay";
+import { formatChatRelayText, formatChatTaskTag } from "../integrations/chat-sdk/relay";
 import { CHAT_CHANNELS_NAMESPACE, routeChatMessage } from "../integrations/chat-sdk/router";
 import { getChatInstance } from "../integrations/chat-sdk/runtime";
 import { isChatThreadBuffered } from "../integrations/chat-sdk/thread-buffer";
@@ -476,7 +476,11 @@ describe("Chat SDK requester and group addressing", () => {
     const deferred = await getTaskById(task!.id);
     expect(deferred?.output).toMatch(new RegExp(`at ${madrid}$`));
     expect(deferred?.output).not.toContain("UTC");
-    expect(formatChatRelayText(deferred!)).toBe(deferred!.output!);
+    // The relay posts the placeholder text after the task tag (here the trigger
+    // drops it: a deferral posts nothing).
+    expect(formatChatRelayText(deferred!)).toBe(
+      `${formatChatTaskTag(deferred!)}\n\n${deferred!.output!}`,
+    );
   });
 
   test("an unknown sender gets no requester and lands in the Unmapped tracker", async () => {
