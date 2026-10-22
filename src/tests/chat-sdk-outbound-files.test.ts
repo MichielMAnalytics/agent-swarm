@@ -650,8 +650,9 @@ describe("relay of output attachments", () => {
       expect.stringMatching(/^send(Rich)?Message$/),
       "sendDocument",
     ]);
+    // The line-leading tag is escaped so Telegram does not render it as a heading.
     expect(textOf(calls[0]!.body)).toBe(
-      `${formatChatTaskTag(task, lead.name)}\n\nDone, report attached.`,
+      `\\${formatChatTaskTag(task, lead.name)}\n\nDone, report attached.`,
     );
     expect((calls[1]!.body.document as TelegramMockFilePart).filename).toBe("result.pdf");
   });

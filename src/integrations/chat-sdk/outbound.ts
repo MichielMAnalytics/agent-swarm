@@ -86,6 +86,42 @@ interface PostTarget {
   }): Promise<SentChunk>;
 }
 
+/** A fence opener or closer: up to 3 spaces, then 3+ backticks or tildes. */
+const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})/;
+/**
+ * A `#` run at the start of a line's text (after blockquote, list and task
+ * markers) that CommonMark does not read as a heading: 7+ `#`, or `#` followed
+ * by a character other than whitespace or `#`.
+ */
+const NON_HEADING_HASH =
+  /^( {0,3}(?:>[ \t]?)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+(?:\[[ xX]\][ \t]+)?)?)(#{7,}|#{1,6}(?=[^\s#]))/;
+
+/**
+ * Telegram renders `{ markdown }` posts with `sendRichMessage`, and Telegram's
+ * own Markdown parser reads a line-leading `#2203` or `#tag` as a heading.
+ * Escape the first `#` of such a line so only CommonMark ATX headings
+ * (`# Title`) stay headings. Fenced code is left as is. The MarkdownV2
+ * fallback parses the escape back to a literal `#`.
+ */
+export function escapeTelegramHashLines(markdown: string): string {
+  let fence: string | undefined;
+  return markdown
+    .split("\n")
+    .map((line) => {
+      const marker = FENCE_LINE.exec(line)?.[1];
+      if (fence) {
+        if (marker && marker[0] === fence[0] && marker.length >= fence.length) fence = undefined;
+        return line;
+      }
+      if (marker) {
+        fence = marker;
+        return line;
+      }
+      return line.replace(NON_HEADING_HASH, "$1\\$2");
+    })
+    .join("\n");
+}
+
 /** `replyFirst` sends the first chunk as a native reply; later chunks are plain posts. */
 async function postChunks(
   adapter: string,
@@ -97,7 +133,7 @@ async function postChunks(
   let threadId: string | undefined;
   const limit = chatMessageLimit(adapter);
   for (const chunk of parts.flatMap((part) => splitChatMessage(part, limit))) {
-    const message = { markdown: chunk };
+    const message = { markdown: adapter === "telegram" ? escapeTelegramHashLines(chunk) : chunk };
     const sent =
       replyFirst && messageIds.length === 0
         ? await replyFirst(message)

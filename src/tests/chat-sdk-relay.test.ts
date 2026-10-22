@@ -458,7 +458,8 @@ describe("chat relay watcher", () => {
     const [send, ...rest] = sendsTo(chatId);
     expect(rest).toHaveLength(0);
     expect(send?.reply_parameters).toEqual({ message_id: 41, allow_sending_without_reply: true });
-    expect(sentText(send ?? {})).toStartWith(`#${task.id.slice(0, 8)} · ChatRelayLead`);
+    // The line-leading tag is escaped so Telegram does not render it as a heading.
+    expect(sentText(send ?? {})).toStartWith(`\\#${task.id.slice(0, 8)} · ChatRelayLead`);
     expect(sentText(send ?? {})).toContain("Here is your answer.");
   });
 
