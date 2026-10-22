@@ -3,8 +3,9 @@ import { useCurrentUser } from "@/contexts/current-user-context";
 import { sessionsShowParam, useSessionsShow } from "@/lib/sessions-show";
 import { api } from "../client";
 
-/** Query key prefix of the sessions v2 tree. Invalidate with this key. */
-export const SESSION_TREE_KEY = ["session-tree"] as const;
+import { sessionTreeKey } from "./session-query-keys";
+
+export { SESSION_TREE_KEY } from "./session-query-keys";
 
 /**
  * Every visible session group with its counts, plus the Inbox, Later, Done,
@@ -16,7 +17,7 @@ export function useSessionTree(options?: { enabled?: boolean }) {
   const { userId } = useCurrentUser();
   const [show] = useSessionsShow();
   return useQuery({
-    queryKey: [...SESSION_TREE_KEY, userId ?? null, show],
+    queryKey: sessionTreeKey(userId ?? null, show),
     queryFn: () => api.getSessionTree(sessionsShowParam(show)),
     enabled: options?.enabled ?? true,
   });
