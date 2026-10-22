@@ -18,6 +18,7 @@ import { toast } from "sonner";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import { sessionSharesMutationOptions } from "@/lib/session-shares-mutation";
 import { sharesInput } from "@/lib/session-sharing";
+import { getSessionsShow, useSessionsShow } from "@/lib/sessions-show";
 import { sessionRefetchInterval } from "@/lib/task-activity";
 import { api } from "../client";
 import type { SessionStatusFilter, SessionTriageFilter } from "../types";
@@ -38,6 +39,8 @@ export interface UseSessionsOptions {
    * Every sessions v2 list sends `tree`, so its totals match `useSessionTree()`.
    */
   scope?: "mine" | "shared" | "tree";
+  /** Mine (default) or All, with `scope=tree`. `sessionsQueryOptions` fills it in. */
+  show?: "all";
   /** Asset key prefix, subgroups included (sessions v2). */
   keyPrefix?: string;
   /** Exactly this group, not its subgroups (sessions v2). */
@@ -71,6 +74,8 @@ export type SessionListParams = Omit<UseSessionsOptions, "enabled"> & { limit: n
 export function sessionsQueryOptions(userId: string | null, options?: UseSessionsOptions) {
   const { enabled = true, ...rest } = options ?? {};
   const params: SessionListParams = { ...rest, limit: rest.limit ?? 50 };
+  // A tree list follows the Mine / All view, so its key and total match the tree's.
+  if (rest.scope === "tree" && getSessionsShow() === "all") params.show = "all";
   return {
     // Rows carry the viewer's read state, and `scope` and `triage` depend on
     // the viewer, so a user switch must not show the last user's page.
@@ -88,6 +93,7 @@ export function sessionListParamsOf(key: QueryKey): SessionListParams | undefine
 
 export function useSessions(options?: UseSessionsOptions) {
   const { userId } = useCurrentUser();
+  useSessionsShow();
   return useQuery(sessionsQueryOptions(userId ?? null, options));
 }
 
