@@ -5767,6 +5767,7 @@
               "static",
               "docker",
               "e2b",
+              "boxd",
               "k8s"
             ]
           },
@@ -6059,6 +6060,7 @@
               "static",
               "docker",
               "e2b",
+              "boxd",
               "k8s"
             ]
           },
@@ -62283,6 +62285,7 @@
                       "static",
                       "docker",
                       "e2b",
+                      "boxd",
                       "k8s"
                     ]
                   },
@@ -62572,6 +62575,7 @@
                       "static",
                       "docker",
                       "e2b",
+                      "boxd",
                       "k8s"
                     ]
                   },
@@ -63132,6 +63136,7 @@
                       "static",
                       "docker",
                       "e2b",
+                      "boxd",
                       "k8s"
                     ]
                   },
@@ -63344,6 +63349,7 @@
                       "static",
                       "docker",
                       "e2b",
+                      "boxd",
                       "k8s"
                     ]
                   },
