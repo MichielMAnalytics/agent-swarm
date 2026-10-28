@@ -13,6 +13,7 @@ const machines = {
     labels: params.labels as Record<string, string>,
   })),
   setAutoHibernateTimeout: mock(async (_id: string, _seconds: number) => {}),
+  setDeleteAfter: mock(async (_id: string, _seconds: number): Promise<Date | null> => null),
   waitUntilReady: mock(async (_id: string) => {}),
   exec: mock(async (_id: string, _params: Record<string, unknown>) => ok),
   get: mock(async (_id: string): Promise<Record<string, unknown>> => machine),
@@ -73,6 +74,7 @@ beforeEach(() => {
     ...machine,
     labels: params.labels as Record<string, string>,
   }));
+  machines.setDeleteAfter.mockImplementation(async () => null);
   machines.exec.mockImplementation(async () => ok);
   machines.get.mockImplementation(async () => machine);
   machines.list.mockImplementation(async () => []);
@@ -80,7 +82,7 @@ beforeEach(() => {
 });
 
 describe("boxd runtime provider", () => {
-  test("requires a key, an HTTPS worker URL, and a valid delete deadline", () => {
+  test("requires a key, an HTTPS worker URL, and valid durations", () => {
     const provider = new BoxdRuntimeProvider();
     expect(provider.checkConfig({ WORKER_API_URL: "https://swarm.test" })).toEqual({
       ready: false,
@@ -91,11 +93,21 @@ describe("boxd runtime provider", () => {
       false,
     );
     expect(provider.checkConfig(target)).toEqual({ ready: true, missing: [] });
-    expect(provider.checkConfig({ ...target, BOXD_DELETE_AFTER_SEC: "soon" })).toEqual({
-      ready: false,
-      missing: [],
-      hint: "BOXD_DELETE_AFTER_SEC must be a positive integer",
-    });
+    for (const key of [
+      "BOXD_DELETE_AFTER_SEC",
+      "BOXD_START_TIMEOUT_SEC",
+      "BOXD_STATUS_TIMEOUT_SEC",
+      "BOXD_TEARDOWN_TIMEOUT_SEC",
+    ]) {
+      for (const value of ["soon", "0", "1.5"]) {
+        expect(provider.checkConfig({ ...target, [key]: value })).toEqual({
+          ready: false,
+          missing: [],
+          hint: `${key} must be a positive integer`,
+        });
+      }
+      expect(provider.checkConfig({ ...target, [key]: "60" }).ready).toBe(true);
+    }
   });
 
   test("provisions an isolated, labeled machine and passes worker env out of argv", async () => {
@@ -109,9 +121,9 @@ describe("boxd runtime provider", () => {
       org: undefined,
       labels: ownerLabels,
       isolated: true,
-      deleteAfter: undefined,
       config: { autoSuspendTimeout: 0, idleIgnoreOutbound: false },
     });
+    expect(machines.setDeleteAfter).not.toHaveBeenCalled();
     expect(machines.setAutoHibernateTimeout).toHaveBeenCalledWith(machine.id, 0);
     expect(machines.waitUntilReady).toHaveBeenCalledWith(machine.id);
     const [, exec] = machines.exec.mock.calls[0]!;
@@ -130,6 +142,7 @@ describe("boxd runtime provider", () => {
       request.image,
     ]);
     expect(exec.env).toEqual(request.env);
+    expect(exec.timeout).toBe(600_000);
     expect(JSON.stringify(exec.command)).not.toContain(request.env.API_KEY);
   });
 
@@ -159,9 +172,15 @@ describe("boxd runtime provider", () => {
     expect(machines.create).not.toHaveBeenCalled();
   });
 
-  test("restores the configured snapshot and applies the org and delete deadline", async () => {
+  test("restores the configured snapshot and applies the org, deadline and start timeout", async () => {
     await new BoxdRuntimeProvider().provision(
-      { ...target, BOXD_SNAPSHOT: "swarm-worker", BOXD_ORG: "acme", BOXD_DELETE_AFTER_SEC: "3600" },
+      {
+        ...target,
+        BOXD_SNAPSHOT: "swarm-worker",
+        BOXD_ORG: "acme",
+        BOXD_DELETE_AFTER_SEC: "3600",
+        BOXD_START_TIMEOUT_SEC: "900",
+      },
       { ...request, resources: { cpu: 4 } },
     );
     expect(machines.create).toHaveBeenCalledWith({
@@ -169,10 +188,22 @@ describe("boxd runtime provider", () => {
       org: "acme",
       labels: ownerLabels,
       isolated: true,
-      deleteAfter: 3600,
       fromSnapshot: "swarm-worker",
       config: { autoSuspendTimeout: 0, idleIgnoreOutbound: false },
     });
+    expect(machines.setDeleteAfter).toHaveBeenCalledWith(machine.id, 3600);
+    expect(machines.exec.mock.calls[0]?.[1].timeout).toBe(900_000);
+  });
+
+  test("deletes the machine when its delete deadline cannot be set", async () => {
+    machines.setDeleteAfter.mockImplementation(async () => {
+      throw new sdk.APIConnectionError("connection reset");
+    });
+    await expect(
+      new BoxdRuntimeProvider().provision({ ...target, BOXD_DELETE_AFTER_SEC: "3600" }, request),
+    ).rejects.toThrow("connection reset");
+    expect(machines.delete).toHaveBeenCalledWith(machine.id);
+    expect(machines.exec).not.toHaveBeenCalled();
   });
 
   test("deletes the machine when the worker fails to start and keeps that error", async () => {
@@ -214,6 +245,9 @@ describe("boxd runtime provider", () => {
     }
     expect(machines.exec).not.toHaveBeenCalled();
     machines.get.mockImplementation(async () => machine);
+    machines.exec.mockImplementation(inspect("running 0\n"));
+    await provider.status({ ...target, BOXD_STATUS_TIMEOUT_SEC: "5" }, handle);
+    expect(machines.exec.mock.calls.map(([, params]) => params.timeout)).toEqual([5_000]);
     for (const [exec, expected] of [
       [inspect("running 0\n"), "running"],
       [inspect("created 0\n"), "starting"],
@@ -282,6 +316,20 @@ describe("boxd runtime provider", () => {
       throw new Error(`denied ${target.BOXD_API_KEY}`);
     });
     await expect(provider.terminate(target, handle)).rejects.toThrow("denied [REDACTED");
+  });
+
+  test("terminate fails unless boxd confirms the machine is gone", async () => {
+    const provider = new BoxdRuntimeProvider();
+    machines.get.mockImplementation(async () => {
+      throw new sdk.APIConnectionError(`unreachable ${target.BOXD_API_KEY}`);
+    });
+    await expect(provider.terminate(target, handle)).rejects.toThrow("unreachable [REDACTED");
+    machines.get.mockImplementation(async () => machine);
+    const started = Date.now();
+    await expect(
+      provider.terminate({ ...target, BOXD_TEARDOWN_TIMEOUT_SEC: "1" }, handle),
+    ).rejects.toThrow(`boxd still reports machine ${machine.id} 1s after deleting it`);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1000);
   });
 
   test("resume wakes hibernated machines and thaws suspended ones", async () => {

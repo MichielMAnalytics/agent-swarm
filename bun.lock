@@ -11,7 +11,7 @@
         "@anthropic-ai/sdk": "^1.1.0",
         "@asteasolutions/zod-to-openapi": "^8.0.0",
         "@aws-sdk/client-bedrock": "3.1048.0",
-        "@boxd-sh/sdk": "0.2.18",
+        "@boxd-sh/sdk": "0.2.20",
         "@chat-adapter/discord": "4.41.1",
         "@chat-adapter/slack": "4.41.1",
         "@chat-adapter/teams": "4.41.1",
@@ -412,7 +412,7 @@
 
     "@borewit/text-codec": ["@borewit/text-codec@0.2.2", "", {}, "sha512-DDaRehssg1aNrH4+2hnj1B7vnUGEjU6OIlyRdkMd0aUdIUvKXrJfXsy8LVtXAy7DRvYVluWbMspsRhz2lcW0mQ=="],
 
-    "@boxd-sh/sdk": ["@boxd-sh/sdk@0.2.18", "", { "dependencies": { "@bufbuild/protobuf": "^2.10.2", "@grpc/grpc-js": "^1.12.0" } }, "sha512-0Agh346a1G5mIlhAztNanSYVOXMJLOjQXqrgc+awYEvU4tkAhQvowmwxjbC8Hj6wO5w8wgNuHcAM8IA6hyuRXw=="],
+    "@boxd-sh/sdk": ["@boxd-sh/sdk@0.2.20", "", { "dependencies": { "@bufbuild/protobuf": "^2.10.2", "@grpc/grpc-js": "^1.12.0" } }, "sha512-Tsqk7s0FlPGCTsijScmr4hlaP2yiS7SuKD2uxIpPJIKXHV9WzuWFOkYgJr0t8sqV/2oBcx8tywopng+Q6+VhYA=="],
 
     "@braintree/sanitize-url": ["@braintree/sanitize-url@7.1.2", "", {}, "sha512-jigsZK+sMF/cuiB7sERuo9V7N9jx+dhmHHnQyDSVdpZwVutaBu7WvNYqMDLSgFgfB30n452TP3vjDAvFC973mA=="],
 

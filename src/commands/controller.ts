@@ -164,6 +164,9 @@ export async function runController(args: string[]): Promise<void> {
       BOXD_BASE_URL: process.env.BOXD_BASE_URL,
       BOXD_SNAPSHOT: process.env.BOXD_SNAPSHOT,
       BOXD_DELETE_AFTER_SEC: process.env.BOXD_DELETE_AFTER_SEC,
+      BOXD_START_TIMEOUT_SEC: process.env.BOXD_START_TIMEOUT_SEC,
+      BOXD_STATUS_TIMEOUT_SEC: process.env.BOXD_STATUS_TIMEOUT_SEC,
+      BOXD_TEARDOWN_TIMEOUT_SEC: process.env.BOXD_TEARDOWN_TIMEOUT_SEC,
     };
     const provider = await createRuntimeProvider(kind, target);
     const config = provider.checkConfig(target);

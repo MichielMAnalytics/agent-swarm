@@ -151,6 +151,9 @@ An org API key selects its org. Set `BOXD_ORG` in controller configuration for a
 | `BOXD_SNAPSHOT` | Restore this snapshot instead of booting a fresh machine. The snapshot's size applies. |
 | `BOXD_DELETE_AFTER_SEC` | Delete each machine this many seconds after creation, in any state. A safety net for per-task pools. |
 | `BOXD_BASE_URL` | Another boxd API endpoint. |
+| `BOXD_START_TIMEOUT_SEC` | Seconds `docker run` may take to start the worker, image pull included. Default 600. |
+| `BOXD_STATUS_TIMEOUT_SEC` | Seconds a status check waits for `docker inspect`. Default 15. |
+| `BOXD_TEARDOWN_TIMEOUT_SEC` | Seconds terminate waits for boxd to confirm the machine is gone. Default 30. |
 
 Pool `resources` select the smallest size that covers them: 1 vCPU and 4 GiB, 2 and 8, 4 and 16, or 8 and 32.
 Machines have no lease. They run until the supervisor terminates them, so keep the API running or set `BOXD_DELETE_AFTER_SEC`.

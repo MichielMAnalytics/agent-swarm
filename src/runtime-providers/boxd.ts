@@ -22,13 +22,22 @@ import { resolveWorkerApiUrl } from "./worker-api-url";
  * - BOXD_BASE_URL (optional API endpoint)
  * - BOXD_SNAPSHOT (optional snapshot to boot from, e.g. one with the worker image pulled)
  * - BOXD_DELETE_AFTER_SEC (optional wall-clock deadline after which boxd deletes the machine)
+ * - BOXD_START_TIMEOUT_SEC (optional, default 600: `docker run`, image pull included)
+ * - BOXD_STATUS_TIMEOUT_SEC (optional, default 15: the `docker inspect` behind status)
+ * - BOXD_TEARDOWN_TIMEOUT_SEC (optional, default 30: waiting for boxd to confirm a delete)
  * - WORKER_API_URL (required HTTPS URL, with deployment fallbacks)
  */
 const WORKER_CONTAINER = "swarm-worker";
-const START_TIMEOUT_MS = 600_000;
-const STATUS_TIMEOUT_MS = 15_000;
-const TEARDOWN_TIMEOUT_MS = 30_000;
+const DEFAULT_START_TIMEOUT_SEC = 600;
+const DEFAULT_STATUS_TIMEOUT_SEC = 15;
+const DEFAULT_TEARDOWN_TIMEOUT_SEC = 30;
 const TEARDOWN_POLL_MS = 200;
+const SECONDS_KEYS = [
+  "BOXD_DELETE_AFTER_SEC",
+  "BOXD_START_TIMEOUT_SEC",
+  "BOXD_STATUS_TIMEOUT_SEC",
+  "BOXD_TEARDOWN_TIMEOUT_SEC",
+] as const;
 
 /** boxd size classes, smallest first. */
 const SIZES = [
@@ -55,12 +64,15 @@ async function client(target: RuntimeTargetConfig): Promise<Boxd> {
   return boxd;
 }
 
-function deleteAfterSec(target: RuntimeTargetConfig): number | undefined {
-  if (target.BOXD_DELETE_AFTER_SEC === undefined || target.BOXD_DELETE_AFTER_SEC === "")
-    return undefined;
-  const sec = Number(target.BOXD_DELETE_AFTER_SEC);
+/** A duration in whole seconds from target config; undefined when unset. */
+function seconds(
+  target: RuntimeTargetConfig,
+  key: (typeof SECONDS_KEYS)[number],
+): number | undefined {
+  if (target[key] === undefined || target[key] === "") return undefined;
+  const sec = Number(target[key]);
   if (!Number.isInteger(sec) || sec <= 0) {
-    throw new Error("BOXD_DELETE_AFTER_SEC must be a positive integer");
+    throw new Error(`${key} must be a positive integer`);
   }
   return sec;
 }
@@ -150,7 +162,7 @@ export class BoxdRuntimeProvider implements RuntimeProvider {
         hint: `boxd requires ${missing.join(" and ")}. WORKER_API_URL must use HTTPS.`,
       };
     try {
-      deleteAfterSec(target);
+      for (const key of SECONDS_KEYS) seconds(target, key);
     } catch (err) {
       return { ready: false, missing: [], hint: (err as Error).message };
     }
@@ -169,13 +181,15 @@ export class BoxdRuntimeProvider implements RuntimeProvider {
           [RUNTIME_LABELS.poolId]: req.poolId,
           [RUNTIME_LABELS.agentId]: req.agentId,
         };
+        const deleteAfter = seconds(target, "BOXD_DELETE_AFTER_SEC");
+        const startTimeoutSec =
+          seconds(target, "BOXD_START_TIMEOUT_SEC") ?? DEFAULT_START_TIMEOUT_SEC;
         const common = {
           name: `swarm-rt-${req.runtimeId}`,
           org: target.BOXD_ORG || undefined,
           labels,
           // Workers run agent code: no metadata endpoint, integrations, or boxd CLI.
           isolated: true,
-          deleteAfter: deleteAfterSec(target),
         };
         // An idle worker still has to receive work; never suspend it.
         const idle = { autoSuspendTimeout: 0, idleIgnoreOutbound: false };
@@ -188,6 +202,12 @@ export class BoxdRuntimeProvider implements RuntimeProvider {
             })
           : await boxd.machines.create({ ...common, config: { ...idle, ...size } });
         try {
+          // Set here rather than through create: the SDK sets the deadline in a
+          // second call, and if that call failed, create would reject after the
+          // machine exists, leaving it with no deadline and no handle to delete.
+          if (deleteAfter !== undefined) {
+            await boxd.machines.setDeleteAfter(machine.id, deleteAfter);
+          }
           // A hibernated worker cannot be woken by its own outbound traffic.
           await boxd.machines.setAutoHibernateTimeout(machine.id, 0);
           await boxd.machines.waitUntilReady(machine.id);
@@ -203,7 +223,7 @@ export class BoxdRuntimeProvider implements RuntimeProvider {
               req.image,
             ],
             env: req.env,
-            timeout: START_TIMEOUT_MS,
+            timeout: startTimeoutSec * 1000,
           });
           if (result.exitCode !== 0) {
             throw new Error(
@@ -229,13 +249,23 @@ export class BoxdRuntimeProvider implements RuntimeProvider {
         if (await isNotFound(err)) return;
         throw err;
       }
-      // delete resolves before teardown finishes. Wait until get and list agree.
-      const deadline = Date.now() + TEARDOWN_TIMEOUT_MS;
-      while (Date.now() < deadline) {
+      // delete resolves before teardown finishes. Only a lookup that no longer
+      // finds the machine confirms it; anything else fails, so the supervisor
+      // retries a terminate that is safe to repeat.
+      const timeoutSec =
+        seconds(target, "BOXD_TEARDOWN_TIMEOUT_SEC") ?? DEFAULT_TEARDOWN_TIMEOUT_SEC;
+      const deadline = Date.now() + timeoutSec * 1000;
+      while (true) {
         try {
           await boxd.machines.get(handle.externalId);
-        } catch {
-          return;
+        } catch (err) {
+          if (await isNotFound(err)) return;
+          throw err;
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `boxd still reports machine ${handle.externalId} ${timeoutSec}s after deleting it`,
+          );
         }
         await Bun.sleep(TEARDOWN_POLL_MS);
       }
@@ -255,6 +285,7 @@ export class BoxdRuntimeProvider implements RuntimeProvider {
       const status = machineStatus(machine.status);
       if (status !== "running") return status;
       // A running machine can still hold a finished worker: report the container.
+      const timeoutSec = seconds(target, "BOXD_STATUS_TIMEOUT_SEC") ?? DEFAULT_STATUS_TIMEOUT_SEC;
       try {
         const result = await boxd.machines.exec(machine.id, {
           command: [
@@ -264,7 +295,7 @@ export class BoxdRuntimeProvider implements RuntimeProvider {
             "{{.State.Status}} {{.State.ExitCode}}",
             WORKER_CONTAINER,
           ],
-          timeout: STATUS_TIMEOUT_MS,
+          timeout: timeoutSec * 1000,
         });
         if (result.exitCode !== 0) {
           return /no such (object|container)/i.test(result.stderr) ? "exited" : "unknown";

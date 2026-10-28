@@ -283,7 +283,9 @@ An isolated machine has no metadata endpoint, no in-VM `boxd` CLI, and no accoun
 Auto-suspend and auto-hibernate are off, because a frozen worker cannot receive work. Machines have no lease and run until termination.
 The adapter then runs `docker run -d --name swarm-worker` with the pool image in the machine.
 The command line carries only environment variable names. The values travel as exec environment.
-If the container fails to start, the adapter deletes the machine before it returns the original error.
+If any step after create fails (the delete deadline, readiness, or the container start), the adapter deletes the machine before it returns the original error.
+The adapter sets `BOXD_DELETE_AFTER_SEC` after create returns rather than through create, so a failure to set it still reaches that cleanup.
+`BOXD_START_TIMEOUT_SEC` bounds `docker run`, image pull included (default 600).
 Workers use Docker's default bridge network, so the machine's public HTTPS address serves nothing.
 
 Pool `resources` select the smallest boxd size that covers them: 1 vCPU and 4 GiB, 2 and 8, 4 and 16, or 8 and 32.
@@ -295,9 +297,10 @@ Use it as a safety net for per-task pools. An idle runtime that outlives the dea
 
 Status reads the machine. A missing machine reports `exited`. Suspended and hibernated machines report `paused`.
 A running machine reports its worker container: `exited` for exit code 0, `failed` for other exit codes.
-A container lookup that fails reports `unknown`. Authentication and transport failures on the machine lookup remain errors.
+A container lookup that fails, or takes longer than `BOXD_STATUS_TIMEOUT_SEC` (default 15), reports `unknown`. Authentication and transport failures on the machine lookup remain errors.
 `list` filters machines by the runtime label and the owner label.
-boxd answers a delete before teardown finishes. Terminate then waits up to 30 seconds until the machine lookup reports it missing, so status and list agree.
+boxd answers a delete before teardown finishes. Terminate then waits until the machine lookup reports it missing, so status and list agree.
+It waits up to `BOXD_TEARDOWN_TIMEOUT_SEC` (default 30). A lookup that still finds the machine at that point, or fails for another reason, fails the terminate so the supervisor retries it; a repeated terminate is safe.
 Pause suspends the machine to RAM. Resume wakes a suspended or hibernated machine.
 The supervisor does not pause boxd runtimes in this release.
 The adapter keeps one SDK client per credential, because boxd rate-limits key exchanges.
