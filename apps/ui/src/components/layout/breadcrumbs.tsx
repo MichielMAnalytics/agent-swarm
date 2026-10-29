@@ -57,11 +57,11 @@ const routeLabels: Record<string, string> = {
   history: "History",
   debug: "Debug",
   integrations: "Integrations",
-  keys: "API Keys",
+  keys: "Provider keys",
   lineage: "Lineage",
-  "api-keys": "API Keys",
+  "api-keys": "Provider keys",
   pages: "Pages",
-  file: "Comb",
+  file: "Files",
   people: "People",
   unmapped: "Unmapped",
 };
@@ -84,7 +84,7 @@ const HEX32_REGEX = /^[0-9a-f]{32}$/i;
 /** Fallback for segments without a routeLabels entry: kebab-case → Title Case
  * ("embed-test" → "Embed Test"). Keeps unknown routes readable without having
  * to register every new path here; routeLabels stays for names automatic
- * casing can't produce ("mcp-servers" → "MCP Servers", "keys" → "API Keys"). */
+ * casing can't produce ("mcp-servers" → "MCP Servers", "keys" → "Provider keys"). */
 function humanizeSegment(segment: string): string {
   // Malformed percent escapes ("/%", "/apps/%ZZ") make decodeURIComponent
   // throw, and the header renders OUTSIDE the route error boundary, so an
@@ -181,7 +181,7 @@ export function Breadcrumbs() {
   if (segments.length === 0) {
     return (
       <span className="min-w-0 truncate text-sm font-medium text-foreground">
-        {user?.name ? `Welcome back, ${user.name}` : "Welcome to Agent Swarm"}
+        {user?.name ? `Hi, ${user.name}` : "Welcome to Agent Swarm"}
       </span>
     );
   }

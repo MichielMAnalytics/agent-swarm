@@ -7,6 +7,7 @@ import {
   updateWorkflowRun,
   updateWorkflowRunStep,
 } from "../be/db";
+import { getRunLineageBlock } from "../be/db/workflow-runs";
 import type {
   WorkflowDefinition,
   WorkflowNode,
@@ -26,6 +27,22 @@ export const FOREACH_TERMINAL_STEP_STATUSES = new Set([
   "cancelled",
   "skipped",
 ]);
+
+/**
+ * A failed step queued for the retry poller (`nextRetryAt` set). A foreach
+ * child in this state is still in flight: it is not settled and holds its
+ * concurrency slot until the poller re-queues it.
+ */
+export function isRetryPending(step: Pick<WorkflowRunStep, "status" | "nextRetryAt">): boolean {
+  return step.status === "failed" && step.nextRetryAt != null;
+}
+
+/** A foreach child whose outcome is final: terminal and not queued for a retry. */
+export function isForeachChildSettled(
+  step: Pick<WorkflowRunStep, "status" | "nextRetryAt">,
+): boolean {
+  return FOREACH_TERMINAL_STEP_STATUSES.has(step.status) && !isRetryPending(step);
+}
 
 export interface SyntheticNodeId {
   parentNodeId: string;
@@ -74,8 +91,9 @@ export async function joinForeach(
 
   const children = latestForeachChildren(def, parent.id, await getWorkflowRunStepsByRunId(runId));
 
-  // `pending` (queued, not started) is non-terminal like running and waiting.
-  if (children.some((step) => !FOREACH_TERMINAL_STEP_STATUSES.has(step.status))) {
+  // `pending` (queued, not started) and a child queued for a retry are
+  // non-terminal like running and waiting.
+  if (children.some((step) => !isForeachChildSettled(step))) {
     return { joined: false, parentNodeId: parent.id, successors: [] };
   }
 
@@ -244,6 +262,8 @@ export async function settleForeachChild(
     });
 
     if (run.status !== "running" && run.status !== "waiting") return unclaimed;
+    // The outcome stays on the item as history; a cancelled tree routes nothing.
+    if (await getRunLineageBlock(runId)) return unclaimed;
 
     if (outcome.status !== "completed" && effectiveFailurePolicy(parent, def) === "fail-fast") {
       const reason = options.runError ?? outcome.error ?? `foreach item ${current.nodeId} failed`;
@@ -270,8 +290,9 @@ export async function settleForeachChild(
 
 /**
  * Fail-fast: cancel every queued (`pending`) child of the fan-out so none of
- * them starts. In-flight children are left to finish and record their outcome.
- * A run retry gives each cancelled item a new attempt.
+ * them starts, and every child queued for a retry so the retry poller does not
+ * revive the failed run. In-flight children are left to finish and record their
+ * outcome. A run retry gives each cancelled item a new attempt.
  */
 export async function cancelQueuedForeachChildren(
   def: WorkflowDefinition,
@@ -294,9 +315,11 @@ export async function cancelQueuedForeachChildren(
       await getWorkflowRunStepsByRunId(runId),
     );
     for (const child of children) {
-      if (child.status !== "pending") continue;
+      if (child.status !== "pending" && !isRetryPending(child)) continue;
       const row = await getDbClient().get<{ id: string }>(
-        "UPDATE workflow_run_steps SET status = 'cancelled', error = ?, finishedAt = ? WHERE id = ? AND status = 'pending' RETURNING id",
+        `UPDATE workflow_run_steps SET status = 'cancelled', error = ?, finishedAt = ?, nextRetryAt = NULL
+          WHERE id = ? AND (status = 'pending' OR (status = 'failed' AND nextRetryAt IS NOT NULL))
+          RETURNING id`,
         [error, finishedAt, child.id],
       );
       if (row) cancelled++;

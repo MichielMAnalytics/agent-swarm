@@ -18,6 +18,10 @@ Operational rules for editing or adding harness providers (claude, codex, openco
 | Cursor | `cursor` | `CursorAdapter` | In-process `@cursor/sdk` local runtime; inference on Cursor's hosted models with `CURSOR_API_KEY`. See [Cursor](#cursor-cursor) below |
 | Grok | `grok` | `GrokAdapter` | xAI Grok CLI as an ACP server (`grok agent --no-leader stdio`) on the shared ACP client; `XAI_API_KEY`, or `OPENROUTER_API_KEY` for `openrouter/<id>` models. See [Grok](#grok-grok) below |
 
+## Tool-schema cost on harness bumps
+
+On a codex, opencode or pi bump, run `bun scripts/probe-tool-schema-tokens.ts --harness <name>` and paste its table into the PR. It reports provider-reported turn-1 input tokens with and without the swarm MCP server, and how many swarm tools the request declares. On codex, a swarm-MCP delta above 2k tokens blocks the bump; on opencode, any declared swarm tool does: the new version stopped deferring MCP tools. On pi, the deferral-on leg must declare only the core set (`CORE_TOOLS`, 26 today). A `FAIL` in "swarm tool reached" means the MCP leg never connected, so its numbers do not count.
+
 ## NaN and Helmcode (pi, opencode)
 
 NaN and Helmcode are OpenAI-compatible, flat-rate providers. Their models run
@@ -215,7 +219,7 @@ this retains the native `llm-deepseek` route. The native Flash ID is
 `deepseek-flash` (V4.1 Flash); OpenRouter uses `deepseek/deepseek-v4.1-flash`.
 There is no fallback across providers when the selected route's key is missing.
 
-The full worker image installs `@deepseek-ai/dsh@0.2.1-rc.2` at build time
+The full worker image installs `@deepseek-ai/dsh@0.2.2-alpha.2` at build time
 in `worker-full-base`, alongside the optional tools in `/opt/global-deps-full`.
 The slim image does not include dsh: use `worker-full` or provision the pinned
 package in your custom image before starting a dsh worker. Both the entrypoint
@@ -280,7 +284,7 @@ and the installed CLI's top-level and headless help.
 
 Set `HARNESS_PROVIDER=cursor` and `CURSOR_API_KEY` (a Cursor user or
 service-account key; Team Admin keys do not work). The adapter runs
-`@cursor/sdk` (pinned `1.0.40`) in-process: `Agent.create` with the local
+`@cursor/sdk` (pinned `1.2.0`) in-process: `Agent.create` with the local
 runtime on the task's cwd, then one `agent.send` per run. The agent loop and
 its file and shell tools run in the worker; inference always runs on Cursor's
 hosted models and bills the key's Cursor plan.
@@ -442,7 +446,7 @@ On success the pi wrapper also returns the server's `structuredContent` next to 
 
 **pi extension text for the model** goes through `sendNudge` (`pi.sendMessage`) in `src/providers/pi-mono-extension.ts`. pi runs extensions in-process and never feeds their stdout to the model, so a `console.log` there only reaches the worker log. `{ block, reason }` from `tool_call` also reaches the model. `context` fires before every LLM call; post-compaction text belongs on `session_compact`.
 
-**pi tool deferral** (`PI_TOOL_DEFERRAL`, default off): non-core swarm tools get `exposure: "deferred"` and the session adds pi's `tool_search`. The adapter's `traits` getter reads the same flag for `hasToolSearch`, so the prompt and the session agree. Keep both reads on `process.env`. Pilot procedure: the harness-providers guide, section "pi tool deferral".
+**pi tool deferral** (`PI_TOOL_DEFERRAL`, default on): non-core swarm tools and installed MCP servers get `exposure: "deferred"` and the session adds pi's `tool_search`. The adapter's `traits` getter reads the same flag for `hasToolSearch`, so the prompt and the session agree. Keep both reads on `process.env`. Rollback: `PI_TOOL_DEFERRAL=false`.
 
 **pi codemode** (`PI_CODEMODE`, default off): adds `createCodemodeExtension({ mode: "on", models })` (`models` follows `PI_CODEMODE_MODELS`, default off, only with codemode on; the usage of a script's `models.*` calls reaches `getSessionStats()` cost, proven in `src/tests/providers/pi-cost.test.ts`), wrapped by `createBoundedCodemodeExtension` (120 s per-script deadline, 32 nested calls, 4 concurrent), and `+codemode` on every pi session. Never switch to `mode: "only"`: lifecycle tools must stay directly callable.
 
@@ -494,6 +498,8 @@ Production Codex sessions start a fresh `codex app-server` inside the existing i
 - `abort()` sends the native turn interrupt request. If it cannot complete within the bounded grace period, the runner terminates the task process group.
 
 The adapter creates no shared app-server daemon and never resumes a native Codex thread. Task continuity still uses the swarm context preamble.
+
+The adapter starts each thread with `ephemeral: false`. Do not switch it back to `true`: codex's `spawn_agent` tool forks the parent thread's context (`fork_context`) by reading the parent rollout, and an ephemeral thread has none, so every such spawn fails with `collab spawn failed: ... no rollout found for thread id` (the code-quality skill's confirming-agent spawn hit this). Rollouts land in `$CODEX_HOME/sessions` (default `~/.codex/sessions`). Nothing resumes them, so `pruneCodexRollouts` (`src/providers/codex-rollouts.ts`) deletes those older than 7 days when a session starts.
 
 ### Codex hook delivery for legacy exec sessions
 
@@ -625,6 +631,14 @@ The claude harness credential gate, spawn validator, and live check all derive o
 - **Spawn env** (`withClaudeRouteEnv`): on every route except `claude-subscription`, `CLAUDE_CODE_OAUTH_TOKEN` is blanked; on gateway and cloud routes even when only `process.env` carries it. Claude Code 2.1.286 sends the OAuth token as `Authorization: Bearer` to `ANTHROPIC_BASE_URL` when no gateway key is set; a blank token counts as unset.
 - **Internal AI** (`resolveCredential`): `ANTHROPIC_API_KEY` is skipped when `ANTHROPIC_BASE_URL` names a gateway, because pi-ai would send it to `api.anthropic.com`.
 - The `claude-subscription` provider declares `harnesses: ["claude"]`; `assertRouteHarness` rejects it elsewhere.
+
+### Codex gateway route
+
+`deriveDefaultRoute("codex", env)` returns an `openai-gateway` route when `CODEX_GATEWAY_BASE_URL` is set to any origin except `https://api.openai.com`, else `null` (the OAuth / `OPENAI_API_KEY` / auth.json checks apply). The route wins over all of them and fails closed: with no `CODEX_GATEWAY_API_KEY` it is not ready.
+
+- **Gate** (`checkCodexCredentials`): `routeCredentialStatus`, before any auth.json or OAuth check.
+- **Live check** (`validateProviderCredentials("codex")`): `GET {CODEX_GATEWAY_BASE_URL}/models` through `createScopedFetch` with `Authorization: Bearer $CODEX_GATEWAY_API_KEY` (2xx verified, 401/403 failed, 404/405 configured).
+- **Session** (`createInProcessCodexSession`): `codexGatewayConfig` adds `model_provider = "swarm-gateway"` plus its `[model_providers]` block (`env_key = "CODEX_GATEWAY_API_KEY"`, `wire_api = "responses"`) to the `thread/start` config; `resolveCodexAuthMode` is skipped; `routeUnsetEnv` removes `CODEX_OAUTH` and `OPENAI_API_KEY` from the CLI env. The runner picks no `codex_oauth_<n>` pool slot. Codex 0.164 ignores `OPENAI_BASE_URL` and env keys for its built-in `openai` provider, so the block is required (verified against a local gateway).
 
 The package is pure (no `src/`, SQLite, or filesystem imports; enforced by the `no-package-imports-src` dep-cruiser rule). Other harnesses return `null` from `deriveDefaultRoute` and keep their own checks.
 

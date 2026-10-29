@@ -18,7 +18,7 @@ import type {
   ToolAnnotations,
 } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod";
-import { sweepExpiredKvPrefix, upsertKv } from "../be/db";
+import { upsertKv } from "../be/db";
 import { MCP_OVERFLOW_NAMESPACE, mcpOverflowNamespace } from "../kv-overflow";
 import { joinKvPath, type KvShapeEntry, splitKvPath, summarizeKvShape } from "../kv-view";
 import { withSpan } from "../otel";
@@ -297,6 +297,17 @@ const storeProgressBlockedWaitingNudge = (r: SwarmToolResult): string | undefine
   return `That reads as blocked-waiting, ${formatIdleDuration(ms)} since your last update — keep working if you can, and if the wait is genuinely long, defer-task is one way to resume later instead of polling.`;
 };
 
+const storeProgressNudge = (r: SwarmToolResult): string | undefined => {
+  const learning = (r.data as { learning?: { status?: unknown; memoryId?: unknown } } | undefined)
+    ?.learning;
+  // nudgeMiddleware permits exactly one steer: the duplicate-learning steer
+  // names a concrete next call, so it wins over the blocked-waiting reminder.
+  if (r.ok && learning?.status === "duplicate" && typeof learning.memoryId === "string") {
+    return `That learning repeats memory ${learning.memoryId}; if your text adds something, memory-edit that memory instead of storing a new one.`;
+  }
+  return storeProgressBlockedWaitingNudge(r);
+};
+
 const workflowLongScriptTimeoutNudge = (r: SwarmToolResult): string | undefined => {
   if (!r.ok) return undefined;
   const hint = (r.data as { longScriptTimeoutHint?: unknown } | undefined)?.longScriptTimeoutHint;
@@ -311,7 +322,7 @@ const workflowLongScriptTimeoutNudge = (r: SwarmToolResult): string | undefined 
 export const NUDGES: Record<string, (result: SwarmToolResult) => string | undefined> = {
   "defer-task": (r) =>
     r.ok ? "Stop working on this task now; the wake-up task will carry your note." : undefined,
-  "store-progress": storeProgressBlockedWaitingNudge,
+  "store-progress": storeProgressNudge,
   "script-run": scriptRunNudge,
   "script-upsert": scriptAuthoringNudge,
   "launch-script-run": scriptAuthoringNudge,
@@ -804,9 +815,8 @@ const ctxControlMiddleware: FinalizeMiddleware = async (result, ctx) => {
 
     // The public KV write surfaces cap values at 2 MiB, while the SQLite TEXT
     // column and this direct server-side helper have no declared size limit.
-    // Sweep the whole per-agent namespace family so expired rows from inactive
-    // agents do not wait for their owner to spill again.
-    await sweepExpiredKvPrefix(MCP_OVERFLOW_NAMESPACE);
+    // Expired values are deleted by the 10-minute sweep in
+    // src/be/mcp-overflow-sweep.ts, off this request path.
     await upsertKv({
       namespace,
       key,

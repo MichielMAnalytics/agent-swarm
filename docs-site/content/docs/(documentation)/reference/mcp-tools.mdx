@@ -100,8 +100,9 @@ Returns a list of tasks with various filters. Sorted by priority (desc) then las
 | `readyOnly` | boolean | No | Only tasks with met dependencies |
 | `taskType` | string | No | Filter by type (e.g., `bug`, `feature`) |
 | `tags` | array | No | Filter by matching tags |
-| `search` | string | No | Search in task description |
+| `search` | string | No | Search task text and title by word or phrase, with a prefix match on the last word, or a task id by prefix. Not a substring match: `2443` does not find `12443`, and `%` and `_` are not wildcards |
 | `scheduleId` | uuid | No | Filter by schedule ID to find tasks created by a specific schedule |
+| `workflowRunId` | string | No | Filter by workflow run ID to find the tasks of a single run |
 | `key` | string | No | Filter by exact logical asset namespace |
 | `keyPrefix` | string | No | Filter by namespace subtree |
 | `includeHeartbeat` | boolean | No | Include heartbeat/system tasks in results (excluded by default) |
@@ -174,6 +175,7 @@ Store task progress, or mark a task as completed or failed.
 | `failureReason` | string | No | Reason (for failure) |
 | `attachments` | array | No | Pointer-based artifacts to attach to the task (max 20 per call). Each entry is one of: `{kind: "agent-fs", path, name, orgId?, driveId?, ...}`, `{kind: "url", url, name, ...}`, `{kind: "shared-fs", path, name, ...}`, `{kind: "page", pageId, name, ...}`. Agent-fs pointers are verified before task state changes using the explicit org/drive pair or the registering agent's configured defaults. May be sent on any call (progress or completion); accumulates across calls; deduped by `sha256` when present, else by `(kind, pointer, name)`. No inline file data — upload to agent-fs first and attach by path. |
 | `citations` | array | No | Claim sources, upserted by index across calls. Use only for factual claims the reader cannot already see in the thread or task tree, 1-2 sources; none on delegation, routing, acks, or status replies. Reference each in `output` with `[citation:N]`, or set `general: true` for a source that backs the whole answer. Kinds: `task`, `memory`, `github`, `slack`, `agent-fs`, `page`, `script-run`, `url`. The first completing call is refused (the task stays in progress) if a marker has no entry, a citation fails validation, or a non-general citation is unreferenced; after one refusal, completion proceeds and those markers are dropped. At most 50 per call/task. |
+| `learning` | string \| object | No | A lesson worth keeping: a gotcha, a dead end, a pattern that worked. Stored as a swarm memory at `/learnings/<workstream>/<slug>`, tagged `learning` and tied to the task. Pass a string, or `{text, tags?, workstream?}` with at most 5 kebab-case tags; `workstream` defaults to the task's repo name, else `general`. The first line is the title. Send it on or before the completing call. A learning that repeats an existing swarm memory under `/learnings/` or `/longterm/workstreams/` (raw cosine 0.80 or higher) is not stored: the result has status `duplicate` with that memory's id, and the existing memory gets a positive rating. A failed write is reported in the result and never blocks the progress update. |
 | `persistMemory` | boolean | No | Opt in to task-completion memory persistence for automatic or recurring tasks. Manual tasks persist by default; scheduled, system, heartbeat, monitor, and digest tasks are skipped unless this is `true`. |
 | `force` | boolean | No | On an already-terminal task, replace only the explicitly supplied `output` and/or `failureReason`. Status, `finishedAt`, completion events, memories, follow-ups, and capacity updates are preserved rather than replayed. |
 
@@ -568,6 +570,7 @@ Update an agent's profile, identity files, and setup script. By default updates 
 | `claudeMd` | string | No | CLAUDE.md content. Above 20,000 characters, updates may keep or reduce the stored size but cannot grow it. |
 | `setupScript` | string | No | Startup script content |
 | `avatar` | object or null | No | Custom Lucide avatar: `{ type: "lucide", icon: "<kebab-case-name>", color?: "#RRGGBB" }`. Pass `null` to restore the deterministic default icon and color. |
+| `slackIcon` | object or null | No | Icon for the agent's Slack messages: `{ type: "emoji", emoji: ":owl:" }` or `{ type: "url", url: "https://..." }`, or `{ type: "app" }` for the Slack app's own icon. A link Slack cannot load falls back to the Slack app's icon. Pass `null` to restore the default (`:crown:` for the lead). |
 
 ### context-history
 
@@ -690,6 +693,7 @@ Manually trigger a workflow execution.
 |-----------|------|----------|-------------|
 | `id` | uuid | Yes | Workflow ID |
 | `triggerData` | object | No | Data to pass as trigger context |
+| `wait` | boolean | No | Default `true`: return after the run's instant steps ran (it finishes or parks at its first async step). `false`: return once the run is created and walk it in the background. Use `false` from a script or step that only needs the `runId` |
 
 ### get-workflow-run
 
@@ -698,6 +702,7 @@ Get details of a specific workflow run including step statuses.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | uuid | Yes | Run ID |
+| `fields` | `full` \| `slim` | No | `slim` omits `run.context` and each step's input (a context snapshot per step). Outputs, errors and retry fields stay. Default: `full` |
 
 ## Related
 
@@ -732,7 +737,7 @@ Retry a failed workflow run from the point of failure.
 
 ### cancel-workflow-run
 
-Cancel a running or waiting workflow run. Cancels all non-terminal steps and their associated tasks.
+Cancel a running or waiting workflow run and every child run below it. Cancels their non-terminal steps, tasks, pending approvals and queued retries in one transaction; finished child runs keep their status. Repeating the cancel on a cancelled run finishes any child runs still open.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -765,7 +770,9 @@ Partially update a single node in a workflow definition. Merges the provided fie
 
 ### request-human-input
 
-Create an approval request and return at once with the request ID and URL. The answer arrives later as a `hitl-follow-up` task. Supports multiple question types: approval (yes/no), text, single-select, multi-select, and boolean.
+Create an approval request and return at once with the request ID and URL. The answer arrives later as a `hitl-follow-up` task. Supports multiple question types: approval (yes/no), text, single-select, multi-select, boolean, and config.
+
+A `config` question asks a person to set one swarm config key on the dashboard, such as an integration token: `{ "id": "bb", "type": "config", "config": { "key": "BITBUCKET_TOKEN", "scope": "global" } }`. Secrets are stored encrypted, and the follow-up task carries only `{ key, scope, isSecret, status, updatedAt }`, never the value. `isSecret` defaults to `true`; `options` and `defaultValue` are for non-secret keys. See [Config questions](/docs/concepts/workflows#config-questions) for every field and rule.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -1141,6 +1148,7 @@ with `script-upsert`.
 | `intent` | string | No | Why this script is being run |
 | `scope` | string | No | Optional scope for named script resolution |
 | `fsMode` | string | No | Filesystem mode (`none` only in v1) |
+| `executor` | `native` \| `quickjs` | No | Executor override for this run. When omitted, named scripts use their saved executor, else `SCRIPT_EXECUTOR` |
 
 ### script-upsert
 
@@ -1154,6 +1162,7 @@ the generated `.d.ts` and rejects on diagnostics.
 | `source` | string | Yes | TypeScript source with a default export function |
 | `description` | string | No | Human-readable script description |
 | `intent` | string | No | Why this script exists |
+| `executor` | `native` \| `quickjs` | No | Per-script executor override. Null or omitted inherits `SCRIPT_EXECUTOR` |
 
 A script may also export a Zod schema named `argsSchema` describing its expected arguments. On upsert the runtime extracts it, converts it to JSON Schema via `zod`'s `toJSONSchema`, and stores it on the catalog entry as `argsJsonSchema` — so callers can discover a script's argument shape before running it. The export is optional; scripts without it simply have a `null` `argsJsonSchema`. The schema can be written with either `zod` or `zod/mini` (`import * as z from "zod/mini"`); Mini uses functional forms such as `z.optional(z.string())`.
 

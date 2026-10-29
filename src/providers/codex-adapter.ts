@@ -30,13 +30,22 @@
 
 import { existsSync as nodeExistsSync } from "node:fs";
 import { join } from "node:path";
+import {
+  CODEX_GATEWAY_API_KEY,
+  deriveDefaultRoute,
+  type ModelRoute,
+  routeCredentialStatus,
+  routeUnsetEnv,
+} from "@desplega/model-routing";
 import { buildRatingsFromLlm, fetchRetrievalsForTask, postRatings } from "../be/memory/raters/llm";
+import { contextBoundNoteThreshold, createContextBoundNote } from "../hooks/context-bound-note";
 import { getApiKey } from "../utils/api-key";
 import {
   CONTEXT_FORMULA,
   clampContextPercent,
   computeContextUsedUnified,
 } from "../utils/context-window";
+import { selectCredential } from "../utils/credentials";
 import { isEnvFlagEnabled, isSessionSummarySkipped } from "../utils/env-flag";
 import { SessionErrorTracker } from "../utils/error-tracker";
 import { summarizeSession as runSummarize } from "../utils/internal-ai";
@@ -59,6 +68,7 @@ import { credentialsToAuthJson } from "./codex-oauth/auth-json.js";
 import { hasCodexOAuthPoolSlots } from "./codex-oauth/env-keys.js";
 import { codexUserHome } from "./codex-oauth/home.js";
 import { CodexOAuthRefreshError, getValidCodexOAuth } from "./codex-oauth/storage.js";
+import { pruneCodexRollouts } from "./codex-rollouts";
 import { resolveCodexPrompt } from "./codex-skill-resolver";
 import { createCodexSwarmEventHandler } from "./codex-swarm-events";
 import { CTX_MODE_NUDGE_EVERY } from "./ctx-mode-env";
@@ -80,6 +90,32 @@ import type {
 } from "./types";
 
 type CodexConfig = Record<string, CodexConfigValue | undefined>;
+
+/** `model_provider` id of the generated gateway block. */
+const CODEX_GATEWAY_PROVIDER_ID = "swarm-gateway";
+
+/**
+ * Config overrides that send Codex through the gateway route. Codex 0.164
+ * ignores `OPENAI_BASE_URL` and env keys for its built-in `openai` provider, so
+ * the gateway needs its own provider block. Verified on 0.164 against a local
+ * gateway: Codex sends `Authorization: Bearer $CODEX_GATEWAY_API_KEY` to
+ * `<base_url>/responses` and never the auth.json OAuth token. `wire_api`
+ * defaults to `responses` (`chat` is rejected); it is set to state intent.
+ */
+export function codexGatewayConfig(route: ModelRoute): CodexConfig {
+  return {
+    model_provider: CODEX_GATEWAY_PROVIDER_ID,
+    model_providers: {
+      [CODEX_GATEWAY_PROVIDER_ID]: {
+        name: "Swarm gateway",
+        base_url: route.baseUrl,
+        env_key: CODEX_GATEWAY_API_KEY,
+        wire_api: "responses",
+        requires_openai_auth: false,
+      },
+    },
+  };
+}
 
 /** Plugin id the worker image installs (`codex plugin add context-mode@context-mode`). */
 const CONTEXT_MODE_CODEX_PLUGIN = "context-mode@context-mode";
@@ -186,7 +222,10 @@ export type CodexThreadFactory = (options: {
 }) => Promise<CodexThread> | CodexThread;
 
 /**
- * Codex satisfies its credential requirement by ANY of:
+ * A gateway route (`CODEX_GATEWAY_BASE_URL` + `CODEX_GATEWAY_API_KEY`) wins
+ * and alone decides readiness: a gateway URL without its key is not ready,
+ * whatever OAuth or auth.json is present. Otherwise Codex satisfies its
+ * credential requirement by ANY of:
  *   1. `~/.codex/auth.json` already exists on disk (the canonical state once
  *      `codex login` has run).
  *   2. `OPENAI_API_KEY` is set — the entrypoint will run
@@ -203,6 +242,13 @@ export function checkCodexCredentials(
   env: Record<string, string | undefined>,
   opts: CredCheckOptions = {},
 ): CredStatus {
+  const gateway = deriveDefaultRoute("codex", env);
+  if (gateway) {
+    const status = routeCredentialStatus(gateway, env);
+    return status.ready
+      ? { ready: true, missing: [], satisfiedBy: "env", hint: status.hint }
+      : { ready: false, missing: status.missing, hint: status.hint };
+  }
   const homeDir = opts.homeDir ?? env.HOME ?? "/root";
   const existsSync = opts.fs?.existsSync ?? nodeExistsSync;
   const authFile = `${homeDir}/.codex/auth.json`;
@@ -995,6 +1041,8 @@ export class CodexSession implements ProviderSession {
    * summary path which materially relies on this ordering for testability.
    */
   private pendingResult: ProviderResult | null = null;
+  /** Fed each main-thread request's prompt size; steers the one-time context-bound note. */
+  private readonly observeContextBound: (contextTokens: number | undefined) => Promise<void>;
 
   constructor(
     thread: CodexThread,
@@ -1015,6 +1063,13 @@ export class CodexSession implements ProviderSession {
       skillsDir ?? process.env.CODEX_SKILLS_DIR ?? join(codexUserHome(), ".codex", "skills");
     this.summarizeDeps = summarizeDeps;
     this.logFileHandle = Bun.file(config.logFile).writer();
+    this.observeContextBound = createContextBoundNote({
+      threshold: contextBoundNoteThreshold(config.env ?? process.env),
+      model: () => this.resolvedModel,
+      // `turn/steer` only joins the active turn, so a late note never starts one.
+      canDeliver: () => this.acceptsSteering && !this.settled && !this.aborted,
+      inject: (note) => this.deliverSteering({ mode: "steer", text: note }),
+    });
     // Mirrors the resolution `buildCodexConfig` already applied when
     // constructing `mergedConfig` — cheap, pure, and keeps the applied-level
     // feedback co-located with `settle()` rather than threading an extra
@@ -1425,6 +1480,8 @@ export class CodexSession implements ProviderSession {
         break;
       case "context.updated":
         this.emitContextUsage(event.usage, event.contextWindow ?? this.contextWindow);
+        // Codex input tokens already include the cached read and write subsets.
+        void this.observeContextBound(event.usage.input_tokens);
         break;
       case "error": {
         const { message } = this.formatTerminalError(event.message, event.codexErrorInfo);
@@ -1557,8 +1614,13 @@ export class CodexSession implements ProviderSession {
       "invalid 'refresh_token'",
     ];
     if (authPatterns.some((p) => normalized.includes(p))) {
+      const slot = this.config.codexSlot;
+      const guidance =
+        slot === undefined
+          ? "Codex authentication failed — check OPENAI_API_KEY or ChatGPT login."
+          : `Codex pool slot ${slot} authentication failed — re-run agent-swarm codex-login --slot ${slot}.`;
       return {
-        message: `[auth-error] Codex authentication failed — check OPENAI_API_KEY or ChatGPT login. Original error: ${raw}`,
+        message: `[auth-error] ${guidance} Original error: ${raw}`,
         category: "authentication_failed",
       };
     }
@@ -1953,14 +2015,21 @@ export async function createInProcessCodexSession(
     preSessionEvents.push(event);
   };
 
-  const mergedConfig = await buildCodexConfig(config, resolvedModel, bufferedEmit);
+  const routeEnv = config.env ?? process.env;
+  const gateway = deriveDefaultRoute("codex", routeEnv);
+  const mergedConfig = {
+    ...(await buildCodexConfig(config, resolvedModel, bufferedEmit)),
+    ...(gateway ? codexGatewayConfig(gateway) : {}),
+  };
 
   // Auth resolution. `codex_oauth` (in the swarm config store) wins over
   // `OPENAI_API_KEY` so users can keep an OpenAI key set for embeddings
   // without it shadowing their ChatGPT login. The entrypoint already runs
   // this same precedence at boot — this block handles local dev (where
   // the entrypoint didn't run) and any case where auth.json is stale.
-  const authMode = await resolveCodexAuthMode(config, bufferedEmit);
+  // A gateway route skips it: no OAuth is restored for a session whose traffic
+  // goes to the gateway.
+  const authMode = gateway ? null : await resolveCodexAuthMode(config, bufferedEmit);
 
   // The app-server receives an explicit environment. Construct a
   // minimal env explicitly so the spawned Codex CLI can find its binary
@@ -1987,7 +2056,14 @@ export async function createInProcessCodexSession(
     ...buildOtelTraceparentEnv(config.env ?? process.env),
     SWARM_CODEX_APP_SERVER: "1",
   };
-  if (authMode === "chatgpt") delete env.OPENAI_API_KEY;
+  if (gateway) {
+    for (const key of routeUnsetEnv("codex", gateway)) delete env[key];
+    const gatewayKey = routeEnv[CODEX_GATEWAY_API_KEY];
+    if (gatewayKey) env[CODEX_GATEWAY_API_KEY] = gatewayKey;
+  } else if (authMode === "chatgpt") delete env.OPENAI_API_KEY;
+  else if (env.OPENAI_API_KEY) {
+    env.OPENAI_API_KEY = selectCredential(env.OPENAI_API_KEY, undefined, "OPENAI_API_KEY").selected;
+  }
 
   const codexPathOverride = process.env.CODEX_PATH_OVERRIDE;
 
@@ -2026,8 +2102,12 @@ export async function createInProcessCodexSession(
         approvalPolicy: "never",
         sandbox: "danger-full-access",
         config: mergedConfig,
-        ephemeral: true,
+        // Must persist a rollout: a `spawn_agent` call with `fork_context` loads
+        // the parent thread's rollout, and an ephemeral thread has none ("no
+        // rollout found for thread id"), which fails every such spawn.
+        ephemeral: false,
       });
+      void pruneCodexRollouts(env).catch(() => {});
       thread = new AppServerCodexThread(client, response.thread.id);
     } catch (error) {
       await client.close();
@@ -2139,6 +2219,11 @@ class CodexSubprocessSession implements ProviderSession {
     };
 
     const apiKey = getApiKey();
+    const providerKeys: Record<string, string> = {};
+    for (const keyVar of ["OPENAI_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"]) {
+      const value = config.env?.[keyVar] ?? process.env[keyVar];
+      if (value) providerKeys[keyVar] = selectCredential(value, undefined, keyVar).selected;
+    }
 
     this.proc = registerProcessGroup(
       Bun.spawn(argv, {
@@ -2156,13 +2241,7 @@ class CodexSubprocessSession implements ProviderSession {
           ...(process.env.MCP_BASE_URL ? { MCP_BASE_URL: process.env.MCP_BASE_URL } : {}),
           ...(apiKey ? { AGENT_SWARM_API_KEY: apiKey, API_KEY: apiKey } : {}),
           // Embedding / summarization paths read these:
-          ...(process.env.OPENAI_API_KEY ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY } : {}),
-          ...(process.env.OPENROUTER_API_KEY
-            ? { OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY }
-            : {}),
-          ...(process.env.ANTHROPIC_API_KEY
-            ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }
-            : {}),
+          ...providerKeys,
           ...(process.env.CODEX_PATH_OVERRIDE
             ? { CODEX_PATH_OVERRIDE: process.env.CODEX_PATH_OVERRIDE }
             : {}),
@@ -2463,6 +2542,9 @@ export class CodexAdapter implements ProviderAdapter {
   }
 
   async createSession(config: ProviderSessionConfig): Promise<ProviderSession> {
+    if (deriveDefaultRoute("codex", config.env ?? process.env)) {
+      console.log("\x1b[2m[codex]\x1b[0m Using credential: gateway");
+    }
     if (this.bypassSubprocess) {
       return createInProcessCodexSession(config, {
         skillsDir: this.skillsDir,

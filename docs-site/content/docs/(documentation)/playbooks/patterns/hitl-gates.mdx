@@ -1,6 +1,8 @@
 ---
 title: 'Pattern: HITL Gates (Human-in-the-Loop Approval)'
 description: Pause a workflow mid-flight until a human approves in Slack. The agent does the work; the human owns the irreversible decision (sending, merging, deleting, posting publicly).
+agent:
+  when: "Someone wants a workflow to wait for a person's approval before it sends, merges, deletes or posts"
 ---
 
 Pause a workflow mid-flight until a human approves in Slack. The agent does the work; the human owns the irreversible decision.
@@ -35,6 +37,10 @@ Agents can also request a human decision with the `request-human-input` MCP tool
 - Give the human enough context *in the gate message* to decide without digging: a summary + a link to the full artifact in [agent-fs](https://github.com/desplega-ai/agent-fs).
 - Define both branches: what happens on approve **and** on reject (archive, retry, escalate).
 - Set a timeout/fallback so a forgotten gate doesn't wedge the workflow forever.
+
+## Ask a person for a secret
+
+When a workflow or agent needs a credential (an API token for a new integration, say), ask for it with a `config` question instead of telling the person to set an env var. The dashboard card names the key, says whether it is already set, and takes the value in a password field. The value goes straight into encrypted swarm config; the agent only learns that it was set. Slack and email cards link to the dashboard and never collect the value. See [Config questions](/docs/concepts/workflows#config-questions).
 
 ## Used in
 

@@ -15,7 +15,9 @@ handlers, user cancel, user retry, crash). Code map: `ACTIONS.md`. Calibration: 
 | Open counterexamples on `main` @ `795526ca3` (CX8-CX10) | **3**, no repro test yet |
 | Closed by #1832 (CX11) | **1** |
 | Open counterexamples on `main` @ `eaf5d0cc1` (CX12 from #1832, CX13 pre-existing) | **2**, no repro test yet |
+| Closed by #2377 (CX13) | **1** |
 | Open counterexamples on `main` @ `7912fff73` (CX14 from #1926) | **1**, no repro test yet |
+| Open counterexamples on `main` @ `77039db51` (CX15 from #2364) | **1**, no repro test yet |
 | Dropped as model drift | **0** (false-positive rate 0 / 7) |
 
 CX1-CX7 each have a repro in `src/tests/workflow-tla-races.test.ts`. The tests call the
@@ -126,6 +128,8 @@ introduced by #1832; no earlier config combined leaves, async branches, and canc
 
 - Property: `TerminalRunStaysQuiet` (Inv1). `Probe-cancel-finalize.cfg`, 954 distinct states, depth 20.
 - Trace: `… XCkWait (B waiting) → TaskFinish(B ok) → E1 → E2 (run running) → Cancel → EFin (run completed)`
+- Closed by #2377 (F9 `FixCancelTree`): `finalizeOrWait` now returns unless the run is `running`
+  or `waiting`. `Fix-CX13.cfg` holds; `Probe-cancel-finalize.cfg` (F9 off) is the control.
 
 ## Sync with #1926 fail-closed write (`main` @ `7912fff73`)
 
@@ -529,3 +533,226 @@ Re-run with tla2tools 2.19, BFS, `-workers 4`. Every config gives the same verdi
 | `Probe-replay-unreadable.cfg` / control | CX14 found / holds | 1,066 / 13,005 | 20 / - |
 | `Probe-child-run.cfg` / control | holds / CX12 found | 13,564 / 338,173 | - / 34 |
 | `Probe-child-run-unreadable.cfg` (new) | CX14 found | 1,151 | 19 |
+
+## Sync with #2364 (`main` @ `77039db51`)
+
+#2364 keeps one child run per `sub-workflow` invocation across crashes and retries. New fix
+flag F8 `FixStepFence` models it (ACTIONS.md, "Fix flags"); it is `TRUE` in the current-code
+configs and `FALSE` in the calibration, `Fix-*`, `Ctl-*`, `Probe-cancel-finalize` and
+`Probe-input-await` configs, which give the same verdicts and, where they hold, the same
+distinct-state counts as on `92fc18110`. What changed in the model:
+
+- Every executor result write is fenced on the claim (step `running` with the claimed
+  `retryCount`, run `running`/`waiting`): `XCkOk`, `XFail`, `P6`, `P7`. A stale execution writes
+  nothing and its walk sees `failed`. An exhausted failure writes the step and the run in one
+  transaction, so `P10` is pre-F8 only.
+- With `ChildRunResume`: an orphaned `running` sub-workflow row is re-claimed instead of getting a
+  new row (`XDedup`, `XChild`); a child is started only while its attempt still runs and is
+  reused by a second call of the same attempt (`ChildStart`); `resumeFromChildRun` settles in one
+  transaction on the current attempt's child and retries a failed child (`EC`, `HC`); the poller
+  re-arms the resume after its park (`P8`); and heartbeat Case 7 re-walks orphaned rows
+  (`H14`-`H17`). `AtMostOneExecuting` counts the child, not the executor call, for these nodes.
+- Run creation commits the run with its context while the run is already held, after the inputs
+  resolve, so the `IWalk` window (`InputAwait`) and the readiness-preflight window no longer
+  exist on `main`. `Probe-input-await.cfg` now models older code.
+
+New probes: `Probe-child-run-crash.cfg` (one sub-workflow branch, one crash, boot sweep only)
+holds; its control (F8 off) finds the bug #2364 fixes, a second row and a second child after a
+crash (`… XRun (A child started) → Crash → H1 → H2 → H3 → … → XDedup (second A row)`).
+`Probe-child-run.cfg` still holds with the larger F8 state space. `src/tests/workflow-tla-races.test.ts`
++ `src/tests/workflow-sub-workflow.test.ts`: 40 pass / 0 fail / 0 `test.failing`.
+
+### CX15 (opened by #2364): the Case 7 sweep re-walks a row that parked and was queued for retry
+
+Leaf `A` is a `sub-workflow` step. A periodic sweep's Case 7 query snapshots `A` while its
+executor is still running. `A` then parks, its child fails, and the resume schedules a retry
+(`A` failed, `nextRetryAt` set). The sweep re-checks only `isWorkflowRunActive`,
+`isStepExecuting` and the run status, all of which pass, and walks `A`. `executeStep` re-claims
+only a `running` row, so it inserts a second `A` row and starts a child for it, while the retry
+poller claims the first row and starts that attempt's child: two children for one node.
+
+- Invariant: `AtMostOneExecuting` (Inv2). `Probe-orphan-sweep.cfg` (one branch, no crash, one
+  sweep), 4,651 distinct states, depth 35.
+- Trace: `… XRun (A child started) → H14 (A running) → XCkWait (A waiting) → WRet → H15 → TaskFinish(A fail) → E1 → H16 → H17 (walk [A]) → WStart → EC (A retry pending) → XDedup (second A row) → XRun → P1 → P4 → P5 (retry child)`
+- `Probe-child-run.cfg` does not reach it: `MaxSteps = 3` leaves no room for a second `A` row.
+- Re-checking that the row is still the node's latest `running` row right before the walk, or
+  dropping retry-pending nodes as Case 1 does (F4), would close it. Not fixed here: this PR
+  changes the spec only.
+
+Re-run with tla2tools 2.19, BFS, `-workers 8` (`-workers 4` for the three one-branch probes).
+
+| Config | Result | Distinct states | Trace |
+|---|---|---|---|
+| `Workflows.cfg` | `JoinWaitsForBranches` violated (CX8) | 33,463 | 26 |
+| `Long.cfg` | `AtMostOneExecuting` violated (crash trace) | 14,590 | 19 |
+| `Cal-bf12ab53.cfg` / control | found / holds | 305 / 160 | 11 / - |
+| `Cal-d4753302.cfg` / control | found / found | 3,933 / 3,031 | 32 / 32 |
+| `Fix-CX1` .. `Fix-CX7` | all hold | 4,073 / 471,850 / 308,120 / 113,010 / 26,296 / 3,325 / 3,778 | - |
+| `Ctl-CX2` .. `Ctl-CX7` | all find their CX | 1,511 / 2,419 / 34,638 / 7,453 / 661 / 1,043 | 22 / 18 / 29 / 32 / 12 / 27 |
+| `Fix-CX11` / `Ctl-CX11` | holds / found | 78,384 / 686 | - / 20 |
+| `Probe-task-retry.cfg` | CX12 found | 1,009,160 | 34 |
+| `Probe-cancel-finalize.cfg` | CX13 found | 826 | 17 |
+| `Probe-input-await.cfg` | CX6 found | 370 | 12 |
+| `Probe-replay-unreadable.cfg` / control | CX14 found / holds | 1,284 / 12,899 | 20 / - |
+| `Probe-child-run.cfg` / control | holds / CX12 found | 4,063,408 / 392,025 | - / 34 |
+| `Probe-child-run-unreadable.cfg` | CX14 found | 1,615 | 18 |
+| `Probe-child-run-crash.cfg` / control (new) | holds / #2364 bug found | 9,444 / 485 | - / 18 |
+| `Probe-orphan-sweep.cfg` (new) | CX15 found | 4,651 | 35 |
+
+`Probe-replay-unreadable-control.cfg` drops from 13,005 to 12,899 distinct states: with F8 a
+stale executor write no longer lands, so fewer states are reachable. It still holds.
+
+## Sync with #2370, #2377 and #2380 (`main` @ `ace735ed8`)
+
+#2377 cancels a run's whole child tree and keeps it stopped. New fix flag F9 `FixCancelTree`
+models what reaches a one-run model (ACTIONS.md, "Fix flags"); it has F8's `TRUE`/`FALSE` split,
+plus `TRUE` in `Probe-child-run-crash-control.cfg`. What changed in the model:
+
+- `finalizeOrWait` (`EFin`, `H13`) returns unless the run is `running` or `waiting`. This closes
+  CX13: new `Fix-CX13.cfg` (`Probe-cancel-finalize.cfg` with F9 on) holds, 3,937 distinct states,
+  and `Probe-cancel-finalize.cfg` still finds it.
+- `Cancel` cancels every open task of the run and drops the queued retry of every `failed` row
+  (`nra` FALSE). An already cancelled run is swept again.
+- The agent-task dispatch in `XRun` commits only while the step is `running` in a live run;
+  otherwise the executor throws and the fenced `XFail` writes nothing. Before, a cancel between
+  the claim and the dispatch left a running task on a cancelled row.
+- `E2`, `H8`, `ER`, `H7R` and `ChildClaim` check the run is not cancelled. A cancel cancels every
+  open step in its transaction, so these checks change no state. The other new
+  `getRunLineageBlock` checks sit next to a run-status check that already excludes `cancelled`.
+
+#2370 retries a foreach agent-task item cut by a deploy drain, and #2380 records an
+`Idempotency-Key` inside the run-creation transaction. Neither reaches a modelled guard: the
+model has no foreach node and one trigger. ACTIONS.md is re-pinned to `ace735ed8`.
+
+Re-run with tla2tools 2.19, BFS, `-workers 4` (`-workers 12` for `Probe-child-run.cfg`). Every
+config gives the same verdict as on `77039db51`. Configs with F9 off that hold keep their
+distinct-state counts. `Probe-replay-unreadable-control.cfg` with F9 off gives 12,899 as before;
+with F9 on it gives 13,164, because a dispatch after a cancel now fails the executor.
+`src/tests/workflow-tla-races.test.ts` + `src/tests/workflow-sub-workflow.test.ts` +
+`src/tests/workflow-cascade-cancel.test.ts`: 68 pass / 0 fail / 0 `test.failing`.
+
+| Config | Result | Distinct states | Trace |
+|---|---|---|---|
+| `Workflows.cfg` | `JoinWaitsForBranches` violated (CX8) | 30,307 | 24 |
+| `Long.cfg` | `AtMostOneExecuting` violated (crash trace) | 13,682 | 19 |
+| `Cal-bf12ab53.cfg` / control | found / holds | 264 / 160 | 11 / - |
+| `Cal-d4753302.cfg` / control | found / found | 3,856 / 2,917 | 32 / 32 |
+| `Fix-CX1` .. `Fix-CX7` | all hold | 4,073 / 471,850 / 308,120 / 113,010 / 26,296 / 3,325 / 3,778 | - |
+| `Ctl-CX2` .. `Ctl-CX7` | all find their CX | 1,253 / 2,438 / 30,476 / 7,566 / 335 / 969 | 22 / 19 / 28 / 29 / 12 / 27 |
+| `Fix-CX11` / `Ctl-CX11` | holds / found | 78,384 / 1,202 | - / 20 |
+| `Fix-CX13.cfg` (new) / `Probe-cancel-finalize.cfg` | holds / CX13 found | 3,937 / 579 | - / 17 |
+| `Probe-task-retry.cfg` | CX12 found | 636,243 | 34 |
+| `Probe-input-await.cfg` | CX6 found | 297 | 12 |
+| `Probe-replay-unreadable.cfg` / control | CX14 found / holds | 1,086 / 13,164 | 18 / - |
+| `Probe-child-run.cfg` / control | holds / CX12 found | 3,965,730 / 187,982 | - / 34 |
+| `Probe-child-run-unreadable.cfg` | CX14 found | 1,440 | 19 |
+| `Probe-child-run-crash.cfg` / control | holds / #2364 bug found | 9,444 / 756 | - / 18 |
+| `Probe-orphan-sweep.cfg` | CX15 found | 4,693 | 35 |
+
+`Probe-child-run.cfg` drops from 4,063,408 (F9 off, rerun) to 3,965,730 distinct states. It has
+no cancel, so the drop is the `finalizeOrWait` guard alone: a branch's finalizer no longer moves a
+run another branch already failed back to `waiting` or `completed`. It still holds.
+
+## Sync with #2419 and #2433 (`main` @ `68e949daa`)
+
+#2433 fails a `sub-workflow` step with `retryable: false` when its child run was deleted
+between the start and the executor's read back. The model has no workflow delete, so the path
+is not modelled; ACTIONS.md names it as an `XFail` whose retry budget is already spent, like the
+System One guards. #2419 adds a read-only run-tree endpoint and moves the run row mapping into
+`workflow-runs.ts`; it adds no write path and changes no guard. The `.tla` and `.cfg` files are
+unchanged; ACTIONS.md re-pins the `db.ts`, `workflow-runs.ts` and `sub-workflow.ts` lines.
+
+Re-run with tla2tools 2.19, BFS, `-workers 4` (`-workers 8` for `Probe-child-run.cfg`). Every
+config gives the same verdict as on `ace735ed8`, and every config that holds keeps its
+distinct-state count. `src/tests/workflow-tla-races.test.ts` +
+`src/tests/workflow-sub-workflow.test.ts` + `src/tests/workflow-cascade-cancel.test.ts`:
+73 pass / 0 fail / 0 `test.failing`.
+
+| Config | Result | Distinct states | Trace |
+|---|---|---|---|
+| `Workflows.cfg` | `JoinWaitsForBranches` violated (CX8) | 35,508 | 25 |
+| `Long.cfg` | `AtMostOneExecuting` violated (crash trace) | 10,380 | 18 |
+| `Cal-bf12ab53.cfg` / control | found / holds | 243 / 160 | 11 / - |
+| `Cal-d4753302.cfg` / control | found / found | 3,838 / 2,778 | 32 / 32 |
+| `Fix-CX1` .. `Fix-CX7` | all hold | 4,073 / 471,850 / 308,120 / 113,010 / 26,296 / 3,325 / 3,778 | - |
+| `Ctl-CX2` .. `Ctl-CX7` | all find their CX | 783 / 2,340 / 27,796 / 7,750 / 371 / 956 | 22 / 19 / 28 / 32 / 12 / 27 |
+| `Fix-CX11` / `Ctl-CX11` | holds / found | 78,384 / 842 | - / 20 |
+| `Fix-CX13.cfg` / `Probe-cancel-finalize.cfg` | holds / CX13 found | 3,937 / 470 | - / 17 |
+| `Probe-task-retry.cfg` | CX12 found | 1,082,928 | 34 |
+| `Probe-input-await.cfg` | CX6 found | 299 | 12 |
+| `Probe-replay-unreadable.cfg` / control | CX14 found / holds | 983 / 13,164 | 18 / - |
+| `Probe-child-run.cfg` / control | holds / CX12 found | 3,965,730 / 313,453 | - / 34 |
+| `Probe-child-run-unreadable.cfg` | CX14 found | 1,800 | 21 |
+| `Probe-child-run-crash.cfg` / control | holds / #2364 bug found | 9,444 / 693 | - / 18 |
+| `Probe-orphan-sweep.cfg` | CX15 found | 4,756 | 35 |
+
+## Sync with #2441 (`main` @ `1a5ee4796`)
+
+#2441 aborts an executor when its step times out: `startStepDeadline` rejects the race, then
+aborts `meta.signal`, so a swarm-script step stops instead of running on after its `XFail`. The
+model's `XRun` already runs the executor atomically and treats a timeout as its `fail` outcome,
+and the agent-task dispatch it models ignores the signal and stays fenced by F9. #2441 also adds
+a detached top-level start (`trigger-workflow` `wait: false`); `walkGraph` takes its own hold
+before its first await, so the `IStart` then `Call` order is unchanged. Neither changes a
+modelled guard or adds a write path. The `.tla` and `.cfg` files are unchanged; ACTIONS.md
+re-pins the `engine.ts` lines, plus the `db.ts` and `workflow-runs.ts` lines shifted by #2452
+(a `workflow.run.finished` bus event; `updateWorkflowRun` keeps its `WHERE id = ?`).
+
+Re-run with tla2tools 2026.10.23, BFS, `-workers 4 -deadlock` (`-workers 8` for
+`Probe-child-run.cfg`). Every config gives the same verdict as on `68e949daa`, and every config
+that holds keeps its distinct-state count. `src/tests/workflow-tla-races.test.ts` +
+`src/tests/workflow-sub-workflow.test.ts` + `src/tests/workflow-cascade-cancel.test.ts`:
+73 pass / 0 fail / 0 `test.failing`.
+
+| Config | Result | Distinct states | Trace |
+|---|---|---|---|
+| `Workflows.cfg` | `JoinWaitsForBranches` violated (CX8) | 28,381 | 25 |
+| `Long.cfg` | `AtMostOneExecuting` violated (crash trace) | 12,754 | 19 |
+| `Cal-bf12ab53.cfg` / control | found / holds | 211 / 160 | 11 / - |
+| `Cal-d4753302.cfg` / control | found / found | 3,648 / 2,712 | 32 / 32 |
+| `Fix-CX1` .. `Fix-CX7` | all hold | 4,073 / 471,850 / 308,120 / 113,010 / 26,296 / 3,325 / 3,778 | - |
+| `Ctl-CX2` .. `Ctl-CX7` | all find their CX | 995 / 2,035 / 27,206 / 6,778 / 379 / 914 | 22 / 19 / 28 / 29 / 12 / 27 |
+| `Fix-CX11` / `Ctl-CX11` | holds / found | 78,384 / 1,165 | - / 20 |
+| `Fix-CX13.cfg` / `Probe-cancel-finalize.cfg` | holds / CX13 found | 3,937 / 647 | - / 17 |
+| `Probe-task-retry.cfg` | CX12 found | 402,925 | 34 |
+| `Probe-input-await.cfg` | CX6 found | 337 | 12 |
+| `Probe-replay-unreadable.cfg` / control | CX14 found / holds | 1,098 / 13,164 | 18 / - |
+| `Probe-child-run.cfg` / control | holds / CX12 found | 3,965,730 / 333,510 | - / 34 |
+| `Probe-child-run-unreadable.cfg` | CX14 found | 1,196 | 18 |
+| `Probe-child-run-crash.cfg` / control | holds / #2364 bug found | 9,444 / 488 | - / 18 |
+| `Probe-orphan-sweep.cfg` | CX15 found | 4,583 | 35 |
+
+## Sync with #2443 (`main` @ `dd3350c35`)
+
+#2443 stamps the starting agent on a run: `createRunWithInitialState` passes
+`triggeredByAgentId` to the same run INSERT, and a `sub-workflow` step reads its parent's
+workflow creator or that stamp before it starts the child. Both are an extra column on an
+existing write and two reads outside any transaction; neither changes a modelled guard, adds a
+write path, or reorders `IStart`, `Call` or `ChildStart`. The `.tla` and `.cfg` files are
+unchanged; ACTIONS.md re-pins the `engine.ts`, `workflow-runs.ts` and `sub-workflow.ts` lines,
+plus the `db.ts` lines shifted by #2443 and #2514 (`updateWorkflowRun` and
+`updateWorkflowRunStep` keep their `WHERE id = ?`).
+
+Re-run with tla2tools 2026.10.23, BFS, `-workers 4 -deadlock` (`-workers 8` for
+`Probe-child-run.cfg`). Every config gives the same verdict as on `1a5ee4796`, and every config
+that holds keeps its distinct-state count. `src/tests/workflow-tla-races.test.ts` +
+`src/tests/workflow-sub-workflow.test.ts` + `src/tests/workflow-cascade-cancel.test.ts`:
+73 pass / 0 fail / 0 `test.failing`.
+
+| Config | Result | Distinct states | Trace |
+|---|---|---|---|
+| `Workflows.cfg` | `JoinWaitsForBranches` violated (CX8) | 22,057 | 25 |
+| `Long.cfg` | `AtMostOneExecuting` violated (crash trace) | 12,068 | 18 |
+| `Cal-bf12ab53.cfg` / control | found / holds | 266 / 160 | 11 / - |
+| `Cal-d4753302.cfg` / control | found / found | 3,551 / 2,594 | 32 / 32 |
+| `Fix-CX1` .. `Fix-CX7` | all hold | 4,073 / 471,850 / 308,120 / 113,010 / 26,296 / 3,325 / 3,778 | - |
+| `Ctl-CX2` .. `Ctl-CX7` | all find their CX | 993 / 2,211 / 25,455 / 7,862 / 266 / 813 | 22 / 20 / 29 / 32 / 12 / 27 |
+| `Fix-CX11` / `Ctl-CX11` | holds / found | 78,384 / 1,018 | - / 20 |
+| `Fix-CX13.cfg` / `Probe-cancel-finalize.cfg` | holds / CX13 found | 3,937 / 610 | - / 17 |
+| `Probe-task-retry.cfg` | CX12 found | 450,625 | 34 |
+| `Probe-input-await.cfg` | CX6 found | 349 | 12 |
+| `Probe-replay-unreadable.cfg` / control | CX14 found / holds | 1,069 / 13,164 | 19 / - |
+| `Probe-child-run.cfg` / control | holds / CX12 found | 3,965,730 / 137,844 | - / 34 |
+| `Probe-child-run-unreadable.cfg` | CX14 found | 1,300 | 19 |
+| `Probe-child-run-crash.cfg` / control | holds / #2364 bug found | 9,444 / 729 | - / 18 |
+| `Probe-orphan-sweep.cfg` | CX15 found | 4,372 | 35 |

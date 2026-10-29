@@ -12,6 +12,7 @@ import { useWhoami } from "@/api/hooks/use-whoami";
 import type { ApprovalQuestion, ApprovalRequest } from "@/api/types";
 import { FadeIn } from "@/components/shared/fade-in";
 import { AnswerView } from "@/components/shared/questions/answer-view";
+import { withCatalogLabel } from "@/components/shared/questions/config-question-field";
 import {
   KeyHint,
   ShortcutSheet,
@@ -46,6 +47,7 @@ import {
   respondErrorMessage,
 } from "@/lib/approval-format";
 import { type DetailShortcut, matchDetailShortcut } from "@/lib/approval-shortcuts";
+import { useCan } from "@/lib/use-can";
 import { formatSmartTime } from "@/lib/utils";
 import { ApprovalVotes } from "../components/approval-votes";
 import { RequestHeader } from "../components/request-header";
@@ -67,6 +69,7 @@ function keyHintFor(question: ApprovalQuestion) {
     case "multi-select":
       return "1–9 · Space";
     case "text":
+    case "config":
       return "↵ to type";
     default:
       return null;
@@ -124,7 +127,7 @@ function ApprovalRequestView({ request }: { request: ApprovalRequest }) {
   const cards = useRef<(HTMLElement | null)[]>([]);
   const top = useRef<HTMLDivElement>(null);
 
-  const questions = request.questions;
+  const questions = useMemo(() => request.questions.map(withCatalogLabel), [request.questions]);
   const isPending = request.status === "pending";
   // The server records the responder from the credential: the token's user,
   // or `operator` for the shared key, whoever is picked in the switcher.
@@ -135,8 +138,10 @@ function ApprovalRequestView({ request }: { request: ApprovalRequest }) {
         ? OPERATOR_RESPONDER
         : null;
   const answeredByMe = answeredHere || hasAnswered(request, myResponder);
+  // A Viewer cannot answer: no approve or reject, only the request itself.
+  const canRespond = useCan("approval.respond");
   // Pending and not yet answered from this credential: the form is live.
-  const editing = isPending && !answeredByMe;
+  const editing = isPending && !answeredByMe && canRespond;
   const myVote = answeredByMe
     ? (request.approvals?.find((vote) => vote.responder === myResponder) ??
       request.approvals?.at(-1))
@@ -198,6 +203,8 @@ function ApprovalRequestView({ request }: { request: ApprovalRequest }) {
       // from the response: no refetch flash.
       if (result.approvalRequest.status === "pending") setAnsweredHere(true);
       queryClient.setQueryData(["approval-request", request.id], result);
+      // Drop the typed answers (a config secret among them) once the server has them.
+      setResponses({});
       setActiveIndex(-1);
       top.current?.scrollIntoView({ block: "start", behavior: reduceMotion ? "auto" : "smooth" });
     } catch (e) {
@@ -302,7 +309,7 @@ function ApprovalRequestView({ request }: { request: ApprovalRequest }) {
         return;
       }
       case "edit": {
-        if (question.type !== "text") return false;
+        if (question.type !== "text" && question.type !== "config") return false;
         cards.current[targetIndex]?.querySelector<HTMLElement>("input, textarea")?.focus();
         setActiveIndex(targetIndex);
         return;
@@ -381,6 +388,7 @@ function ApprovalRequestView({ request }: { request: ApprovalRequest }) {
             cursor={focused ? (cursors[question.id] ?? -1) : -1}
             showKeys={showKeys}
             onSubmitShortcut={handleSubmit}
+            configState={request.configState?.[question.id]}
           />
         ) : collapsed === null || collapsed === false ? (
           <AnswerView question={question} response={response} />
@@ -428,7 +436,12 @@ function ApprovalRequestView({ request }: { request: ApprovalRequest }) {
         </FadeIn>
         {/* Room for the fixed phone bar under the last card. */}
         {editing ? <div aria-hidden className="h-28 md:hidden" /> : null}
-        {isPending && !editing ? (
+        {isPending && !answeredByMe && !canRespond ? (
+          <output className="mt-3 block rounded-xl border border-border-subtle bg-muted/40 px-4 py-3 text-xs text-muted-foreground">
+            Your role cannot answer approval requests. An admin or an approver can.
+          </output>
+        ) : null}
+        {isPending && answeredByMe ? (
           <div className="mt-3 flex items-center gap-3 rounded-xl border border-border-subtle bg-muted/40 px-4 py-3">
             <output className="block min-w-0 flex-1 text-xs text-muted-foreground">
               Your approval is recorded{quorum ? ` (${quorum})` : ""}. The request stays pending

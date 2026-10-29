@@ -32,6 +32,7 @@ import {
   parseSessionSearch,
   type SessionSearchParams,
 } from "@/lib/session-search";
+import { useSessionsFilter } from "@/lib/sessions-show";
 import { isSessionTab, itemFromDetail, userName } from "@/lib/sessions-v2";
 import { sessionDisplayTitle } from "@/lib/utils";
 import type { RowMenuActions } from "./sidebar/row-menu";
@@ -54,6 +55,8 @@ export function useServerSessionSearch(
 ) {
   const { userId } = useCurrentUser();
   const me = userId ?? null;
+  // The search query reads the filter (Mine / All, hidden sources): re-render on a change.
+  useSessionsFilter();
   const wantsPeople = parseSessionSearch(text).with.length > 0;
   const users = useUsers({ enabled: wantsPeople });
   const { groups } = useMyGroups(me);

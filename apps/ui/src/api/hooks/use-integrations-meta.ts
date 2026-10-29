@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import { api } from "@/api/client";
 import { invalidateStatusQuery } from "@/api/hooks/status-query";
 import { getConfig } from "@/lib/config";
+import { type EnvPresenceMap, fetchEnvPresenceBatched } from "@/lib/env-presence-batch";
 
 // ---------------------------------------------------------------------------
 // Integrations-page support hooks
@@ -37,10 +38,9 @@ function getHeaders(): HeadersInit {
   return headers;
 }
 
-export type EnvPresenceMap = Record<string, boolean>;
+export type { EnvPresenceMap };
 
-async function fetchEnvPresence(keys: string[]): Promise<EnvPresenceMap> {
-  if (keys.length === 0) return {};
+async function fetchEnvPresenceBatch(keys: string[]): Promise<EnvPresenceMap> {
   const url = `${getBaseUrl()}/api/config/env-presence?keys=${encodeURIComponent(keys.join(","))}`;
   const res = await fetch(url, { headers: getHeaders() });
   if (!res.ok) {
@@ -50,12 +50,19 @@ async function fetchEnvPresence(keys: string[]): Promise<EnvPresenceMap> {
   return data.presence ?? {};
 }
 
+function fetchEnvPresence(keys: string[]): Promise<EnvPresenceMap> {
+  return fetchEnvPresenceBatched(keys, fetchEnvPresenceBatch);
+}
+
 export function useEnvPresence(keys: string[]) {
   const stableKey = [...keys].sort().join(",");
   return useQuery({
     queryKey: ["config", "env-presence", stableKey],
     queryFn: () => fetchEnvPresence(keys),
     staleTime: 5_000,
+    // A new tab restores a persisted snapshot that can still be fresh. Callers
+    // gate on presence read after mount (the org-name prompt), so ask the server.
+    refetchOnMount: "always",
     enabled: keys.length > 0,
   });
 }
@@ -142,5 +149,16 @@ export function useTestClaudeManagedConnection() {
     onError: (err) => {
       toast.error(`Test connection failed: ${err.message}`);
     },
+  });
+}
+
+/** The Slack app's own avatar, for the Slack icon preview. Fetched only while `enabled`. */
+export function useSlackAppIcon(enabled: boolean) {
+  return useQuery({
+    queryKey: ["integrations", "slack", "app-icon"],
+    queryFn: () => api.fetchSlackAppIcon(),
+    enabled,
+    // A null avatar can be a passing Slack failure: ask again on the next mount.
+    staleTime: (query) => (query.state.data?.imageUrl ? 60 * 60 * 1000 : 0),
   });
 }

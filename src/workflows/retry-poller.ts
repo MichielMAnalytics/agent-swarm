@@ -6,6 +6,7 @@ import {
   getWorkflowRunStepsByRunId,
   updateWorkflowRun,
 } from "../be/db";
+import { disarmWorkflowTreeRetries, getRunLineageBlock } from "../be/db/workflow-runs";
 import type { RetryPolicy } from "../types";
 import { checkpointStep, checkpointStepFailure, checkpointStepWaiting } from "./checkpoint";
 import { getSuccessors, resolveValidationPort } from "./definition";
@@ -17,7 +18,8 @@ import {
 } from "./engine";
 import type { AsyncExecutorResult } from "./executors/base";
 import type { ExecutorRegistry } from "./executors/registry";
-import { FOREACH_ITEMS_WAIT_FOR, parkAndDriveForeach } from "./foreach-driver";
+import { FOREACH_ITEMS_WAIT_FOR, parkAndDriveForeach, runForeachDrive } from "./foreach-driver";
+import { resolveForeachParent } from "./foreach-join";
 import { rebuildNodeExecutionInput } from "./step-input";
 import { runStepValidation } from "./validation";
 
@@ -45,6 +47,19 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
           const workflow = await getWorkflow(run.workflowId);
           if (!workflow) continue;
 
+          // A foreach child goes back to its fan-out's queue: the driver
+          // rebuilds the per-item config and starts it under the concurrency
+          // cap, and the item settles into the join like any other.
+          const foreachParent = resolveForeachParent(workflow.definition, step.nodeId);
+          if (foreachParent) {
+            if (!(await claimRetry(run.id, step.id, { requeueForeachChild: true }))) continue;
+            console.log(
+              `[workflows] Retrying foreach item ${step.nodeId} (attempt ${step.retryCount}) for run ${step.runId}`,
+            );
+            await runForeachDrive(run.id, foreachParent.id, registry);
+            continue;
+          }
+
           // Find the node definition for this step
           const node = workflow.definition.nodes.find((n) => n.id === step.nodeId);
           if (!node) continue;
@@ -61,6 +76,9 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
           // the run were read outside it: a cancel committing in between must
           // win, or the step re-executes inside a cancelled run.
           if (!(await claimRetry(run.id, step.id))) continue;
+          // Every result write below is fenced on this claim, so a cancel or
+          // another settle that commits while the executor runs wins.
+          const fence = { retryCount: step.retryCount };
 
           // Rebuild `run.id`, upstream outputs and the node's declared-inputs
           // context the way the original execution saw them. Without the alias
@@ -78,6 +96,8 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
               step.id,
               scriptBodyInterpolationError(node.id, scriptBodyUnresolved),
               step.retryCount,
+              undefined,
+              { fence },
             );
             continue;
           }
@@ -104,14 +124,17 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
             if (result.status === "failed") {
               // Re-failed — use the EXISTING retryCount from the step.
               // checkpointStepFailure handles marking run as failed if no retries left,
-              // or setting nextRetryAt for the next poll cycle.
-              const retryPolicy = node.retry || executor.retryPolicy;
+              // or setting nextRetryAt for the next poll cycle. A non-retryable
+              // failure skips the policy, as in executeStep.
+              const retryPolicy =
+                result.retryable === false ? undefined : node.retry || executor.retryPolicy;
               await checkpointStepFailure(
                 run.id,
                 step.id,
                 result.error || "Retry failed",
                 step.retryCount,
                 retryPolicy,
+                { fence, output: result.output },
               );
             } else if (
               "async" in result &&
@@ -150,6 +173,12 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
               // find the parent already advanced.
               const waiting = await checkpointStepWaiting(run.id, step.id, ctx);
               if (!waiting) continue;
+              // As in executeStep: a child run that finished before the step
+              // parked had its event dropped.
+              if ((result as AsyncExecutorResult).waitFor === "workflow.child.finished") {
+                const { resumeFromChildRun } = await import("./resume");
+                await resumeFromChildRun(step.id, registry);
+              }
             } else {
               // Success! Re-run validation if configured before checkpointing.
               let validationPassed: boolean | undefined;
@@ -168,6 +197,8 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
                     step.id,
                     "Validation failed (mustPass)",
                     step.retryCount,
+                    undefined,
+                    { fence },
                   );
                   continue;
                 }
@@ -186,6 +217,7 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
                     "Validation failed, retrying",
                     step.retryCount,
                     retryPolicy,
+                    { fence },
                   );
                   continue;
                 }
@@ -197,7 +229,9 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
               result.nextPort = resolveValidationPort(node.next, result.nextPort, validationPassed);
 
               // Validation passed (or no validation) — checkpoint and continue
-              await checkpointStep(run.id, step.id, step.nodeId, result, ctx);
+              if (!(await checkpointStep(run.id, step.id, step.nodeId, result, ctx, { fence }))) {
+                continue;
+              }
 
               const port = result.nextPort || "default";
               const successors = getSuccessors(workflow.definition, step.nodeId, port);
@@ -219,7 +253,9 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
             if (await failRunOnUnreadableReplay(run.id, err, step.id)) continue;
             const errorMsg = err instanceof Error ? err.message : String(err);
             const retryPolicy = node.retry || executor.retryPolicy;
-            await checkpointStepFailure(run.id, step.id, errorMsg, step.retryCount, retryPolicy);
+            await checkpointStepFailure(run.id, step.id, errorMsg, step.retryCount, retryPolicy, {
+              fence,
+            });
           }
         } catch (err) {
           if (await failRunOnUnreadableReplay(step.runId, err, step.id)) continue;
@@ -243,14 +279,44 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
 /**
  * Flip a retry-pending step to `running` only while it is still retry-pending
  * and its run is live, and revive a run failed by this step.
+ *
+ * `requeueForeachChild` flips a foreach child to `pending` instead, for the
+ * driver to claim, and clears the cut's error: the join reads `error` on a
+ * completed child as a failed item, so a stale one would count the retry's
+ * success as a failure.
+ *
+ * A queued child never revives a failed run: its retry does not settle, so
+ * something else failed the run. The queued retry is retired instead, leaving
+ * the item `failed` with the cut's error for a run retry to give a new attempt.
+ *
+ * A run inside a cancelled tree is never revived: its queued retry is dropped.
  */
-async function claimRetry(runId: string, stepId: string): Promise<boolean> {
+async function claimRetry(
+  runId: string,
+  stepId: string,
+  options: { requeueForeachChild?: boolean } = {},
+): Promise<boolean> {
   return getDbClient().transaction(async () => {
     const run = await getWorkflowRun(runId);
     if (!run || !RETRYABLE_RUN_STATUSES.has(run.status)) return false;
+    if (await getRunLineageBlock(runId)) {
+      await disarmWorkflowTreeRetries([runId], new Date().toISOString());
+      return false;
+    }
+    if (options.requeueForeachChild && run.status === "failed") {
+      await getDbClient().run(
+        `UPDATE workflow_run_steps SET nextRetryAt = NULL, finishedAt = ?
+          WHERE id = ? AND runId = ? AND status = 'failed' AND nextRetryAt IS NOT NULL`,
+        [new Date().toISOString(), stepId, runId],
+      );
+      return false;
+    }
+    const set = options.requeueForeachChild
+      ? "status = 'pending', nextRetryAt = NULL, error = NULL"
+      : "status = 'running', nextRetryAt = NULL";
     const claimed = await getDbClient().get<{ id: string }>(
       `UPDATE workflow_run_steps
-          SET status = 'running', nextRetryAt = NULL
+          SET ${set}
         WHERE id = ? AND runId = ? AND status = 'failed' AND nextRetryAt IS NOT NULL
         RETURNING id`,
       [stepId, runId],
@@ -272,6 +338,7 @@ async function completeRunIfSettled(runId: string, ctx: Record<string, unknown>)
   await getDbClient().transaction(async () => {
     const run = await getWorkflowRun(runId);
     if (!run || (run.status !== "running" && run.status !== "waiting")) return;
+    if (await getRunLineageBlock(runId)) return;
     const steps = await getWorkflowRunStepsByRunId(runId);
     const live = steps.some(
       (s) =>

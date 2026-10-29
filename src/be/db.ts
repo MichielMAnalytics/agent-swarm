@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import pkg from "../../package.json";
-import { defaultAssetKey, normalizeAssetKey, sessionGroupKey } from "../assets/key";
+import { defaultAssetKey, normalizeAssetKey } from "../assets/key";
+import { sessionSourceKey, sessionThreadGroupKey } from "../assets/source-key";
 import {
   generateDefaultClaudeMd,
   generateDefaultIdentityMd,
@@ -24,6 +25,7 @@ import type {
   AgentLogEventType,
   AgentMcpServer,
   AgentSkill,
+  AgentSlackIcon,
   AgentStatus,
   AgentTask,
   AgentTaskStatus,
@@ -126,6 +128,7 @@ import {
   CreateTaskOptionsSchema,
   isTerminalTaskStatus,
   type ModelTier,
+  OPEN_TASK_STATUSES,
   parseModelTier,
   SERVER_GENERATED_ATTACHMENT_CAPABILITY,
   SessionCostModelBreakdownSchema,
@@ -194,6 +197,7 @@ import {
   getLatestContextVersion,
 } from "./db/context-versions";
 import { clearAgentModelProfileOnOverrideChange } from "./db/model-profiles";
+import { pageSearchSql } from "./db/page-search";
 import { getDb, getDbClient } from "./db/runtime";
 import {
   assertAssetKeyMovesAllowed,
@@ -207,7 +211,9 @@ import {
   sessionCountQuery,
   sessionPageFields,
   sessionSummaryQuery,
+  threadRootsSql,
 } from "./db/session-tree";
+import { searchSkillRowsRanked } from "./db/skill-search";
 import { classifyTaskHumanFree, reclassifyTaskHumanFree } from "./db/tasks/human-free";
 import {
   type AgentTaskRow,
@@ -221,7 +227,21 @@ import {
   rowToAgentTaskSummary,
 } from "./db/tasks/read";
 import { configureTaskWriteDependencies, failTask } from "./db/tasks/write";
-import { emitChildRunFinished, wakeParentsOfDeletedRuns } from "./db/workflow-runs";
+import { tombstoneWorkflowIdempotencyKeys } from "./db/workflow-idempotency";
+import {
+  emitChildRunFinished,
+  emitRunFinished,
+  getRunLineageBlock,
+  getStepExecutionBlock,
+  isTerminalWorkflowRunStatus,
+  rowToWorkflowRun,
+  rowToWorkflowRunStep,
+  WORKFLOW_RUN_SUMMARY_COLUMNS,
+  type WorkflowRunRow,
+  type WorkflowRunStepRow,
+  WorkflowStepNotExecutableError,
+  wakeParentsOfDeletedRuns,
+} from "./db/workflow-runs";
 import { scrubJsonValue } from "./scrub-json";
 import { openSealedJson, sealedJsonForDisplay, sealJson } from "./sealed-json";
 import { configSecretName, registerStoredSecret } from "./secret-registry";
@@ -234,7 +254,7 @@ import {
 } from "./swarm-config-guard";
 import { emitTaskStarted } from "./task-lifecycle-events";
 import { publishWorkerConfigNudge, publishWorkerNudge } from "./worker-nudges";
-import { defineWorkflowPayload, type WorkflowPayloadView } from "./workflow-replay";
+import type { WorkflowPayloadView } from "./workflow-replay";
 
 export {
   refreshActiveSessionOnActivity,
@@ -277,7 +297,7 @@ export {
   updateAgentStatus,
   updateAgentStatusFromCapacity,
 } from "./db/agents";
-export { recordKeySeatMismatch } from "./db/api-keys";
+export { recordKeySeatMismatch, recordKeyValidation } from "./db/api-keys";
 export {
   type ApprovalRequestSummary,
   type ApprovalVote,
@@ -2417,17 +2437,23 @@ async function findLatestRoutingCandidate(
 async function captureRoutingDecisionSnapshot(
   options: CreateTaskOptions,
 ): Promise<RoutingDecisionSnapshot> {
+  // MATERIALIZED pins the plan: a status seek over the few open tasks. Without
+  // it (and with no sqlite_stat1) the planner flattens the CTE back into an OR
+  // over agentId/offeredTo that reads each agent's whole task history.
   const workerStatuses = await getDbClient().query<RoutingDecisionWorkerStatus>(
-    `SELECT agent.id AS agentId, agent.status,
+    `WITH open_task AS MATERIALIZED (
+         SELECT id, agentId, offeredTo, status FROM agent_tasks
+          WHERE status IN (${OPEN_TASK_STATUSES.map(() => "?").join(", ")})
+       )
+       SELECT agent.id AS agentId, agent.status,
          COUNT(task.id) AS openTaskCount,
          SUM(CASE WHEN task.status IN ('in_progress', 'reviewing') THEN 1 ELSE 0 END) AS activeTaskCount
        FROM agents agent
-       LEFT JOIN agent_tasks task ON
-         (task.agentId = agent.id OR task.offeredTo = agent.id)
-         AND task.status NOT IN ('completed', 'failed', 'cancelled', 'superseded')
+       LEFT JOIN open_task task ON task.agentId = agent.id OR task.offeredTo = agent.id
        WHERE agent.isLead = 0
        GROUP BY agent.id, agent.status
        ORDER BY agent.id`,
+    [...OPEN_TASK_STATUSES],
   );
 
   const samePr =
@@ -2489,6 +2515,8 @@ export async function createTaskExtended(
     );
   }
   let requestedByUserIdInherited = false;
+  // The parent key is read again inside the INSERT transaction (see below).
+  let keyInherited = false;
   // True only when `options.routingAffinity` ends up populated purely via
   // the plain parent-fallback inherit below (child declared no affinity of
   // its own, the parent wasn't lead-only, AND the parent's affinity actually
@@ -2653,6 +2681,7 @@ export async function createTaskExtended(
       }
       if (parent.key && !options.key) {
         options.key = parent.key;
+        keyInherited = true;
       }
       if (parent.contextKey && !options.contextKey) {
         options.contextKey = parent.contextKey;
@@ -2842,7 +2871,18 @@ export async function createTaskExtended(
   }
 
   const auditUserId = getCurrentRequestUserId() ?? null;
-  const assetKey = normalizeAssetKey(options?.key ?? defaultAssetKey("task", id));
+  const assetKey = normalizeAssetKey(
+    options?.key ??
+      (options?.parentTaskId
+        ? null
+        : sessionSourceKey({
+            id,
+            slackChannelId: options?.slackChannelId,
+            slackThreadTs: options?.slackThreadTs,
+            contextKey: options?.contextKey,
+          })) ??
+      defaultAssetKey("task", id),
+  );
   // The Linear tracker dedup guard and the INSERT commit as one unit. Two
   // distinct webhook deliveries for the same issue are dispatched
   // fire-and-forget (src/linear/webhook.ts), nothing serializes them, and
@@ -2854,10 +2894,31 @@ export async function createTaskExtended(
   const claim = await getDbClient().transaction<
     { existing: ExistingTrackerContextWork } | { row: AgentTaskRow }
   >(async () => {
+    // A workflow step's task commits only while the step may still start
+    // work. Checked in the INSERT's transaction: a cascade cancel of the
+    // step's run tree either commits first and is seen here, or sees and
+    // cancels this task.
+    if (options?.workflowRunStepId) {
+      const blocked = await getStepExecutionBlock(options.workflowRunStepId);
+      if (blocked) throw new WorkflowStepNotExecutableError(options.workflowRunStepId, blocked);
+    }
     const existingTrackerWork = options?.bypassTrackerContextDedup
       ? null
       : await findExistingLinearTrackerContextWork(options?.contextKey);
     if (existingTrackerWork) return { existing: existingTrackerWork };
+
+    // A chain move (a user move, the source key backfill) can commit between
+    // the parent read above and this write lock. Its chain query did not see
+    // this child, so take the parent's key as it is now.
+    const parentKey =
+      keyInherited && options?.parentTaskId
+        ? (
+            await getDbClient().get<{ key: string }>('SELECT "key" FROM agent_tasks WHERE id = ?', [
+              options.parentTaskId,
+            ])
+          )?.key
+        : undefined;
+    const insertKey = parentKey ? normalizeAssetKey(parentKey) : assetKey;
 
     let routingDecisionSnapshot: RoutingDecisionSnapshot | null = null;
     try {
@@ -2889,7 +2950,7 @@ export async function createTaskExtended(
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       [
         id,
-        assetKey,
+        insertKey,
         options?.agentId ?? null,
         options?.creatorAgentId ?? null,
         // Free text from every task source; scrub at the single INSERT.
@@ -3691,6 +3752,7 @@ export async function updateAgentProfile(
     heartbeatMd?: string;
     /** `null` resets to the deterministic fallback; omit the key to leave untouched. */
     avatar?: AgentAvatar | null;
+    slackIcon?: AgentSlackIcon | null;
   },
   meta?: VersionMeta,
   guard?: {
@@ -3838,6 +3900,8 @@ export async function updateAgentProfile(
     // untouched) from "key present with value null" (reset).
     const avatarProvided = Object.hasOwn(updates, "avatar");
     const avatarJson = updates.avatar ? JSON.stringify(updates.avatar) : null;
+    const slackIconProvided = Object.hasOwn(updates, "slackIcon");
+    const slackIconJson = updates.slackIcon ? JSON.stringify(updates.slackIcon) : null;
 
     const now = new Date().toISOString();
     const row = await tx.get<AgentRow>(
@@ -3853,6 +3917,7 @@ export async function updateAgentProfile(
           toolsMd = COALESCE(?, toolsMd),
           heartbeatMd = COALESCE(?, heartbeatMd),
           avatar = CASE WHEN ? = 1 THEN ? ELSE avatar END,
+          slack_icon = CASE WHEN ? = 1 THEN ? ELSE slack_icon END,
           lastUpdatedAt = ?
          WHERE id = ? RETURNING *`,
       [
@@ -3868,6 +3933,8 @@ export async function updateAgentProfile(
         writable.heartbeatMd ?? null,
         avatarProvided ? 1 : 0,
         avatarJson,
+        slackIconProvided ? 1 : 0,
+        slackIconJson,
         now,
         id,
       ],
@@ -4738,7 +4805,7 @@ export async function createSessionLogs(logs: {
   for (let start = 0; start < logs.lines.length; start += BATCH_SIZE) {
     // Yield to the event loop between batches.
     if (start > 0) await new Promise<void>((r) => setTimeout(r, 5));
-    const batch: { content: string; lineNumber: number }[] = [];
+    const batch: string[] = [];
     const end = Math.min(start + BATCH_SIZE, logs.lines.length);
     for (let i = start; i < end; i++) {
       const line = logs.lines[i];
@@ -4747,10 +4814,22 @@ export async function createSessionLogs(logs: {
       // content that is already scrubbed at the adapter emit site. We scrub
       // again here so any future write path that bypasses the adapter still
       // lands clean text in the persistent session_logs table.
-      batch.push({ content: scrubSecrets(line), lineNumber: i });
+      batch.push(scrubSecrets(line));
     }
     await getDbClient().transaction(async (tx) => {
-      for (const { content, lineNumber } of batch) {
+      // The worker flushes one (sessionId, iteration) in many POSTs, so the
+      // lineNumber continues from the newest stored row instead of restarting
+      // at the POST's index. Reading the newest row by rowid walks the
+      // sessionId index backwards and stops at the first hit, where MAX()
+      // would scan the whole session. Rows written here are monotonic in
+      // rowid, so this equals MAX + 1 for them.
+      const last = await tx.get<{ lineNumber: number }>(
+        `SELECT lineNumber FROM session_logs WHERE sessionId = ? AND iteration = ?
+         ORDER BY rowid DESC LIMIT 1`,
+        [logs.sessionId, logs.iteration],
+      );
+      let lineNumber = last ? last.lineNumber + 1 : 0;
+      for (const content of batch) {
         await tx.run(
           `INSERT INTO session_logs (id, taskId, sessionId, iteration, cli, content, lineNumber, createdAt)
            VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
@@ -4761,7 +4840,7 @@ export async function createSessionLogs(logs: {
             logs.iteration,
             logs.cli,
             content,
-            lineNumber,
+            lineNumber++,
           ],
         );
       }
@@ -4769,6 +4848,10 @@ export async function createSessionLogs(logs: {
   }
 }
 
+// Session log reads order by rowid, which is insert order. Rows written before
+// lineNumber was assigned server-side restart at 0 on every worker flush, so
+// only rowid orders them. The API never runs VACUUM (runbooks/db-retention.md);
+// a manual VACUUM may renumber rowids but copies rows in rowid order.
 export async function getSessionLogsByTaskId(
   taskId: string,
   limit?: number,
@@ -4776,16 +4859,16 @@ export async function getSessionLogsByTaskId(
   if (typeof limit === "number" && limit > 0) {
     const rows = await getDbClient().query<SessionLogRow>(
       `SELECT * FROM (
-         SELECT * FROM session_logs WHERE taskId = ?
-         ORDER BY iteration DESC, lineNumber DESC
+         SELECT rowid AS seq, * FROM session_logs WHERE taskId = ?
+         ORDER BY rowid DESC
          LIMIT ?
-       ) ORDER BY iteration ASC, lineNumber ASC`,
+       ) ORDER BY seq ASC`,
       [taskId, limit],
     );
     return rows.map(rowToSessionLog);
   }
   const rows = await getDbClient().query<SessionLogRow>(
-    "SELECT * FROM session_logs WHERE taskId = ? ORDER BY iteration ASC, lineNumber ASC",
+    "SELECT * FROM session_logs WHERE taskId = ? ORDER BY rowid ASC",
     [taskId],
   );
   return rows.map(rowToSessionLog);
@@ -4796,7 +4879,7 @@ export async function getSessionLogsBySession(
   iteration: number,
 ): Promise<SessionLog[]> {
   const rows = await getDbClient().query<SessionLogRow>(
-    "SELECT * FROM session_logs WHERE sessionId = ? AND iteration = ? ORDER BY lineNumber ASC",
+    "SELECT * FROM session_logs WHERE sessionId = ? AND iteration = ? ORDER BY rowid ASC",
     [sessionId, iteration],
   );
   return rows.map(rowToSessionLog);
@@ -5995,6 +6078,8 @@ export interface ScheduledTaskFilters {
   lastRunStatus?: "failed" | "succeeded";
   key?: string;
   keyPrefix?: string;
+  /** At most this many rows, in list order. */
+  limit?: number;
 }
 
 /**
@@ -6076,6 +6161,10 @@ export async function getScheduledTasks(
   }
 
   query += " ORDER BY lastRunAt IS NULL ASC, lastRunAt DESC, lastUpdatedAt DESC";
+  if (filters?.limit !== undefined) {
+    query += " LIMIT ?";
+    params.push(filters.limit);
+  }
 
   const rows = await getDbClient().query<ScheduledTaskRow>(query, params);
   return opts?.slim ? rows.map(rowToScheduledTaskSummary) : rows.map(rowToScheduledTask);
@@ -6360,9 +6449,36 @@ export async function updateScheduledTask(
 
 export async function deleteScheduledTask(id: string): Promise<boolean> {
   return await getDbClient().transaction(async (tx) => {
+    // An unfired deferral is the only continuation of a suppressed completion.
+    // Read under the delete's write lock so a concurrent wake cannot be missed.
+    const deferred = await tx.get<{ parentTaskId: string }>(
+      `SELECT parentTaskId FROM scheduled_tasks
+       WHERE id = ? AND taskType = 'deferred' AND parentTaskId IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM agent_tasks WHERE scheduleId = scheduled_tasks.id)`,
+      [id],
+    );
     // Favorites carry no FK to the entity; drop every user's star with it.
     await tx.run("DELETE FROM user_favorites WHERE itemType = 'schedule' AND itemId = ?", [id]);
     const result = await tx.run("DELETE FROM scheduled_tasks WHERE id = ?", [id]);
+    if (result.changes > 0 && deferred) {
+      getDbClient().afterCommit(async () => {
+        try {
+          const parent = await getTaskById(deferred.parentTaskId);
+          if (!parent?.deferredAt) return;
+          const { createWorkerTaskFollowUp } = await import("../tasks/worker-follow-up");
+          await createWorkerTaskFollowUp({
+            task: parent,
+            status: "failed",
+            failureReason: "Deferred continuation schedule deleted before its wake-up",
+          });
+        } catch (error) {
+          console.error(
+            "[deleteScheduledTask] deferred deletion follow-up failed:",
+            scrubSecrets(error instanceof Error ? error.message : String(error)),
+          );
+        }
+      });
+    }
     return result.changes > 0;
   });
 }
@@ -7615,6 +7731,10 @@ export interface WorkflowFilters {
   consecutiveErrorsMin?: number;
   key?: string;
   keyPrefix?: string;
+  /** Matches the name, description or key anywhere, case-insensitive. */
+  q?: string;
+  /** At most this many rows, newest first. */
+  limit?: number;
 }
 
 export function listWorkflows(filters?: WorkflowFilters): Promise<Workflow[]>;
@@ -7660,7 +7780,16 @@ export async function listWorkflows(
     ) >= ?`;
     params.push(filters.consecutiveErrorsMin);
   }
+  if (filters?.q) {
+    const pattern = `%${literalPrefixPattern(filters.q)}`;
+    query += ` AND (name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' OR "key" LIKE ? ESCAPE '\\')`;
+    params.push(pattern, pattern, pattern);
+  }
   query += " ORDER BY lastUpdatedAt DESC";
+  if (filters?.limit !== undefined) {
+    query += " LIMIT ?";
+    params.push(filters.limit);
+  }
   const rows = await getDbClient().query<WorkflowRow>(query, params);
   return opts?.slim ? rows.map(rowToWorkflowSummary) : rows.map(rowToWorkflow);
 }
@@ -7789,7 +7918,9 @@ async function deleteWorkflowRows(id: string, source?: "api" | "mcp"): Promise<b
   await reclassifyTaskHumanFree(linkedTaskIds);
   // 4. Delete every user's favorite of it (no FK to the workflow)
   await client.run("DELETE FROM user_favorites WHERE itemType = 'workflow' AND itemId = ?", [id]);
-  // 5. Delete workflow
+  // 5. Keep Idempotency-Keys that created or triggered it taken, without the stored response
+  await tombstoneWorkflowIdempotencyKeys(id);
+  // 6. Delete workflow
   const result = await client.run("DELETE FROM workflows WHERE id = ?", [id]);
   const deleted = result.changes > 0;
   if (deleted) {
@@ -7825,50 +7956,6 @@ export async function getWorkflowsByScheduleId(scheduleId: string): Promise<Work
 // Workflow Run CRUD
 // ============================================================================
 
-type WorkflowRunRow = {
-  id: string;
-  workflowId: string;
-  status: string;
-  triggerType: string;
-  triggerData: string | null;
-  /** Absent from list rows: see `WORKFLOW_RUN_SUMMARY_COLUMNS`. */
-  context?: string | null;
-  /** Sealed exact `context` (migration 201). Absent from list rows. */
-  context_replay?: string | null;
-  error: string | null;
-  created_by: string | null;
-  startedAt: string;
-  lastUpdatedAt: string;
-  finishedAt: string | null;
-  /** The `sub-workflow` step that started this run (migration 203). */
-  parentStepId?: string | null;
-};
-
-/**
- * `view` picks the `context` copy: `replay` (default) is the exact sealed value
- * the engine resumes from; `display` is the scrubbed column for API, MCP and UI
- * responses. See `src/be/workflow-replay.ts`.
- */
-function rowToWorkflowRun(row: WorkflowRunRow, view: WorkflowPayloadView = "replay"): WorkflowRun {
-  const run: WorkflowRun = {
-    id: row.id,
-    workflowId: row.workflowId,
-    status: row.status as WorkflowRunStatus,
-    triggerData: row.triggerData ? JSON.parse(row.triggerData) : undefined,
-    context: undefined,
-    error: row.error ?? undefined,
-    createdBy: row.created_by ?? undefined,
-    startedAt: normalizeDateRequired(row.startedAt),
-    lastUpdatedAt: normalizeDateRequired(row.lastUpdatedAt),
-    finishedAt: normalizeDate(row.finishedAt) ?? undefined,
-    parentStepId: row.parentStepId ?? undefined,
-  };
-  return defineWorkflowPayload(run, "context", row.context, row.context_replay, view, {
-    runId: row.id,
-    target: "its context",
-  });
-}
-
 export async function createWorkflowRun(data: {
   id: string;
   workflowId: string;
@@ -7876,10 +7963,14 @@ export async function createWorkflowRun(data: {
   triggerData?: unknown;
   createdBy?: string;
   parentStepId?: string;
+  /** The parent step's `retryCount` when it started this run (migration 240). */
+  parentStepAttempt?: number;
+  /** Server-stamped agent that started the run (migration 247). Never from trigger data. */
+  triggeredByAgentId?: string;
 }): Promise<WorkflowRun> {
   const now = new Date().toISOString();
   const row = await getDbClient().get<WorkflowRunRow>(
-    `INSERT INTO workflow_runs (id, workflowId, triggerType, startedAt, triggerData, created_by, parentStepId) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+    `INSERT INTO workflow_runs (id, workflowId, triggerType, startedAt, triggerData, created_by, parentStepId, parentStepAttempt, triggeredByAgentId) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     [
       data.id,
       data.workflowId,
@@ -7888,6 +7979,8 @@ export async function createWorkflowRun(data: {
       data.triggerData ? scrubJsonValue(data.triggerData) : null,
       data.createdBy ?? null,
       data.parentStepId ?? null,
+      data.parentStepAttempt ?? 0,
+      data.triggeredByAgentId ?? null,
     ],
   );
   if (!row) throw new Error("Failed to create workflow run");
@@ -7967,16 +8060,33 @@ export async function updateWorkflowRun(
   updates.push("lastUpdatedAt = ?");
   params.push(new Date().toISOString());
   params.push(id);
-  const row = await getDbClient().get<WorkflowRunRow>(
-    `UPDATE workflow_runs SET ${updates.join(", ")} WHERE id = ? RETURNING *`,
-    params,
-  );
+  const update = () =>
+    getDbClient().get<WorkflowRunRow>(
+      `UPDATE workflow_runs SET ${updates.join(", ")} WHERE id = ? RETURNING *`,
+      params,
+    );
+  const endsRun = data.status !== undefined && isTerminalWorkflowRunStatus(data.status);
+  // A run that ends reads the status it replaces in the same transaction, so
+  // only a change out of a live status announces the end: a later terminal
+  // write, same status or not, does not announce it again.
+  const [previousStatus, row] = endsRun
+    ? await getDbClient().transaction(async () => {
+        const previous = await getDbClient().get<{ status: WorkflowRunStatus }>(
+          "SELECT status FROM workflow_runs WHERE id = ?",
+          [id],
+        );
+        return [previous?.status, await update()] as const;
+      })
+    : [undefined, await update()];
   if (!row) return null;
   const run = rowToWorkflowRun(row);
   if (data.status === "completed" || data.status === "failed") {
     emitWorkflowTerminalTelemetry(run);
   }
   if (row.parentStepId) emitChildRunFinished(id, row.parentStepId, run.status);
+  if (endsRun && previousStatus && !isTerminalWorkflowRunStatus(previousStatus)) {
+    emitRunFinished(id, run.workflowId, run.status);
+  }
   return run;
 }
 
@@ -7990,11 +8100,6 @@ export type WorkflowRunListOptions = {
    */
   includeContext?: boolean;
 };
-
-// Everything but `context`. `triggerData` stays: it is small, and stored
-// scripts read it off list rows (dedupe by trigger, failure reports).
-const WORKFLOW_RUN_SUMMARY_COLUMNS =
-  "id, workflowId, status, triggerType, triggerData, error, created_by, startedAt, lastUpdatedAt, finishedAt";
 
 export type WorkflowRunPage = {
   runs: WorkflowRun[];
@@ -8079,56 +8184,6 @@ export async function listWorkflowRunsPage(
 // ============================================================================
 // Workflow Run Step CRUD
 // ============================================================================
-
-type WorkflowRunStepRow = {
-  id: string;
-  runId: string;
-  nodeId: string;
-  nodeType: string;
-  status: string;
-  input: string | null;
-  output: string | null;
-  /** Sealed exact `output` (migration 201). */
-  output_replay: string | null;
-  error: string | null;
-  startedAt: string;
-  finishedAt: string | null;
-  retryCount: number;
-  maxRetries: number;
-  nextRetryAt: string | null;
-  idempotencyKey: string | null;
-  diagnostics: string | null;
-  nextPort: string | null;
-};
-
-/** `view` picks the `output` copy, as in `rowToWorkflowRun`. */
-function rowToWorkflowRunStep(
-  row: WorkflowRunStepRow,
-  view: WorkflowPayloadView = "replay",
-): WorkflowRunStep {
-  const step: WorkflowRunStep = {
-    id: row.id,
-    runId: row.runId,
-    nodeId: row.nodeId,
-    nodeType: row.nodeType,
-    status: row.status as WorkflowRunStepStatus,
-    input: row.input ? JSON.parse(row.input) : undefined,
-    output: undefined,
-    error: row.error ?? undefined,
-    startedAt: normalizeDateRequired(row.startedAt),
-    finishedAt: normalizeDate(row.finishedAt) ?? undefined,
-    retryCount: row.retryCount,
-    maxRetries: row.maxRetries,
-    nextRetryAt: normalizeDate(row.nextRetryAt) ?? undefined,
-    idempotencyKey: row.idempotencyKey ?? undefined,
-    diagnostics: row.diagnostics ?? undefined,
-    nextPort: row.nextPort ?? undefined,
-  };
-  return defineWorkflowPayload(step, "output", row.output, row.output_replay, view, {
-    runId: row.runId,
-    target: `the output of step ${row.id} (node ${row.nodeId})`,
-  });
-}
 
 export async function createWorkflowRunStep(data: {
   id: string;
@@ -8243,7 +8298,7 @@ export async function getWorkflowRunStepsByRunId(
   view: WorkflowPayloadView = "replay",
 ): Promise<WorkflowRunStep[]> {
   const rows = await getDbClient().query<WorkflowRunStepRow>(
-    "SELECT * FROM workflow_run_steps WHERE runId = ? ORDER BY startedAt ASC",
+    "SELECT * FROM workflow_run_steps WHERE runId = ? ORDER BY startedAt ASC, rowid ASC",
     [runId],
   );
   return rows.map((row) => rowToWorkflowRunStep(row, view));
@@ -8262,6 +8317,10 @@ export interface StuckWorkflowRun {
 }
 
 export async function getStuckWorkflowRuns(): Promise<StuckWorkflowRun[]> {
+  // CROSS JOIN fixes the join order: the few waiting steps drive, and each
+  // one seeks its task through idx_agent_tasks_workflowRunStepId, so `output`
+  // is read only for matched tasks. Driving from agent_tasks by status reads
+  // nearly every finished task.
   return getDbClient().query<StuckWorkflowRun>(
     `SELECT
         wr.id as runId,
@@ -8271,10 +8330,11 @@ export async function getStuckWorkflowRuns(): Promise<StuckWorkflowRun[]> {
         at.status as taskStatus,
         at.output as taskOutput,
         wr.workflowId
-      FROM workflow_runs wr
-      JOIN workflow_run_steps wrs ON wrs.runId = wr.id AND wrs.status = 'waiting'
-      JOIN agent_tasks at ON at.workflowRunStepId = wrs.id
-      WHERE wr.status = 'waiting'
+      FROM workflow_run_steps wrs
+      CROSS JOIN workflow_runs wr ON wr.id = wrs.runId
+      CROSS JOIN agent_tasks at ON at.workflowRunStepId = wrs.id
+      WHERE wrs.status = 'waiting'
+        AND wr.status = 'waiting'
         AND at.status IN ('completed', 'failed', 'cancelled')
       ORDER BY at.createdAt ASC, at.rowid ASC`,
   );
@@ -8359,7 +8419,7 @@ export async function getLatestStepForNode(
   nodeId: string,
 ): Promise<WorkflowRunStep | null> {
   const row = await getDbClient().get<WorkflowRunStepRow>(
-    "SELECT * FROM workflow_run_steps WHERE runId = ? AND nodeId = ? ORDER BY startedAt DESC LIMIT 1",
+    "SELECT * FROM workflow_run_steps WHERE runId = ? AND nodeId = ? ORDER BY startedAt DESC, rowid DESC LIMIT 1",
     [runId, nodeId],
   );
   return row ? rowToWorkflowRunStep(row) : null;
@@ -8661,6 +8721,8 @@ export interface PageListOptions {
   slim?: boolean;
   key?: string;
   keyPrefix?: string;
+  /** Matches the title, slug or description anywhere, case-insensitive. */
+  q?: string;
 }
 
 export function listPagesByAgent(agentId: string, limit?: number, offset?: number): Promise<Page[]>;
@@ -8691,6 +8753,7 @@ export async function listPagesByAgent(
     query += ` AND "key" LIKE ? ESCAPE '\\'`;
     params.push(assetKeyPrefixPattern(opts.keyPrefix));
   }
+  query += pageSearchSql(opts?.q, params);
   query += " ORDER BY updatedAt DESC LIMIT ? OFFSET ?";
   params.push(limit, offset);
   const rows = await getDbClient().query<PageRow>(query, params);
@@ -8722,6 +8785,7 @@ export async function listAllPages(
     query += ` AND "key" LIKE ? ESCAPE '\\'`;
     params.push(assetKeyPrefixPattern(opts.keyPrefix));
   }
+  query += pageSearchSql(opts?.q, params);
   query += " ORDER BY updatedAt DESC LIMIT ? OFFSET ?";
   params.push(limit, offset);
   const rows = await getDbClient().query<PageRow>(query, params);
@@ -8733,10 +8797,10 @@ export async function listAllPages(
  * pager so the UI shows the real count, not just the current page's length.
  */
 export async function countAllPages(
-  filters?: Pick<PageListOptions, "key" | "keyPrefix">,
+  filters?: Pick<PageListOptions, "key" | "keyPrefix" | "q">,
 ): Promise<number> {
   let query = "SELECT COUNT(*) AS count FROM pages WHERE 1=1";
-  const params: string[] = [];
+  const params: (string | number)[] = [];
   if (filters?.key) {
     query += ' AND "key" = ?';
     params.push(normalizeAssetKey(filters.key));
@@ -8744,6 +8808,7 @@ export async function countAllPages(
     query += ` AND "key" LIKE ? ESCAPE '\\'`;
     params.push(assetKeyPrefixPattern(filters.keyPrefix));
   }
+  query += pageSearchSql(filters?.q, params);
   const row = await getDbClient().get<{ count: number }>(query, params);
   return row?.count ?? 0;
 }
@@ -8751,10 +8816,10 @@ export async function countAllPages(
 /** Page count scoped to a single agent — companion to `listPagesByAgent`. */
 export async function countPagesByAgent(
   agentId: string,
-  filters?: Pick<PageListOptions, "key" | "keyPrefix">,
+  filters?: Pick<PageListOptions, "key" | "keyPrefix" | "q">,
 ): Promise<number> {
   let query = "SELECT COUNT(*) AS count FROM pages WHERE agentId = ?";
-  const params: string[] = [agentId];
+  const params: (string | number)[] = [agentId];
   if (filters?.key) {
     query += ' AND "key" = ?';
     params.push(normalizeAssetKey(filters.key));
@@ -8762,6 +8827,7 @@ export async function countPagesByAgent(
     query += ` AND "key" LIKE ? ESCAPE '\\'`;
     params.push(assetKeyPrefixPattern(filters.keyPrefix));
   }
+  query += pageSearchSql(filters?.q, params);
   const row = await getDbClient().get<{ count: number }>(query, params);
   return row?.count ?? 0;
 }
@@ -9779,15 +9845,29 @@ export async function createApprovalRequest(data: {
   const row = await getDbClient().transaction(async () => {
     let status: ApprovalRequest["status"] = "pending";
     let resolutionReason: string | null = null;
-    if (data.requireActionableWorkflow && data.workflowRunId && data.workflowRunStepId) {
-      const run = await getWorkflowRun(data.workflowRunId);
-      const step = await getWorkflowRunStep(data.workflowRunStepId);
+    // A request linked to an existing run, with or without a step, is born
+    // cancelled unless the run is live and its tree is not cancelled: a
+    // pending request in a cancelled tree would be open work no cancel may
+    // leave behind. A missing run is refused only on the workflow (HITL) path.
+    const actionable = data.requireActionableWorkflow && data.workflowRunStepId;
+    const run = data.workflowRunId ? await getWorkflowRun(data.workflowRunId, "display") : null;
+    if (data.workflowRunId && (run || actionable)) {
+      const step = actionable ? await getWorkflowRunStep(data.workflowRunStepId!) : undefined;
       if (!run || (run.status !== "running" && run.status !== "waiting")) {
         status = "cancelled";
         resolutionReason = run?.error ?? `Workflow run is ${run?.status ?? "missing"}`;
-      } else if (!step || step.runId !== run.id || step.status !== "running") {
+      } else if (
+        step !== undefined &&
+        (!step || step.runId !== run.id || step.status !== "running")
+      ) {
         status = "cancelled";
         resolutionReason = `Human-in-the-loop step is ${step?.status ?? "missing"}`;
+      } else {
+        const blocked = await getRunLineageBlock(run.id);
+        if (blocked) {
+          status = "cancelled";
+          resolutionReason = blocked;
+        }
       }
     }
 
@@ -10989,11 +11069,23 @@ export async function listSkills(filters?: SkillFilters): Promise<Skill[]> {
   return rows.map(rowToSkill);
 }
 
+/**
+ * Ranked skill search (see searchSkillRowsRanked). Falls back to the unranked
+ * substring match when the ranked query finds nothing, e.g. a partial word or
+ * a query of only stopwords. The fallback also ranks an exact name first.
+ */
 export async function searchSkills(
   query: string,
   limit = 20,
   includeContent = true,
 ): Promise<Skill[]> {
+  const ranked = await searchSkillRowsRanked<SkillRow>(
+    query,
+    limit,
+    includeContent === false ? SKILL_SLIM_COLUMNS : "skills.*",
+  );
+  if (ranked.length > 0) return ranked.map(rowToSkill);
+
   const tokens = query.split(/\s+/).filter(Boolean);
   const columns = includeContent === false ? SKILL_SLIM_COLUMNS : "*";
   const searchClauses = tokens.map(() => "(name LIKE ? OR description LIKE ? OR content LIKE ?)");
@@ -11002,8 +11094,8 @@ export async function searchSkills(
     return [term, term, term];
   });
   const rows = await getDbClient().query<SkillRow>(
-    `SELECT ${columns} FROM skills WHERE ${[...searchClauses, "isEnabled = 1"].join(" AND ")} ORDER BY name ASC LIMIT ?`,
-    [...params, limit],
+    `SELECT ${columns} FROM skills WHERE ${[...searchClauses, "isEnabled = 1"].join(" AND ")} ORDER BY lower(name) = lower(?) DESC, name ASC LIMIT ?`,
+    [...params, query.trim(), limit],
   );
   return rows.map(rowToSkill);
 }
@@ -11675,6 +11767,8 @@ export interface ApiKeyStatus {
   /** Auth failures in a row since the last success or clear. */
   consecutiveAuthFailures: number;
   lastAuthFailureAt: string | null;
+  lastValidationError: string | null;
+  lastValidationFailedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -11700,6 +11794,7 @@ function rowToApiKeyStatus(row: ApiKeyStatusRow): ApiKeyStatus {
 
 export interface AvailableKeyIndicesResult {
   availableIndices: number[];
+  rejectedIndices: number[];
   /** Indices excluded only by an active model-scoped window block (not key-wide). */
   modelBlockedIndices: number[];
   /** ISO of the earliest resetsAt among modelBlockedIndices, or null when none. */
@@ -11720,6 +11815,14 @@ export interface AvailableKeyIndicesResult {
  * whose `plan` cannot run the family (`planAllowsModelFamily`) is excluded
  * and reported in `seatBlockedIndices`, also when it is key-wide or
  * model-window blocked; a seat block has no reset time.
+ *
+ * With `keySuffixes` (the caller's own pool, in order), rows are matched by
+ * key suffix instead of the stored `keyIndex`, across every scope: a key has
+ * one state wherever it is pooled, and a key at the same index in another
+ * agent's pool is never blocked by it. A suffix listed more than once is read
+ * by `keyIndex` in `scope`/`scopeId`, as without the list. Returned indices
+ * are positions in `keySuffixes`. Without it, rows of `scope`/`scopeId` are
+ * read by `keyIndex`.
  */
 export async function getAvailableKeyIndices(
   keyType: string,
@@ -11727,36 +11830,60 @@ export async function getAvailableKeyIndices(
   scope = "global",
   scopeId: string | null = null,
   modelFamily?: ModelFamily,
+  keySuffixes?: string[],
 ): Promise<AvailableKeyIndicesResult> {
   const now = new Date().toISOString();
   const nowMs = Date.now();
   const client = getDbClient();
   const effectiveScopeId = scopeId ?? "";
+  const suffixes = keySuffixes?.length ? keySuffixes : undefined;
+  const rowFilter = suffixes
+    ? `keyType = ? AND keySuffix IN (${suffixes.map(() => "?").join(", ")})`
+    : "keyType = ? AND scope = ? AND scopeId = ?";
+  const rowParams = suffixes ? [keyType, ...suffixes] : [keyType, scope, effectiveScopeId];
 
   // Auto-clear expired rate limits. Never an auth bench: only `clearAuthBench` lifts it.
   await client.run(
     `UPDATE api_key_status
      SET status = 'available', rateLimitedUntil = NULL, updatedAt = ?
-     WHERE keyType = ? AND scope = ? AND scopeId = ?
+     WHERE ${rowFilter}
        AND status = 'rate_limited' AND rateLimitedUntil <= ? AND consecutiveAuthFailures < ?`,
-    [now, keyType, scope, effectiveScopeId, now, CODEX_AUTH_FAILURE_BENCH_THRESHOLD],
+    [now, ...rowParams, now, CODEX_AUTH_FAILURE_BENCH_THRESHOLD],
   );
 
   const rows = await client.query<{
     keyIndex: number;
+    keySuffix: string;
+    scope: string;
+    scopeId: string;
     status: string;
     rateLimitWindows: string | null;
     plan: string | null;
     authFailureSeq: number;
+    lastValidationFailedAt: string | null;
   }>(
-    `SELECT keyIndex, status, rateLimitWindows, plan, authFailureSeq FROM api_key_status
-       WHERE keyType = ? AND scope = ? AND scopeId = ?`,
-    [keyType, scope, effectiveScopeId],
+    `SELECT keyIndex, keySuffix, scope, scopeId, status, rateLimitWindows, plan, authFailureSeq, lastValidationFailedAt FROM api_key_status
+       WHERE ${rowFilter}`,
+    rowParams,
   );
+  // Pool positions a row applies to: the position holding its suffix, or its stored index.
+  // A suffix held by several pool members cannot tell them apart, so it falls back to
+  // the index read: only a row of the requested scope, at its stored index.
+  const positionsOf = (row: (typeof rows)[number]): number[] => {
+    if (!suffixes) return [row.keyIndex];
+    const positions = suffixes.flatMap((suffix, i) => (suffix === row.keySuffix ? [i] : []));
+    if (positions.length < 2) return positions;
+    const sameScope = row.scope === scope && row.scopeId === effectiveScopeId;
+    return sameScope && positions.includes(row.keyIndex) ? [row.keyIndex] : [];
+  };
 
   const blockedIndices = new Set(
-    rows.filter((r) => r.status === "rate_limited").map((r) => r.keyIndex),
+    rows.filter((r) => r.status === "rate_limited").flatMap(positionsOf),
   );
+  const rejectedIndices = [
+    ...new Set(rows.filter((row) => row.lastValidationFailedAt !== null).flatMap(positionsOf)),
+  ];
+  for (const index of rejectedIndices) blockedIndices.add(index);
 
   const modelBlockedIndices: number[] = [];
   let earliestModelResetsAtSec: number | undefined;
@@ -11765,14 +11892,17 @@ export async function getAvailableKeyIndices(
       // A key already blocked key-wide doesn't need a separate model-block
       // entry — it's excluded from availableIndices either way, and
       // modelBlockedIndices means "excluded only by a model-scoped block".
-      if (blockedIndices.has(row.keyIndex)) continue;
+      const positions = positionsOf(row).filter(
+        (i) => !blockedIndices.has(i) && !modelBlockedIndices.includes(i),
+      );
+      if (positions.length === 0) continue;
       const block = activeModelBlock(
         parseRateLimitWindowsJson(row.rateLimitWindows),
         modelFamily,
         nowMs,
       );
       if (!block) continue;
-      modelBlockedIndices.push(row.keyIndex);
+      modelBlockedIndices.push(...positions);
       if (earliestModelResetsAtSec === undefined || block.resetsAt < earliestModelResetsAtSec) {
         earliestModelResetsAtSec = block.resetsAt;
       }
@@ -11786,7 +11916,10 @@ export async function getAvailableKeyIndices(
   const seatBlockedIndices: number[] = [];
   if (modelFamily) {
     for (const row of rows) {
-      if (!planAllowsModelFamily(row.plan, modelFamily)) seatBlockedIndices.push(row.keyIndex);
+      if (planAllowsModelFamily(row.plan, modelFamily)) continue;
+      for (const i of positionsOf(row)) {
+        if (!seatBlockedIndices.includes(i)) seatBlockedIndices.push(i);
+      }
     }
   }
   const seatBlockedSet = new Set(seatBlockedIndices);
@@ -11799,6 +11932,7 @@ export async function getAvailableKeyIndices(
 
   return {
     availableIndices,
+    rejectedIndices,
     modelBlockedIndices,
     seatBlockedIndices,
     earliestModelResetAt:
@@ -12134,22 +12268,30 @@ export async function clearKeyRateLimit(
   const effectiveScopeId = scopeId ?? "";
   const { keyIndex = -1, authFence = null } = opts;
   const clearAuthBench = opts.clearAuthBench === true && authFence !== null;
-  const key = [keyType, keySuffix, scope, effectiveScopeId];
   return await getDbClient().transaction(async (tx) => {
+    // The key's rows in every scope: `getAvailableKeyIndices` reads them all by suffix.
     const result = await tx.run(
       `UPDATE api_key_status
          SET status = 'available', rateLimitedUntil = NULL, updatedAt = ?
-         WHERE keyType = ? AND keySuffix = ? AND scope = ? AND scopeId = ?
+         WHERE keyType = ? AND keySuffix = ?
            AND status = 'rate_limited' AND ((? AND authFailureSeq <= ?) OR consecutiveAuthFailures < ?)`,
-      [now, ...key, clearAuthBench ? 1 : 0, authFence, CODEX_AUTH_FAILURE_BENCH_THRESHOLD],
+      [
+        now,
+        keyType,
+        keySuffix,
+        clearAuthBench ? 1 : 0,
+        authFence,
+        CODEX_AUTH_FAILURE_BENCH_THRESHOLD,
+      ],
     );
     const cleared = result.changes > 0;
     if (!clearAuthBench) return cleared;
     const lifted = await tx.query<{ keySuffix: string }>(
       `UPDATE api_key_status SET consecutiveAuthFailures = 0, updatedAt = ?1,
            status = CASE WHEN keySuffix = ?2 THEN status ELSE 'available' END, rateLimitedUntil = CASE WHEN keySuffix = ?2 THEN rateLimitedUntil END
-         WHERE keyType = ?3 AND scope = ?4 AND scopeId = ?5 AND (consecutiveAuthFailures > 0 OR status = 'rate_limited')
-           AND ((keySuffix = ?2 AND authFailureSeq <= ?7) OR (keySuffix != ?2 AND keyIndex = ?6)) RETURNING keySuffix`,
+         WHERE keyType = ?3 AND (consecutiveAuthFailures > 0 OR status = 'rate_limited')
+           AND ((keySuffix = ?2 AND authFailureSeq <= ?7)
+             OR (keySuffix != ?2 AND keyIndex = ?6 AND scope = ?4 AND scopeId = ?5)) RETURNING keySuffix`,
       [now, keySuffix, keyType, scope, effectiveScopeId, keyIndex, authFence],
     );
     const retired = lifted.filter((row) => row.keySuffix !== keySuffix);
@@ -12629,6 +12771,8 @@ export async function upsertInboxState(opts: {
 
   // SQLite upsert via UNIQUE(userId, itemType, itemId). readAt is sticky: the
   // first non-null value written wins on every subsequent conflict.
+  // `triageSessionList` in src/be/db/session-tree.ts copies these conflict
+  // rules for whole-list triage. Keep the two in step.
   const row = await getDbClient().get<InboxItemStateRow>(
     `INSERT INTO inbox_item_state (userId, itemType, itemId, status, snoozeUntil, dismissedAt, doneAt, readAt, lastReadAt, createdAt, lastUpdatedAt)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -12870,7 +13014,8 @@ export async function listTaskTemplates(opts?: {
 /**
  * Walk the chain rooted at `rootTaskId`, ordered by `createdAt` (root first; `rowid` breaks
  * ties as idx_agent_tasks_created did). `CROSS JOIN` keeps the chain as the outer loop: with
- * a plain JOIN, SQLite scanned all of agent_tasks to skip the sort.
+ * a plain JOIN, SQLite scanned all of agent_tasks to skip the sort. Each task carries its
+ * `totalCostUsd`, so the session header can total the whole chain, not only the root.
  */
 export async function getRootTaskChain(rootTaskId: string): Promise<AgentTask[]> {
   const rows = await getDbClient().query<AgentTaskRow>(
@@ -12880,7 +13025,9 @@ export async function getRootTaskChain(rootTaskId: string): Promise<AgentTask[]>
          SELECT t.id FROM agent_tasks t
          JOIN chain c ON t.parentTaskId = c.id
        )
-       SELECT t.* FROM chain
+       SELECT t.*,
+         (SELECT SUM(totalCostUsd) FROM session_costs WHERE session_costs.taskId = t.id) AS totalCostUsd
+       FROM chain
        CROSS JOIN agent_tasks t ON t.id = chain.id
        ORDER BY t.createdAt, t.rowid`,
     [rootTaskId],
@@ -12925,6 +13072,7 @@ export async function listRecentSessions(
   opts: ListRecentSessionsOpts = {},
 ): Promise<SessionListItem[] | SessionListItemSummary[]> {
   const query = sessionSummaryQuery(opts);
+  const threadRoots = threadRootsSql();
   const rootRows = await getDbClient().query<
     AgentTaskRow & {
       __chainCount: number;
@@ -12933,15 +13081,17 @@ export async function listRecentSessions(
       __readState: SessionReadState | null;
       __snoozeUntil: string | null;
       __needsYou: number;
+      __threadRoots: number;
     }
   >(
     `SELECT r.*, a.chainCount AS __chainCount, a.lastActivityAt AS __lastActivityAt,
       a.latestStatus AS __latestStatus, a.readState AS __readState,
-      a.snoozeUntil AS __snoozeUntil, a.needsYou AS __needsYou
+      a.snoozeUntil AS __snoozeUntil, a.needsYou AS __needsYou,
+      ${threadRoots.sql} AS __threadRoots
     FROM (${query.sql}) a CROSS JOIN agent_tasks r ON r.id = a.root_id
     ORDER BY ${opts.triage === "later" ? "a.snoozeUntil ASC," : ""}
       a.lastActivityAt DESC, r.createdAt DESC, r.id DESC LIMIT ? OFFSET ?`,
-    [...query.params, opts.limit ?? 25, opts.offset ?? 0],
+    [...threadRoots.params, ...query.params, opts.limit ?? 25, opts.offset ?? 0],
   );
   const fields = await sessionPageFields(
     rootRows.map((row) => ({
@@ -12957,7 +13107,7 @@ export async function listRecentSessions(
     ...(row.__readState ? { readState: row.__readState } : {}),
     snoozeUntil: row.__snoozeUntil,
     needsYou: !!row.__needsYou,
-    groupKey: sessionGroupKey(row.key),
+    groupKey: sessionThreadGroupKey(row.key, row.__threadRoots),
     ...fields.get(row.id),
   }));
 }

@@ -5,6 +5,7 @@ import { resolveHttpAuditUserId } from "../be/audit-user";
 import {
   createWorkflow,
   deleteWorkflow,
+  getDbClient,
   getWorkflow,
   getWorkflowRun,
   getWorkflowRunStepsByRunId,
@@ -15,7 +16,21 @@ import {
   type updateWorkflow,
   withFavoriteFlags,
 } from "../be/db";
-import { getWorkflowRunParent } from "../be/db/workflow-runs";
+import {
+  assertWorkflowIdempotencyKeyUnused,
+  IdempotencyKeyTakenError,
+  recordAcceptedWorkflowOperation,
+  type WorkflowIdempotencyClaim,
+  workflowRequestFingerprint,
+} from "../be/db/workflow-idempotency";
+import {
+  getWorkflowRunParent,
+  getWorkflowRunStepsSlimByRunId,
+  getWorkflowRunSummary,
+  getWorkflowRunTree,
+  WORKFLOW_RUN_TREE_MAX_DEPTH,
+  WorkflowRunTreeError,
+} from "../be/db/workflow-runs";
 import {
   AssetKeySchema,
   AutomationIntegrationIdSchema,
@@ -31,6 +46,7 @@ import {
   WorkflowRunSchema,
   WorkflowRunStatusSchema,
   WorkflowRunStepSchema,
+  WorkflowRunStepSlimSchema,
   WorkflowRunSummarySchema,
   WorkflowSchema,
   WorkflowVersionSchema,
@@ -46,6 +62,11 @@ import { cancelWorkflowRun, retryFailedRun } from "../workflows/resume";
 import { handleWebhookTrigger, WebhookError } from "../workflows/triggers";
 import { snapshotAndUpdateWorkflow } from "../workflows/version";
 import { resolveHttpFavoriteOwner } from "./favorite-owner";
+import {
+  idempotencyKeyHeader,
+  readIdempotencyKey,
+  replayAcceptedOperation,
+} from "./idempotency-key";
 import { route } from "./route-def";
 import { jsonError, parseBody, triggerSchemaErrorResponse } from "./utils";
 
@@ -96,6 +117,13 @@ const WorkflowRunPageSchema = z.object({
   }),
 });
 
+/** Mirrors `WorkflowRunTree` in src/be/db/workflow-runs.ts. */
+const WorkflowRunTreeSchema = z.object({
+  rootRunId: z.string(),
+  runs: z.array(WorkflowRunSummarySchema),
+  hasOpenWork: z.boolean(),
+});
+
 const SuccessResponseSchema = z.object({ success: z.literal(true) });
 
 /** Adds `warnings` to a just-saved workflow when a node in it cannot run yet. */
@@ -125,6 +153,9 @@ const listWorkflowsRoute = route({
     lastRunStatus: WorkflowRunStatusSchema.optional(),
     key: AssetKeySchema.optional(),
     keyPrefix: AssetKeySchema.optional(),
+    /** Matches the name, description or key anywhere, case-insensitive. */
+    q: z.string().trim().min(1).max(200).optional(),
+    limit: z.coerce.number().int().min(1).max(500).optional(),
     /** `full` restores the legacy shape (includes `definition`); default is slim. */
     fields: z.enum(["full", "slim"]).optional(),
   }),
@@ -142,6 +173,7 @@ const createWorkflowRoute = route({
   pattern: ["api", "workflows"],
   summary: "Create a new workflow",
   tags: ["Workflows"],
+  headers: idempotencyKeyHeader("creates one workflow"),
   body: z.object({
     name: z.string().min(1),
     key: AssetKeySchema.optional(),
@@ -159,7 +191,9 @@ const createWorkflowRoute = route({
   }),
   responses: {
     201: { description: "Workflow created", schema: WorkflowSaveResponseSchema },
-    400: { description: "Invalid definition" },
+    400: { description: "Invalid definition, or a malformed Idempotency-Key" },
+    409: { description: "Idempotency-Key was already used for a different request" },
+    410: { description: "The workflow created under this Idempotency-Key was deleted" },
   },
 });
 
@@ -272,16 +306,30 @@ const triggerWorkflowRoute = route({
   path: "/api/workflows/{id}/trigger",
   pattern: ["api", "workflows", null, "trigger"],
   summary: "Trigger a workflow execution",
+  description:
+    "With an `Idempotency-Key`, a retry returns the accepted run's `runId` and `skipped` without starting, resuming or waiting for anything, even after the workflow was disabled or edited and whatever state the run is in now.",
   tags: ["Workflows"],
   params: z.object({ id: z.string() }),
+  query: z.object({
+    wait: z
+      .enum(["true", "false"])
+      .optional()
+      .describe(
+        "Default true: respond after the run's instant steps ran, when it finishes or parks at its first async step. " +
+          "false: respond as soon as the run is committed and walk it in the background.",
+      ),
+  }),
+  headers: idempotencyKeyHeader("starts one run"),
   responses: {
     201: {
       description: "Workflow run started (or skipped if cooldown active)",
       schema: z.object({ runId: z.string(), skipped: z.boolean() }),
     },
-    400: { description: "Workflow is disabled" },
+    400: { description: "Workflow is disabled, or a malformed Idempotency-Key" },
     401: { description: "Unauthorized" },
     404: { description: "Workflow not found" },
+    409: { description: "Idempotency-Key was already used for a different request" },
+    410: { description: "The workflow triggered under this Idempotency-Key was deleted" },
   },
 });
 
@@ -328,19 +376,47 @@ const getWorkflowRunRoute = route({
   path: "/api/workflow-runs/{id}",
   pattern: ["api", "workflow-runs", null],
   summary: "Get a workflow run with steps (includes retry columns)",
+  description:
+    "Returns the run with its `context` and every step with its `input` by default. A step's `input` is a snapshot of the context when the step started, so in runs with loops (polling, `wait`, iterations) the response grows with steps × context size. Pass `fields=slim` to drop `run.context` and `steps[].input`; outputs, errors, diagnostics, retry fields and `parent` stay.",
   tags: ["Workflows"],
   params: z.object({ id: z.string() }),
+  query: z.object({
+    /** `slim` omits `run.context` and `steps[].input`; default is full. */
+    fields: z.enum(["full", "slim"]).optional(),
+  }),
   responses: {
     200: {
       description: "Workflow run details with steps including retry info",
-      schema: z.object({
-        run: WorkflowRunSchema,
-        steps: z.array(WorkflowRunStepSchema),
-        /** Set on a child run: the run and `sub-workflow` step that started it. */
-        parent: WorkflowRunParentSchema.optional(),
-      }),
+      schema: z.union([
+        z.object({
+          run: WorkflowRunSchema,
+          steps: z.array(WorkflowRunStepSchema),
+          /** Set on a child run: the run and `sub-workflow` step that started it. */
+          parent: WorkflowRunParentSchema.optional(),
+        }),
+        z.object({
+          run: WorkflowRunSummarySchema,
+          steps: z.array(WorkflowRunStepSlimSchema),
+          parent: WorkflowRunParentSchema.optional(),
+        }),
+      ]),
     },
     404: { description: "Run not found" },
+  },
+});
+
+const getWorkflowRunTreeRoute = route({
+  method: "get",
+  path: "/api/workflow-runs/{id}/tree",
+  pattern: ["api", "workflow-runs", null, "tree"],
+  summary: "Get a workflow run and every sub-workflow run below it",
+  description: `Follows stored parent links (\`parentStepId\` → step → run) through every attempt of every step, terminal runs included. \`runs\` holds list rows without \`context\`, root first. \`hasOpenWork\` is true while any run in the tree is live, has a pending, running or waiting step, a queued retry, an open task or a pending approval; after a cancel it turns false once the tree has settled. Both come from one read snapshot. The tree is not paginated. Links that form a cycle or nest deeper than ${WORKFLOW_RUN_TREE_MAX_DEPTH} levels return 409.`,
+  tags: ["Workflows"],
+  params: z.object({ id: z.string() }),
+  responses: {
+    200: { description: "The run tree", schema: WorkflowRunTreeSchema },
+    404: { description: "Run not found" },
+    409: { description: "Stored parent links form a cycle or nest past the depth bound" },
   },
 });
 
@@ -549,6 +625,8 @@ export async function handleWorkflows(
       lastRunStatus: parsed.query.lastRunStatus,
       key: parsed.query.key,
       keyPrefix: parsed.query.keyPrefix,
+      q: parsed.query.q,
+      limit: parsed.query.limit,
     };
     // List responses default to slim (no `definition`); `?fields=full` restores it.
     if (parsed.query.fields === "full") {
@@ -574,8 +652,21 @@ export async function handleWorkflows(
   }
 
   if (createWorkflowRoute.match(req.method, pathSegments)) {
+    const idempotency = readIdempotencyKey(req, res, myAgentId);
+    if (idempotency === null) return true;
     const parsed = await createWorkflowRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
+    const claim: WorkflowIdempotencyClaim | undefined = idempotency && {
+      ...idempotency,
+      operation: "workflow.create",
+      targetId: "",
+      fingerprint: workflowRequestFingerprint("workflow.create", parsed.body),
+    };
+    const replayCreate = (body: unknown) =>
+      createWorkflowRoute.respond(res, 201, body as z.input<typeof WorkflowSaveResponseSchema>);
+    // Before validation: a retry gets the original result even if the same
+    // definition would no longer validate.
+    if (claim && (await replayAcceptedOperation(res, claim, replayCreate))) return true;
 
     // Validate definition structure
     const validation = validateDefinition(parsed.body.definition, getExecutorRegistry());
@@ -603,27 +694,55 @@ export async function handleWorkflows(
       throw error;
     }
 
-    const workflow = await createWorkflow(
-      {
-        key,
-        name: parsed.body.name,
-        description: parsed.body.description,
-        definition: parsed.body.definition,
-        triggers: parsed.body.triggers,
-        cooldown: parsed.body.cooldown,
-        input: parsed.body.input,
-        triggerSchema: parsed.body.triggerSchema,
-        params: parsed.body.params,
-        requiredParams: parsed.body.requiredParams,
-        requires: parsed.body.requires,
-        dir: parsed.body.dir,
-        vcsRepo: parsed.body.vcsRepo,
-        createdByAgentId: myAgentId ?? undefined,
-        createdBy: (await resolveHttpAuditUserId(req, myAgentId)) ?? undefined,
-      },
-      "api",
-    );
-    createWorkflowRoute.respond(res, 201, await withSaveWarnings(workflow));
+    const data: Parameters<typeof createWorkflow>[0] = {
+      key,
+      name: parsed.body.name,
+      description: parsed.body.description,
+      definition: parsed.body.definition,
+      triggers: parsed.body.triggers,
+      cooldown: parsed.body.cooldown,
+      input: parsed.body.input,
+      triggerSchema: parsed.body.triggerSchema,
+      params: parsed.body.params,
+      requiredParams: parsed.body.requiredParams,
+      requires: parsed.body.requires,
+      dir: parsed.body.dir,
+      vcsRepo: parsed.body.vcsRepo,
+      createdByAgentId: myAgentId ?? undefined,
+      createdBy: (await resolveHttpAuditUserId(req, myAgentId)) ?? undefined,
+    };
+    if (!claim) {
+      const workflow = await createWorkflow(data, "api");
+      createWorkflowRoute.respond(res, 201, await withSaveWarnings(workflow));
+      return true;
+    }
+
+    // Warnings are computed before the transaction (a readiness check may
+    // call out) and stored with the workflow, so a retry gets this snapshot,
+    // not the workflow as it is by then.
+    const warnings = await workflowSaveWarnings(parsed.body.definition, getExecutorRegistry());
+    let saved: z.input<typeof WorkflowSaveResponseSchema>;
+    try {
+      saved = await getDbClient().transaction(async () => {
+        // Before the insert: a concurrent winner's workflow holds the same name.
+        await assertWorkflowIdempotencyKeyUnused(claim);
+        const workflow = await createWorkflow(data, "api");
+        const body = warnings.length > 0 ? { ...workflow, warnings } : workflow;
+        await recordAcceptedWorkflowOperation(claim, {
+          workflowId: workflow.id,
+          status: 201,
+          body,
+        });
+        return body;
+      });
+    } catch (err) {
+      // A concurrent request with this key committed first; nothing of this one did.
+      if (err instanceof IdempotencyKeyTakenError) {
+        if (await replayAcceptedOperation(res, claim, replayCreate)) return true;
+      }
+      throw err;
+    }
+    createWorkflowRoute.respond(res, 201, saved);
     return true;
   }
 
@@ -858,8 +977,26 @@ export async function handleWorkflows(
   }
 
   if (triggerWorkflowRoute.match(req.method, pathSegments)) {
+    const idempotency = readIdempotencyKey(req, res, myAgentId);
+    if (idempotency === null) return true;
     const parsed = await triggerWorkflowRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
+    let claim: WorkflowIdempotencyClaim | undefined;
+    let keyedBody: Record<string, unknown> | undefined;
+    const replayTrigger = (body: unknown) =>
+      triggerWorkflowRoute.respond(res, 201, body as { runId: string; skipped: boolean });
+    if (idempotency) {
+      keyedBody = await parseBody<Record<string, unknown>>(req);
+      claim = {
+        ...idempotency,
+        operation: "workflow.trigger",
+        targetId: parsed.params.id,
+        fingerprint: workflowRequestFingerprint("workflow.trigger", keyedBody),
+      };
+      // Before the enabled, cooldown, readiness and trigger-schema checks: an
+      // accepted trigger replays even after the workflow changed.
+      if (await replayAcceptedOperation(res, claim, replayTrigger)) return true;
+    }
     const workflow = await getWorkflow(parsed.params.id);
     if (!workflow) {
       res.writeHead(404);
@@ -870,19 +1007,46 @@ export async function handleWorkflows(
       jsonError(res, "Workflow is disabled", 400);
       return true;
     }
-    const body = await parseBody<Record<string, unknown>>(req);
+    // Not `??`: a JSON `null` body is a parsed body too, and reading the
+    // already-ended stream again would wait forever.
+    const body = idempotency ? keyedBody : await parseBody<Record<string, unknown>>(req);
     let runId: string;
+    let accepted: { runId: string; skipped: boolean } | undefined;
     try {
       runId = await startWorkflowExecution(workflow, body, getExecutorRegistry(), {
         triggerType: "api",
+        triggeredByAgentId: myAgentId,
         requestedByUserId: (await resolveHttpAuditUserId(req, myAgentId)) ?? undefined,
+        detach: parsed.query.wait === "false",
+        // Recorded in the run's own transaction, before the walk starts.
+        accept: claim
+          ? async (run) => {
+              const response = { runId: run.runId, skipped: run.skipped };
+              await recordAcceptedWorkflowOperation(claim, {
+                workflowId: workflow.id,
+                runId: run.runId,
+                status: 201,
+                body: response,
+              });
+              accepted = response;
+            }
+          : undefined,
       });
     } catch (err) {
       if (err instanceof TriggerSchemaError) {
         triggerSchemaErrorResponse(res, err.message, err.validationErrors);
         return true;
       }
+      // A concurrent request with this key committed its run first; this one
+      // created none and walks nothing.
+      if (claim && err instanceof IdempotencyKeyTakenError) {
+        if (await replayAcceptedOperation(res, claim, replayTrigger)) return true;
+      }
       throw err;
+    }
+    if (accepted) {
+      triggerWorkflowRoute.respond(res, 201, accepted);
+      return true;
     }
 
     // Check if skipped due to cooldown
@@ -909,15 +1073,41 @@ export async function handleWorkflows(
     const parsed = await getWorkflowRunRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
     // Display view: the scrubbed context and step outputs, never replay state.
-    const run = await getWorkflowRun(parsed.params.id, "display");
+    // `fields=slim` skips the context and step-input columns in SQL too.
+    const slim = parsed.query.fields === "slim";
+    const run = slim
+      ? await getWorkflowRunSummary(parsed.params.id)
+      : await getWorkflowRun(parsed.params.id, "display");
     if (!run) {
       res.writeHead(404);
       res.end();
       return true;
     }
-    const steps = await getWorkflowRunStepsByRunId(parsed.params.id, "display");
+    const steps = slim
+      ? await getWorkflowRunStepsSlimByRunId(parsed.params.id)
+      : await getWorkflowRunStepsByRunId(parsed.params.id, "display");
     const parent = run.parentStepId ? await getWorkflowRunParent(run.parentStepId) : null;
     getWorkflowRunRoute.respond(res, 200, { run, steps, ...(parent ? { parent } : {}) });
+    return true;
+  }
+
+  if (getWorkflowRunTreeRoute.match(req.method, pathSegments)) {
+    const parsed = await getWorkflowRunTreeRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    let tree: Awaited<ReturnType<typeof getWorkflowRunTree>>;
+    try {
+      tree = await getWorkflowRunTree(parsed.params.id);
+    } catch (err) {
+      if (!(err instanceof WorkflowRunTreeError)) throw err;
+      jsonError(res, err.message, 409);
+      return true;
+    }
+    if (!tree) {
+      res.writeHead(404);
+      res.end();
+      return true;
+    }
+    getWorkflowRunTreeRoute.respond(res, 200, tree);
     return true;
   }
 

@@ -726,7 +726,10 @@ export interface paths {
         /** List apps */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    q?: string;
+                    limit?: number;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -2253,6 +2256,8 @@ export interface paths {
             parameters: {
                 query?: {
                     include?: "tasks";
+                    q?: string;
+                    limit?: number;
                     fields?: "full" | "slim";
                 };
                 header?: never;
@@ -2865,6 +2870,7 @@ export interface paths {
                             icon: string;
                             color?: string;
                         } | null;
+                        slackIcon?: components["schemas"]["AgentSlackIcon"] | null;
                         changeSource?: string;
                         changedByAgentId?: string;
                         changeReason?: string;
@@ -3198,6 +3204,658 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/used-by": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Grant or revoke the 'used by' logo consent
+         * @description Records consent to show the organization's logo on agent-swarm.dev. A grant requires a valid contact email. It sends organization identity, contact details, and an optional quote to the proxy for manual review. This explicit admin action works when telemetry is off. A revoke clears the stored contact details and quote.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        granted: boolean;
+                        /** Format: email */
+                        contactEmail?: string;
+                        /** @enum {string} */
+                        contactFunction?: "engineer" | "eng_lead" | "founder" | "product" | "marketing" | "sales" | "research" | "ops" | "other";
+                        quote?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Consent recorded */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            granted: boolean;
+                            changedAt: string;
+                        };
+                    };
+                };
+                /** @description Invalid contact details, or missing organization name or website */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Only a config admin can change the consent */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description The telemetry proxy did not accept the consent */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/ranking": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Public ranking state
+         * @description Whether this install can join the public agent-swarm.dev ranking (telemetry on, organization name and website set), whether it is opted in, and its stored listing. Only a config admin can read it.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Ranking state */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            eligible: boolean;
+                            missing: ("SWARM_ORG_NAME" | "SWARM_ORG_WEBSITE")[];
+                            telemetryOn: boolean;
+                            enabled: boolean;
+                            name: string | null;
+                            domain: string | null;
+                            listing: {
+                                /** @enum {number} */
+                                v: 1;
+                                name: string;
+                                domain: string;
+                                /** @enum {string} */
+                                category: "engineering" | "product" | "marketing" | "support" | "operations" | "other";
+                                subcategory: string | null;
+                                description: string | null;
+                                sourceCodeUrl: string | null;
+                                updatedAt: string;
+                            } | null;
+                            listingMatchesDomain: boolean;
+                            verifyUrl: string | null;
+                        };
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Only a config admin can read the ranking state */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/ranking/opt-in": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Opt this install into the public ranking
+         * @description Builds the telemetry_ranking listing from the organization name and website plus the chosen category, stores it, turns PUBLIC_RANKING_ENABLED on and sends ranking.opted_in. That is the whole opt-in: the install shows on agent-swarm.dev/ranking at the next hourly refresh.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        category: "engineering" | "product" | "marketing" | "support" | "operations" | "other";
+                        subcategory?: string | null;
+                        description?: string | null;
+                        sourceCodeUrl?: string | null;
+                    };
+                };
+            };
+            responses: {
+                /** @description Opted in */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            domain: string;
+                            listing: {
+                                /** @enum {number} */
+                                v: 1;
+                                name: string;
+                                domain: string;
+                                /** @enum {string} */
+                                category: "engineering" | "product" | "marketing" | "support" | "operations" | "other";
+                                subcategory: string | null;
+                                description: string | null;
+                                sourceCodeUrl: string | null;
+                                updatedAt: string;
+                            };
+                            verifyUrl: string;
+                        };
+                    };
+                };
+                /** @description A listing field is invalid */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Only a config admin can opt in */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description telemetry_off: telemetry is off or the install has no ID. org_identity_missing: the organization name or website is not set (`missing` lists which). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/ranking/opt-out": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Leave the public ranking
+         * @description Turns PUBLIC_RANKING_ENABLED off and sends ranking.opted_out, so workers stop sending ranking.usage. The install leaves agent-swarm.dev/ranking at the next hourly refresh.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Opted out */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {boolean} */
+                            enabled: false;
+                        };
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Only a config admin can opt out */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/config/resolved": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get resolved config (merged global + agent + repo scopes) */
+        get: {
+            parameters: {
+                query?: {
+                    agentId?: string;
+                    repoId?: string;
+                    /** @description Return only the entry with this exact key. Omit to return every resolved entry. */
+                    key?: string;
+                    includeSecrets?: "true" | "false";
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Resolved config entries */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            configs: components["schemas"]["SwarmConfig"][];
+                            message?: string;
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/config/env-presence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Check which of the given env var keys are currently set in process.env (presence only, no values) */
+        get: {
+            parameters: {
+                query: {
+                    keys: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Map of key -> boolean (true iff set in process.env) */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            presence: {
+                                [key: string]: boolean;
+                            };
+                        };
+                    };
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/config/reload": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reload global swarm_config into process.env (override=true) and re-init integrations (Slack, GitHub, Linear, AgentMail) */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            responses: {
+                /** @description Reload result */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {boolean} */
+                            success: true;
+                            configsLoaded: number;
+                            keysUpdated: string[];
+                            integrationsReinitialized: string[];
+                        };
+                    };
+                };
+                /** @description Reload failed */
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/config/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a single config entry by ID */
+        get: {
+            parameters: {
+                query?: {
+                    includeSecrets?: "true" | "false";
+                };
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Config entry */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["SwarmConfig"] & {
+                            message?: string;
+                        };
+                    };
+                };
+                /** @description Config not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        /** Delete a config entry by ID (including legacy reserved rows for cleanup). Global-scope deletes auto-trigger an integrations reload. */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Config deleted */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {boolean} */
+                            success: true;
+                        };
+                    };
+                };
+                /** @description Config not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List config entries with optional filters */
+        get: {
+            parameters: {
+                query?: {
+                    scope?: string;
+                    scopeId?: string;
+                    /** @description Return only entries with this exact key. Omit to return every entry. */
+                    key?: string;
+                    includeSecrets?: "true" | "false";
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description List of config entries */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            configs: components["schemas"]["SwarmConfig"][];
+                            message?: string;
+                        };
+                    };
+                };
+            };
+        };
+        /** Create or update a config entry (reserved env-only keys are rejected). Global-scope writes auto-trigger an integrations reload (debounced ~250ms) so Slack/GitHub/Linear/Jira/AgentMail pick up new credentials without an explicit /api/config/reload call. */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        scope: "global" | "agent" | "repo";
+                        scopeId?: string | null;
+                        key: string;
+                        value?: unknown;
+                        isSecret?: boolean;
+                        envPath?: string | null;
+                        description?: string | null;
+                        /** @description Export this row into agent process env (default true on create, false for a few server-side secrets; omitted on update keeps the stored flag). Rejected as true for keys only the API server reads. */
+                        exportToEnv?: boolean;
+                    };
+                };
+            };
+            responses: {
+                /** @description Config entry upserted */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["SwarmConfig"];
+                    };
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/approval-requests": {
         parameters: {
             query?: never;
@@ -3236,7 +3894,7 @@ export interface paths {
                                 questions: {
                                     id: string;
                                     /** @enum {string} */
-                                    type: "approval" | "text" | "single-select" | "multi-select" | "boolean";
+                                    type: "approval" | "text" | "single-select" | "multi-select" | "boolean" | "config";
                                     label: string;
                                     required?: boolean;
                                     description?: string;
@@ -3250,6 +3908,33 @@ export interface paths {
                                     minSelections?: number;
                                     maxSelections?: number;
                                     defaultValue?: boolean;
+                                    /** @description Config question settings. Answers are written to swarm_config and replaced by a result that never holds a secret value. */
+                                    config?: {
+                                        /** @description The swarm config key to set, e.g. BITBUCKET_TOKEN */
+                                        key: string;
+                                        /**
+                                         * @description Config scope the value is written to
+                                         * @enum {string}
+                                         */
+                                        scope: "global" | "agent" | "repo";
+                                        /** @description Agent or repo id for agent/repo scope. From request-human-input, agent scope defaults to the calling agent; pass it explicitly when asking on behalf of another agent. */
+                                        scopeId?: string;
+                                        /** @description Store encrypted and never show the value (default true). An existing secret row always stays secret. */
+                                        isSecret?: boolean;
+                                        /**
+                                         * Format: uri
+                                         * @description Link shown next to the field, e.g. where to create the token
+                                         */
+                                        helpUrl?: string;
+                                        /** @description Allowed values for a non-secret key, rendered as a choice */
+                                        options?: {
+                                            value: string;
+                                            label: string;
+                                            description?: string;
+                                        }[];
+                                        /** @description Prefilled value for a non-secret key */
+                                        defaultValue?: string;
+                                    };
                                 }[];
                                 workflowRunId: string | null;
                                 workflowRunStepId: string | null;
@@ -3300,6 +3985,16 @@ export interface paths {
                                 createdBy?: string;
                                 createdAt: string;
                                 updatedAt: string;
+                                /** @description Live state of each config question's key, by question id. Read at request time and never stored. `value` appears only for non-secret keys. */
+                                configState?: {
+                                    [key: string]: {
+                                        exists: boolean;
+                                        isSecret: boolean;
+                                        updatedAt: string | null;
+                                        /** @description Current value; present only for non-secret rows */
+                                        value?: string;
+                                    };
+                                };
                             }[] | {
                                 id: string;
                                 title: string;
@@ -3343,11 +4038,12 @@ export interface paths {
                 content: {
                     "application/json": {
                         title: string;
+                        /** @description A request with a `config` question needs `approvers.policy: "any"`. The answer is written to swarm_config; the request stores only `{ key, scope, scopeId, isSecret, status, updatedAt }` (plus `value` for non-secret keys). */
                         questions: {
                             id: string;
                             /** @enum {string} */
-                            type: "approval" | "text" | "single-select" | "multi-select" | "boolean";
-                            label: string;
+                            type: "approval" | "text" | "single-select" | "multi-select" | "boolean" | "config";
+                            label?: string;
                             required?: boolean;
                             description?: string;
                             placeholder?: string;
@@ -3360,6 +4056,33 @@ export interface paths {
                             minSelections?: number;
                             maxSelections?: number;
                             defaultValue?: boolean;
+                            /** @description Config question settings. Answers are written to swarm_config and replaced by a result that never holds a secret value. */
+                            config?: {
+                                /** @description The swarm config key to set, e.g. BITBUCKET_TOKEN */
+                                key: string;
+                                /**
+                                 * @description Config scope the value is written to
+                                 * @enum {string}
+                                 */
+                                scope: "global" | "agent" | "repo";
+                                /** @description Agent or repo id for agent/repo scope. From request-human-input, agent scope defaults to the calling agent; pass it explicitly when asking on behalf of another agent. */
+                                scopeId?: string;
+                                /** @description Store encrypted and never show the value (default true). An existing secret row always stays secret. */
+                                isSecret?: boolean;
+                                /**
+                                 * Format: uri
+                                 * @description Link shown next to the field, e.g. where to create the token
+                                 */
+                                helpUrl?: string;
+                                /** @description Allowed values for a non-secret key, rendered as a choice */
+                                options?: {
+                                    value: string;
+                                    label: string;
+                                    description?: string;
+                                }[];
+                                /** @description Prefilled value for a non-secret key */
+                                defaultValue?: string;
+                            };
                         }[];
                         approvers: {
                             users?: string[];
@@ -3376,6 +4099,7 @@ export interface paths {
                         sourceTaskId?: string;
                         /** @description Seconds until the request expires. After that the request becomes 'timeout' and you get a hitl-follow-up task. A request with no timeout is cancelled after APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS days (default 7). */
                         timeoutSeconds?: number;
+                        /** @description Where to announce the request. A Slack target (channel or user ID) gets a card with the title, the questions and a link to the dashboard page that answers it. Slack targets need a lead agent caller (403 otherwise). Email is not supported yet and is skipped. */
                         notifications?: {
                             /** @enum {string} */
                             channel: "slack" | "email";
@@ -3398,7 +4122,7 @@ export interface paths {
                                 questions: {
                                     id: string;
                                     /** @enum {string} */
-                                    type: "approval" | "text" | "single-select" | "multi-select" | "boolean";
+                                    type: "approval" | "text" | "single-select" | "multi-select" | "boolean" | "config";
                                     label: string;
                                     required?: boolean;
                                     description?: string;
@@ -3412,6 +4136,33 @@ export interface paths {
                                     minSelections?: number;
                                     maxSelections?: number;
                                     defaultValue?: boolean;
+                                    /** @description Config question settings. Answers are written to swarm_config and replaced by a result that never holds a secret value. */
+                                    config?: {
+                                        /** @description The swarm config key to set, e.g. BITBUCKET_TOKEN */
+                                        key: string;
+                                        /**
+                                         * @description Config scope the value is written to
+                                         * @enum {string}
+                                         */
+                                        scope: "global" | "agent" | "repo";
+                                        /** @description Agent or repo id for agent/repo scope. From request-human-input, agent scope defaults to the calling agent; pass it explicitly when asking on behalf of another agent. */
+                                        scopeId?: string;
+                                        /** @description Store encrypted and never show the value (default true). An existing secret row always stays secret. */
+                                        isSecret?: boolean;
+                                        /**
+                                         * Format: uri
+                                         * @description Link shown next to the field, e.g. where to create the token
+                                         */
+                                        helpUrl?: string;
+                                        /** @description Allowed values for a non-secret key, rendered as a choice */
+                                        options?: {
+                                            value: string;
+                                            label: string;
+                                            description?: string;
+                                        }[];
+                                        /** @description Prefilled value for a non-secret key */
+                                        defaultValue?: string;
+                                    };
                                 }[];
                                 workflowRunId: string | null;
                                 workflowRunStepId: string | null;
@@ -3462,12 +4213,31 @@ export interface paths {
                                 createdBy?: string;
                                 createdAt: string;
                                 updatedAt: string;
+                                /** @description Live state of each config question's key, by question id. Read at request time and never stored. `value` appears only for non-secret keys. */
+                                configState?: {
+                                    [key: string]: {
+                                        exists: boolean;
+                                        isSecret: boolean;
+                                        updatedAt: string | null;
+                                        /** @description Current value; present only for non-secret rows */
+                                        value?: string;
+                                    };
+                                };
                             };
                         };
                     };
                 };
                 /** @description Validation error */
                 400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Slack notifications require a lead agent */
+                403: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -3490,7 +4260,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get approval request details */
+        /**
+         * Get approval request details
+         * @description Includes `configState` when the request has `config` questions: the live state of each target key, read now.
+         */
         get: {
             parameters: {
                 query?: never;
@@ -3515,7 +4288,7 @@ export interface paths {
                                 questions: {
                                     id: string;
                                     /** @enum {string} */
-                                    type: "approval" | "text" | "single-select" | "multi-select" | "boolean";
+                                    type: "approval" | "text" | "single-select" | "multi-select" | "boolean" | "config";
                                     label: string;
                                     required?: boolean;
                                     description?: string;
@@ -3529,6 +4302,33 @@ export interface paths {
                                     minSelections?: number;
                                     maxSelections?: number;
                                     defaultValue?: boolean;
+                                    /** @description Config question settings. Answers are written to swarm_config and replaced by a result that never holds a secret value. */
+                                    config?: {
+                                        /** @description The swarm config key to set, e.g. BITBUCKET_TOKEN */
+                                        key: string;
+                                        /**
+                                         * @description Config scope the value is written to
+                                         * @enum {string}
+                                         */
+                                        scope: "global" | "agent" | "repo";
+                                        /** @description Agent or repo id for agent/repo scope. From request-human-input, agent scope defaults to the calling agent; pass it explicitly when asking on behalf of another agent. */
+                                        scopeId?: string;
+                                        /** @description Store encrypted and never show the value (default true). An existing secret row always stays secret. */
+                                        isSecret?: boolean;
+                                        /**
+                                         * Format: uri
+                                         * @description Link shown next to the field, e.g. where to create the token
+                                         */
+                                        helpUrl?: string;
+                                        /** @description Allowed values for a non-secret key, rendered as a choice */
+                                        options?: {
+                                            value: string;
+                                            label: string;
+                                            description?: string;
+                                        }[];
+                                        /** @description Prefilled value for a non-secret key */
+                                        defaultValue?: string;
+                                    };
                                 }[];
                                 workflowRunId: string | null;
                                 workflowRunStepId: string | null;
@@ -3579,6 +4379,16 @@ export interface paths {
                                 createdBy?: string;
                                 createdAt: string;
                                 updatedAt: string;
+                                /** @description Live state of each config question's key, by question id. Read at request time and never stored. `value` appears only for non-secret keys. */
+                                configState?: {
+                                    [key: string]: {
+                                        exists: boolean;
+                                        isSecret: boolean;
+                                        updatedAt: string | null;
+                                        /** @description Current value; present only for non-secret rows */
+                                        value?: string;
+                                    };
+                                };
                             };
                         };
                     };
@@ -3613,7 +4423,7 @@ export interface paths {
         put?: never;
         /**
          * Submit a response to an approval request
-         * @description Only a person may answer: a user token, a page session signed for a user, or the shared key with no agent identity (recorded as `operator`). The responder is taken from the credential. When the request lists `approvers.users` or `approvers.roles`, a user must match one of them. A rejection resolves the request at once; approvals resolve it when the `any`, `all` or `{ min: N }` policy is met, and until then it stays pending with the answer recorded in `approvals`.
+         * @description Only a person may answer: a user token, a page session signed for a user, or the shared key with no agent identity (recorded as `operator`). The responder is taken from the credential. When the request lists `approvers.users` or `approvers.roles`, a user must match one of them. A rejection resolves the request at once; approvals resolve it when the `any`, `all` or `{ min: N }` policy is met, and until then it stays pending with the answer recorded in `approvals`. A `config` question takes `{ action: "set", value }`, `{ action: "keep" }` (key must exist) or `{ action: "skip" }` (optional questions only); `set` also needs the config write permission. The value is written only when the request is approved, and the stored answer is the result, never a secret value.
          */
         post: {
             parameters: {
@@ -3649,7 +4459,7 @@ export interface paths {
                                 questions: {
                                     id: string;
                                     /** @enum {string} */
-                                    type: "approval" | "text" | "single-select" | "multi-select" | "boolean";
+                                    type: "approval" | "text" | "single-select" | "multi-select" | "boolean" | "config";
                                     label: string;
                                     required?: boolean;
                                     description?: string;
@@ -3663,6 +4473,33 @@ export interface paths {
                                     minSelections?: number;
                                     maxSelections?: number;
                                     defaultValue?: boolean;
+                                    /** @description Config question settings. Answers are written to swarm_config and replaced by a result that never holds a secret value. */
+                                    config?: {
+                                        /** @description The swarm config key to set, e.g. BITBUCKET_TOKEN */
+                                        key: string;
+                                        /**
+                                         * @description Config scope the value is written to
+                                         * @enum {string}
+                                         */
+                                        scope: "global" | "agent" | "repo";
+                                        /** @description Agent or repo id for agent/repo scope. From request-human-input, agent scope defaults to the calling agent; pass it explicitly when asking on behalf of another agent. */
+                                        scopeId?: string;
+                                        /** @description Store encrypted and never show the value (default true). An existing secret row always stays secret. */
+                                        isSecret?: boolean;
+                                        /**
+                                         * Format: uri
+                                         * @description Link shown next to the field, e.g. where to create the token
+                                         */
+                                        helpUrl?: string;
+                                        /** @description Allowed values for a non-secret key, rendered as a choice */
+                                        options?: {
+                                            value: string;
+                                            label: string;
+                                            description?: string;
+                                        }[];
+                                        /** @description Prefilled value for a non-secret key */
+                                        defaultValue?: string;
+                                    };
                                 }[];
                                 workflowRunId: string | null;
                                 workflowRunStepId: string | null;
@@ -3713,6 +4550,16 @@ export interface paths {
                                 createdBy?: string;
                                 createdAt: string;
                                 updatedAt: string;
+                                /** @description Live state of each config question's key, by question id. Read at request time and never stored. `value` appears only for non-secret keys. */
+                                configState?: {
+                                    [key: string]: {
+                                        exists: boolean;
+                                        isSecret: boolean;
+                                        updatedAt: string | null;
+                                        /** @description Current value; present only for non-secret rows */
+                                        value?: string;
+                                    };
+                                };
                             };
                         };
                     };
@@ -3801,7 +4648,7 @@ export interface paths {
                                 questions: {
                                     id: string;
                                     /** @enum {string} */
-                                    type: "approval" | "text" | "single-select" | "multi-select" | "boolean";
+                                    type: "approval" | "text" | "single-select" | "multi-select" | "boolean" | "config";
                                     label: string;
                                     required?: boolean;
                                     description?: string;
@@ -3815,6 +4662,33 @@ export interface paths {
                                     minSelections?: number;
                                     maxSelections?: number;
                                     defaultValue?: boolean;
+                                    /** @description Config question settings. Answers are written to swarm_config and replaced by a result that never holds a secret value. */
+                                    config?: {
+                                        /** @description The swarm config key to set, e.g. BITBUCKET_TOKEN */
+                                        key: string;
+                                        /**
+                                         * @description Config scope the value is written to
+                                         * @enum {string}
+                                         */
+                                        scope: "global" | "agent" | "repo";
+                                        /** @description Agent or repo id for agent/repo scope. From request-human-input, agent scope defaults to the calling agent; pass it explicitly when asking on behalf of another agent. */
+                                        scopeId?: string;
+                                        /** @description Store encrypted and never show the value (default true). An existing secret row always stays secret. */
+                                        isSecret?: boolean;
+                                        /**
+                                         * Format: uri
+                                         * @description Link shown next to the field, e.g. where to create the token
+                                         */
+                                        helpUrl?: string;
+                                        /** @description Allowed values for a non-secret key, rendered as a choice */
+                                        options?: {
+                                            value: string;
+                                            label: string;
+                                            description?: string;
+                                        }[];
+                                        /** @description Prefilled value for a non-secret key */
+                                        defaultValue?: string;
+                                    };
                                 }[];
                                 workflowRunId: string | null;
                                 workflowRunStepId: string | null;
@@ -3865,6 +4739,16 @@ export interface paths {
                                 createdBy?: string;
                                 createdAt: string;
                                 updatedAt: string;
+                                /** @description Live state of each config question's key, by question id. Read at request time and never stored. `value` appears only for non-secret keys. */
+                                configState?: {
+                                    [key: string]: {
+                                        exists: boolean;
+                                        isSecret: boolean;
+                                        updatedAt: string | null;
+                                        /** @description Current value; present only for non-secret rows */
+                                        value?: string;
+                                    };
+                                };
                             };
                             alreadyCancelled: boolean;
                             runCancelled: boolean;
@@ -4562,658 +5446,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/used-by": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Grant or revoke the 'used by' logo consent
-         * @description Records consent to show the organization's logo on agent-swarm.dev. A grant requires a valid contact email. It sends organization identity, contact details, and an optional quote to the proxy for manual review. This explicit admin action works when telemetry is off. A revoke clears the stored contact details and quote.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: {
-                content: {
-                    "application/json": {
-                        granted: boolean;
-                        /** Format: email */
-                        contactEmail?: string;
-                        /** @enum {string} */
-                        contactFunction?: "engineer" | "eng_lead" | "founder" | "product" | "ops" | "other";
-                        quote?: string;
-                    };
-                };
-            };
-            responses: {
-                /** @description Consent recorded */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            granted: boolean;
-                            changedAt: string;
-                        };
-                    };
-                };
-                /** @description Invalid contact details, or missing organization name or website */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-                /** @description Unauthorized */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-                /** @description Only a config admin can change the consent */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-                /** @description The telemetry proxy did not accept the consent */
-                502: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/ranking": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Public ranking state
-         * @description Whether this install can join the public agent-swarm.dev ranking (telemetry on, organization name and website set), whether it is opted in, and its stored listing. Only a config admin can read it.
-         */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Ranking state */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            eligible: boolean;
-                            missing: ("SWARM_ORG_NAME" | "SWARM_ORG_WEBSITE")[];
-                            telemetryOn: boolean;
-                            enabled: boolean;
-                            name: string | null;
-                            domain: string | null;
-                            listing: {
-                                /** @enum {number} */
-                                v: 1;
-                                name: string;
-                                domain: string;
-                                /** @enum {string} */
-                                category: "engineering" | "product" | "marketing" | "support" | "operations" | "other";
-                                subcategory: string | null;
-                                description: string | null;
-                                sourceCodeUrl: string | null;
-                                updatedAt: string;
-                            } | null;
-                            listingMatchesDomain: boolean;
-                            verifyUrl: string | null;
-                        };
-                    };
-                };
-                /** @description Unauthorized */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-                /** @description Only a config admin can read the ranking state */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/ranking/opt-in": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Opt this install into the public ranking
-         * @description Builds the telemetry_ranking listing from the organization name and website plus the chosen category, stores it, turns PUBLIC_RANKING_ENABLED on and sends ranking.opted_in. That is the whole opt-in: the install shows on agent-swarm.dev/ranking at the next hourly refresh.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: {
-                content: {
-                    "application/json": {
-                        /** @enum {string} */
-                        category: "engineering" | "product" | "marketing" | "support" | "operations" | "other";
-                        subcategory?: string | null;
-                        description?: string | null;
-                        sourceCodeUrl?: string | null;
-                    };
-                };
-            };
-            responses: {
-                /** @description Opted in */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            domain: string;
-                            listing: {
-                                /** @enum {number} */
-                                v: 1;
-                                name: string;
-                                domain: string;
-                                /** @enum {string} */
-                                category: "engineering" | "product" | "marketing" | "support" | "operations" | "other";
-                                subcategory: string | null;
-                                description: string | null;
-                                sourceCodeUrl: string | null;
-                                updatedAt: string;
-                            };
-                            verifyUrl: string;
-                        };
-                    };
-                };
-                /** @description A listing field is invalid */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-                /** @description Unauthorized */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-                /** @description Only a config admin can opt in */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-                /** @description telemetry_off: telemetry is off or the install has no ID. org_identity_missing: the organization name or website is not set (`missing` lists which). */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/ranking/opt-out": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Leave the public ranking
-         * @description Turns PUBLIC_RANKING_ENABLED off and sends ranking.opted_out, so workers stop sending ranking.usage. The install leaves agent-swarm.dev/ranking at the next hourly refresh.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Opted out */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            /** @enum {boolean} */
-                            enabled: false;
-                        };
-                    };
-                };
-                /** @description Unauthorized */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-                /** @description Only a config admin can opt out */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/config/resolved": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get resolved config (merged global + agent + repo scopes) */
-        get: {
-            parameters: {
-                query?: {
-                    agentId?: string;
-                    repoId?: string;
-                    /** @description Return only the entry with this exact key. Omit to return every resolved entry. */
-                    key?: string;
-                    includeSecrets?: "true" | "false";
-                };
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Resolved config entries */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            configs: components["schemas"]["SwarmConfig"][];
-                            message?: string;
-                        };
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/config/env-presence": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Check which of the given env var keys are currently set in process.env (presence only, no values) */
-        get: {
-            parameters: {
-                query: {
-                    keys: string;
-                };
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Map of key -> boolean (true iff set in process.env) */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            presence: {
-                                [key: string]: boolean;
-                            };
-                        };
-                    };
-                };
-                /** @description Validation error */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/config/reload": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Reload global swarm_config into process.env (override=true) and re-init integrations (Slack, GitHub, Linear, AgentMail) */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: {
-                content: {
-                    "application/json": Record<string, never>;
-                };
-            };
-            responses: {
-                /** @description Reload result */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            /** @enum {boolean} */
-                            success: true;
-                            configsLoaded: number;
-                            keysUpdated: string[];
-                            integrationsReinitialized: string[];
-                        };
-                    };
-                };
-                /** @description Reload failed */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/config/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get a single config entry by ID */
-        get: {
-            parameters: {
-                query?: {
-                    includeSecrets?: "true" | "false";
-                };
-                header?: never;
-                path: {
-                    id: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Config entry */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["SwarmConfig"] & {
-                            message?: string;
-                        };
-                    };
-                };
-                /** @description Config not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        /** Delete a config entry by ID (including legacy reserved rows for cleanup). Global-scope deletes auto-trigger an integrations reload. */
-        delete: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    id: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Config deleted */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            /** @enum {boolean} */
-                            success: true;
-                        };
-                    };
-                };
-                /** @description Config not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/config": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** List config entries with optional filters */
-        get: {
-            parameters: {
-                query?: {
-                    scope?: string;
-                    scopeId?: string;
-                    /** @description Return only entries with this exact key. Omit to return every entry. */
-                    key?: string;
-                    includeSecrets?: "true" | "false";
-                };
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description List of config entries */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            configs: components["schemas"]["SwarmConfig"][];
-                            message?: string;
-                        };
-                    };
-                };
-            };
-        };
-        /** Create or update a config entry (reserved env-only keys are rejected). Global-scope writes auto-trigger an integrations reload (debounced ~250ms) so Slack/GitHub/Linear/Jira/AgentMail pick up new credentials without an explicit /api/config/reload call. */
-        put: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: {
-                content: {
-                    "application/json": {
-                        /** @enum {string} */
-                        scope: "global" | "agent" | "repo";
-                        scopeId?: string | null;
-                        key: string;
-                        value?: unknown;
-                        isSecret?: boolean;
-                        envPath?: string | null;
-                        description?: string | null;
-                        /** @description Export this row into agent process env (default true on create, false for a few server-side secrets; omitted on update keeps the stored flag). Rejected as true for keys only the API server reads. */
-                        exportToEnv?: boolean;
-                    };
-                };
-            };
-            responses: {
-                /** @description Config entry upserted */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["SwarmConfig"];
-                    };
-                };
-                /** @description Validation error */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/codex-oauth/device": {
         parameters: {
             query?: never;
@@ -5337,6 +5569,129 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/codex-oauth/accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List stored Codex ChatGPT accounts */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Stored account metadata */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            accounts: {
+                                slot: number;
+                                configKey: string;
+                                legacy: boolean;
+                                suffix: string | null;
+                                plan: string | null;
+                                email: string | null;
+                                /** @enum {string} */
+                                status: "ok" | "needs_login" | "unchecked";
+                            }[];
+                        };
+                    };
+                };
+                /** @description Caller cannot read all secrets */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex-oauth/accounts/{slot}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove a stored Codex ChatGPT account */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    slot: number | null;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Remaining accounts */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            accounts: {
+                                slot: number;
+                                configKey: string;
+                                legacy: boolean;
+                                suffix: string | null;
+                                plan: string | null;
+                                email: string | null;
+                                /** @enum {string} */
+                                status: "ok" | "needs_login" | "unchecked";
+                            }[];
+                        };
+                    };
+                };
+                /** @description Config administration and permission to read all secrets required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Account slot does not exist */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/oauth/keep-warm/codex": {
         parameters: {
             query?: never;
@@ -5414,7 +5769,7 @@ export interface paths {
         put?: never;
         /**
          * Send agent-fs comments to the swarm as one lead task
-         * @description Comb's 'Send to swarm'. The server reads each comment again from agent-fs with its bootstrap key, skips replies, resolved comments, and comments already sent, and creates ONE task for the lead. Each sent comment gets a `[comb:sent task=<id>]` reply from the swarm service account. A comment is sent at most once. When an earlier send lost its reply, the batch posts that reply again (`repaired`). Answers 404 while COMB_ENABLED is off.
+         * @description Comb's 'Send to swarm'. The server reads each comment again from agent-fs with its bootstrap key, skips replies, resolved comments, and comments already sent, and creates ONE task for the lead. Each sent comment gets a `[comb:sent task=<id>]` reply from the swarm service account. A comment is sent at most once. An optional `note` from the sender goes into the task text. When an earlier send lost its reply, the batch posts that reply again (`repaired`). Answers 404 while COMB_ENABLED is off.
          */
         post: {
             parameters: {
@@ -5430,6 +5785,7 @@ export interface paths {
                         driveId: string;
                         commentIds: string[];
                         scopePath: string;
+                        note?: string;
                     };
                 };
             };
@@ -5453,6 +5809,8 @@ export interface paths {
                                 id: string;
                                 taskId: string;
                             }[];
+                            /** @enum {string} */
+                            lead?: "online" | "offline" | "none";
                         };
                     };
                 };
@@ -5475,6 +5833,8 @@ export interface paths {
                                 id: string;
                                 taskId: string;
                             }[];
+                            /** @enum {string} */
+                            lead?: "online" | "offline" | "none";
                         };
                     };
                 };
@@ -5560,6 +5920,236 @@ export interface paths {
             };
         };
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/config/pool-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List credential pool suffixes and status */
+        get: {
+            parameters: {
+                query: {
+                    key: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Credential pool */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            key: string;
+                            /** @enum {string} */
+                            source: "stored" | "env" | "none";
+                            readOnly: boolean;
+                            keys: {
+                                index: number;
+                                suffix: string;
+                                /** @enum {string} */
+                                status: "ok" | "rejected" | "rate_limited" | "unchecked";
+                                error: string | null;
+                                checkedAt: string | null;
+                                rateLimitedUntil: string | null;
+                            }[];
+                        };
+                    };
+                };
+                /** @description Invalid pool variable */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Secret read permission required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        /** Test and append keys to a credential pool */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        key: string;
+                        value: string;
+                        /** @description Base URL for the check only. Null tests the provider default. Omit to use the stored URL. */
+                        baseUrl?: string | null;
+                    };
+                };
+            };
+            responses: {
+                /** @description Updated credential pool and checks */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            key: string;
+                            /** @enum {string} */
+                            source: "stored" | "env" | "none";
+                            readOnly: boolean;
+                            keys: {
+                                index: number;
+                                suffix: string;
+                                /** @enum {string} */
+                                status: "ok" | "rejected" | "rate_limited" | "unchecked";
+                                error: string | null;
+                                checkedAt: string | null;
+                                rateLimitedUntil: string | null;
+                            }[];
+                            checks: {
+                                suffix: string;
+                                /** @enum {string} */
+                                result: "verified" | "rejected" | "not_tested";
+                                httpStatus: number | null;
+                                error: string | null;
+                            }[];
+                        };
+                    };
+                };
+                /** @description Invalid key */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Config administration and permission to read all secrets required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Duplicate key or deployment env pool */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Provider rejected a key. Nothing was saved. */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            error: string;
+                            checks: {
+                                suffix: string;
+                                /** @enum {string} */
+                                result: "verified" | "rejected" | "not_tested";
+                                httpStatus: number | null;
+                                error: string | null;
+                            }[];
+                        };
+                    };
+                };
+            };
+        };
+        /** Remove one credential pool member */
+        delete: {
+            parameters: {
+                query: {
+                    key: string;
+                    index?: number | null;
+                    suffix: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Updated credential pool */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            key: string;
+                            /** @enum {string} */
+                            source: "stored" | "env" | "none";
+                            readOnly: boolean;
+                            keys: {
+                                index: number;
+                                suffix: string;
+                                /** @enum {string} */
+                                status: "ok" | "rejected" | "rate_limited" | "unchecked";
+                                error: string | null;
+                                checkedAt: string | null;
+                                rateLimitedUntil: string | null;
+                            }[];
+                        };
+                    };
+                };
+                /** @description Invalid pool member */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Config administration and permission to read all secrets required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description The pool changed or comes from the deployment env */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
         options?: never;
         head?: never;
         patch?: never;
@@ -5789,6 +6379,78 @@ export interface paths {
             };
             responses: {
                 /** @description Key marked as rate-limited */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {boolean} */
+                            success: true;
+                            message: string;
+                        };
+                    };
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/keys/report-validation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Record live validation results for a credential pool */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        keyType: string;
+                        keys: {
+                            keyIndex: number;
+                            keySuffix: string;
+                            ok: boolean;
+                            httpStatus?: number;
+                        }[];
+                        scope?: string;
+                        scopeId?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Validation recorded */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -6064,6 +6726,7 @@ export interface paths {
                     scope?: string;
                     scopeId?: string;
                     model?: "fable" | "opus" | "sonnet" | "haiku";
+                    keySuffixes?: string;
                 };
                 header?: never;
                 path?: never;
@@ -6081,6 +6744,7 @@ export interface paths {
                             /** @enum {boolean} */
                             success: true;
                             availableIndices: number[];
+                            rejectedIndices?: number[];
                             totalKeys: number;
                             modelBlockedIndices?: number[];
                             earliestModelResetAt?: string | null;
@@ -6180,6 +6844,8 @@ export interface paths {
                                 lastSeatMismatchModel: string | null;
                                 consecutiveAuthFailures: number;
                                 lastAuthFailureAt: string | null;
+                                lastValidationError: string | null;
+                                lastValidationFailedAt: string | null;
                                 modelLimits: {
                                     model: string;
                                     window: string;
@@ -7208,7 +7874,7 @@ export interface paths {
         put?: never;
         /**
          * Invite an external member into the agent-fs shared org
-         * @description The API server performs the invite with its own bootstrap credentials (which are API-only and never served over HTTP), provisioning the shared org/drive first when needed. Intended for the cloud control plane's Connect-to-Drive flow. No keys are returned; the invitee obtains their own key via agent-fs registration.
+         * @description The API server performs the invite with its own bootstrap credentials (which are API-only and never served over HTTP), provisioning the shared org/drive first when needed. Intended for the cloud control plane's Connect-to-Drive flow. An email with an agent-fs account is added directly (status added). An email without one gets a pending invite (status pending) with an acceptUrl when agent-fs returns one; agent-fs sends no email, so the caller must hand the link to the invitee. No keys are returned; the invitee obtains their own key via agent-fs registration.
          */
         post: {
             parameters: {
@@ -7231,7 +7897,7 @@ export interface paths {
                 };
             };
             responses: {
-                /** @description Invite state ({ orgId, invited }) */
+                /** @description Invite state ({ orgId, invited, status, acceptUrl? }) */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -7239,12 +7905,33 @@ export interface paths {
                     content: {
                         "application/json": {
                             orgId: string;
+                            /** @description False only when the email already holds the requested role. */
                             invited: boolean;
+                            /**
+                             * @description already_member: no change. added: an existing agent-fs account joined the org. pending: the email has no account, so agent-fs created an invite the person must accept.
+                             * @enum {string}
+                             */
+                            status: "already_member" | "added" | "pending";
+                            /** @description Pending invite id (status pending). */
+                            inviteId?: string;
+                            /** @description ISO time the accept link expires (status pending). */
+                            expiresAt?: string;
+                            /** @description Link the invitee opens to accept (status pending). agent-fs sends no email, so hand it to the person. Absent when agent-fs has no app URL configured. */
+                            acceptUrl?: string;
                         };
                     };
                 };
                 /** @description Invalid body */
                 400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description A non-admin user token named an email other than its own */
+                403: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -7796,6 +8483,15 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
+                /** @description A non-admin user token wrote another user's state */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
             };
         };
         trace?: never;
@@ -7867,6 +8563,15 @@ export interface paths {
                 };
                 /** @description Unauthorized */
                 401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description A non-admin user token wrote another user's state */
+                403: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -7993,6 +8698,44 @@ export interface paths {
                     content: {
                         "application/json": {
                             [key: string]: unknown;
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/integrations/slack/app-icon": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The Slack app's own avatar, shown on posts with no icon override */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description `imageUrl` is null when Slack is off or the lookup fails. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            imageUrl: string | null;
                         };
                     };
                 };
@@ -11733,7 +12476,7 @@ export interface paths {
         };
         /**
          * Identity + setup readiness + live activity for the swarm dashboard
-         * @description Single source of truth consumed by the UI home page. Identity comes from SWARM_* envs; setup milestones each emit `unverified | configured | verified`; automations report `running | needs_setup` from the same runtime preflight used at dispatch; activity counts agents alive in the last 5 min and tasks created in the last 24h; agent_fs reports whether AGENT_FS_API_URL is set, plus the Comb settings (COMB_ENABLED, the browser-facing agent-fs URL, the shared org and drive ids, and the agent-fs user id of the swarm service account); telemetry reports the effective ANONYMIZED_TELEMETRY opt-out state.
+         * @description Single source of truth consumed by the UI home page. Identity comes from SWARM_* envs; setup milestones each emit `unverified | configured | verified`; automations report `running | needs_setup` from the same runtime preflight used at dispatch; activity counts agents alive in the last 5 min, leads that can take work (status idle or busy), and tasks created in the last 24h; agent_fs reports whether AGENT_FS_API_URL is set, plus the Comb settings (whether Files is on and, when off, what is missing; the browser-facing agent-fs URL, the shared org and drive ids, and the agent-fs user id of the swarm service account); telemetry reports the effective ANONYMIZED_TELEMETRY opt-out state.
          */
         get: {
             parameters: {
@@ -11785,6 +12528,7 @@ export interface paths {
                             activity: {
                                 agents_online: number;
                                 leads_online: number;
+                                leads_ready: number;
                                 recent_tasks_count: number;
                             };
                             agent_fs: {
@@ -11796,6 +12540,7 @@ export interface paths {
                                 };
                                 comb: {
                                     enabled: boolean;
+                                    reason: string | null;
                                     api_url: string | null;
                                     live_url: string;
                                     org_id: string | null;
@@ -11959,7 +12704,7 @@ export interface paths {
                                 /** Format: date-time */
                                 startedAt: string;
                                 /** @enum {string} */
-                                currentStep: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "first_task";
+                                currentStep: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "files" | "first_task";
                                 /** Format: date-time */
                                 minimizedAt: string | null;
                                 /** Format: date-time */
@@ -12029,6 +12774,16 @@ export interface paths {
                                         /** @enum {string|null} */
                                         errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
                                     };
+                                    files: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "created" | "connected" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
                                     first_task: {
                                         /** @enum {string} */
                                         status: "todo" | "done" | "skipped" | "failed";
@@ -12049,10 +12804,19 @@ export interface paths {
                                     state: "unverified" | "configured" | "verified";
                                     workers: number;
                                     verifiedWorkers: number;
+                                    error: string | null;
+                                    warning: string | null;
                                 }[];
                                 embeddings: {
                                     configured: boolean;
                                     dimensions: number;
+                                    model: string | null;
+                                    local: boolean;
+                                    /** @enum {string|null} */
+                                    provider: "local" | "openai" | "openrouter" | "vercel" | "azure" | "custom" | null;
+                                    localDefault: {
+                                        model: string;
+                                    } | null;
                                 };
                                 integrations: {
                                     slack: boolean;
@@ -12070,6 +12834,9 @@ export interface paths {
                                     id: string;
                                     status: string;
                                 } | null;
+                                files: {
+                                    enabled: boolean;
+                                };
                             };
                         };
                     };
@@ -12090,7 +12857,7 @@ export interface paths {
                         /** @enum {string} */
                         action: "view";
                         /** @enum {string} */
-                        step: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "first_task";
+                        step: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "files" | "first_task";
                     } | {
                         /** @enum {string} */
                         action: "complete";
@@ -12128,14 +12895,21 @@ export interface paths {
                         method: "slack" | "github" | "gitlab" | "bitbucket" | "linear_oauth" | "jira_oauth";
                     } | {
                         /** @enum {string} */
+                        action: "complete";
+                        /** @enum {string} */
+                        step: "files";
+                        /** @enum {string} */
+                        method: "created" | "connected";
+                    } | {
+                        /** @enum {string} */
                         action: "skip";
                         /** @enum {string} */
-                        step: "name" | "ai" | "agents" | "memory" | "integrations" | "first_task";
+                        step: "name" | "ai" | "agents" | "memory" | "integrations" | "files" | "first_task";
                     } | {
                         /** @enum {string} */
                         action: "fail";
                         /** @enum {string} */
-                        step: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "first_task";
+                        step: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "files" | "first_task";
                         /** @enum {string} */
                         errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown";
                     } | {
@@ -12170,7 +12944,7 @@ export interface paths {
                                 /** Format: date-time */
                                 startedAt: string;
                                 /** @enum {string} */
-                                currentStep: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "first_task";
+                                currentStep: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "files" | "first_task";
                                 /** Format: date-time */
                                 minimizedAt: string | null;
                                 /** Format: date-time */
@@ -12240,6 +13014,16 @@ export interface paths {
                                         /** @enum {string|null} */
                                         errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
                                     };
+                                    files: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "created" | "connected" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
                                     first_task: {
                                         /** @enum {string} */
                                         status: "todo" | "done" | "skipped" | "failed";
@@ -12260,10 +13044,19 @@ export interface paths {
                                     state: "unverified" | "configured" | "verified";
                                     workers: number;
                                     verifiedWorkers: number;
+                                    error: string | null;
+                                    warning: string | null;
                                 }[];
                                 embeddings: {
                                     configured: boolean;
                                     dimensions: number;
+                                    model: string | null;
+                                    local: boolean;
+                                    /** @enum {string|null} */
+                                    provider: "local" | "openai" | "openrouter" | "vercel" | "azure" | "custom" | null;
+                                    localDefault: {
+                                        model: string;
+                                    } | null;
                                 };
                                 integrations: {
                                     slack: boolean;
@@ -12281,6 +13074,9 @@ export interface paths {
                                     id: string;
                                     status: string;
                                 } | null;
+                                files: {
+                                    enabled: boolean;
+                                };
                             };
                         };
                     };
@@ -12340,6 +13136,7 @@ export interface paths {
                         apiKey?: string;
                         /** @enum {string} */
                         reuseKey?: "OPENAI_API_KEY" | "OPENROUTER_API_KEY";
+                        restoreDefault?: boolean;
                     };
                 };
             };
@@ -12537,6 +13334,441 @@ export interface paths {
         };
         trace?: never;
     };
+    "/agentfs/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Streaming pass-through proxy to agent-fs (enabled by AGENT_FS_PROXY) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Upstream agent-fs response, streamed verbatim */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Returned by agent-fs when credentials are missing or invalid, or by the swarm when POST /agentfs/auth/register has no swarm credential */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description POST /agentfs/auth/register with a user token for an email that is not the user's */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description POST /agentfs/auth/register body over 16 KB */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Too many registrations from this IP (POST /agentfs/auth/register) */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description agent-fs is unreachable */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        /** Streaming pass-through proxy to agent-fs (enabled by AGENT_FS_PROXY) */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Upstream agent-fs response, streamed verbatim */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Returned by agent-fs when credentials are missing or invalid, or by the swarm when POST /agentfs/auth/register has no swarm credential */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description POST /agentfs/auth/register with a user token for an email that is not the user's */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description POST /agentfs/auth/register body over 16 KB */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Too many registrations from this IP (POST /agentfs/auth/register) */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description agent-fs is unreachable */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        /** Streaming pass-through proxy to agent-fs (enabled by AGENT_FS_PROXY) */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Upstream agent-fs response, streamed verbatim */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Returned by agent-fs when credentials are missing or invalid, or by the swarm when POST /agentfs/auth/register has no swarm credential */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description POST /agentfs/auth/register with a user token for an email that is not the user's */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description POST /agentfs/auth/register body over 16 KB */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Too many registrations from this IP (POST /agentfs/auth/register) */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description agent-fs is unreachable */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        /** Streaming pass-through proxy to agent-fs (enabled by AGENT_FS_PROXY) */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Upstream agent-fs response, streamed verbatim */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Returned by agent-fs when credentials are missing or invalid, or by the swarm when POST /agentfs/auth/register has no swarm credential */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description POST /agentfs/auth/register with a user token for an email that is not the user's */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description POST /agentfs/auth/register body over 16 KB */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Too many registrations from this IP (POST /agentfs/auth/register) */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description agent-fs is unreachable */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        /** Streaming pass-through proxy to agent-fs (enabled by AGENT_FS_PROXY) */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Upstream agent-fs response, streamed verbatim */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Returned by agent-fs when credentials are missing or invalid, or by the swarm when POST /agentfs/auth/register has no swarm credential */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description POST /agentfs/auth/register with a user token for an email that is not the user's */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description POST /agentfs/auth/register body over 16 KB */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Too many registrations from this IP (POST /agentfs/auth/register) */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description agent-fs is unreachable */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        trace?: never;
+    };
+    "/share/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Public agent-fs share page, served through the API (enabled by AGENT_FS_PROXY) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description agent-fs /share response, streamed verbatim */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unknown or expired link (from agent-fs), or the proxy is off */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description agent-fs is unreachable */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/site/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Public agent-fs site page, served through the API (enabled by AGENT_FS_PROXY) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description agent-fs /site response, streamed verbatim */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unknown or expired link (from agent-fs), or the proxy is off */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description agent-fs is unreachable */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/tasks": {
         parameters: {
             query?: never;
@@ -12554,10 +13786,12 @@ export interface paths {
                     status?: string;
                     agentId?: string;
                     scheduleId?: string;
+                    workflowRunId?: string;
                     /** @description Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form. */
                     key?: string;
                     /** @description Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form. */
                     keyPrefix?: string;
+                    /** @description Search task text and title by word or phrase, with a prefix match on the last word, or a task id by prefix. Not a substring match: '2443' does not find '12443', and '%' and '_' are not wildcards. */
                     search?: string;
                     includeHeartbeat?: "true" | "false";
                     createdAfter?: string;
@@ -14182,6 +15416,7 @@ export interface paths {
                     key?: string;
                     /** @description Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form. */
                     keyPrefix?: string;
+                    q?: string;
                     limit?: number;
                     offset?: number | null;
                     fields?: "full" | "slim";
@@ -17329,6 +18564,15 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
+                /** @description Deferral owned by another agent */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
                 /** @description Schedule not found */
                 404: {
                     headers: {
@@ -17514,6 +18758,15 @@ export interface paths {
                 };
                 /** @description Validation error */
                 400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Deferral owned by another agent */
+                403: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -18790,6 +20043,12 @@ export interface paths {
                     fields?: "full" | "slim";
                     /** @description mine: owned sessions. shared: sessions shared with me. tree: Sessions that GET /api/session-tree counts: mine plus shared with me, no ownerless roots. A bypass actor sees every root with tree scope. */
                     scope?: "mine" | "shared" | "tree";
+                    /** @description Sessions v2 view, for a user viewer with tree scope. mine (default): roots the user started from a human channel (not workflow, schedule, or system) plus sessions shared with the user. all: every tree session. Lists only: access is unchanged. */
+                    show?: "mine" | "all";
+                    /** @description Comma-separated root sources to leave out, e.g. `slack,chat`. Older sessions v2 clients send this; `showSource` replaces it. */
+                    hideSource?: string;
+                    /** @description Comma-separated root sources to keep (the sessions v2 source filter), e.g. `ui,slack`. Present and empty keeps none; omit to keep every source. */
+                    showSource?: string;
                 };
                 header?: never;
                 path?: never;
@@ -18909,7 +20168,14 @@ export interface paths {
         /** Get session groups and triage counts */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description Sessions v2 view, for a user viewer with tree scope. mine (default): roots the user started from a human channel (not workflow, schedule, or system) plus sessions shared with the user. all: every tree session. Lists only: access is unchanged. */
+                    show?: "mine" | "all";
+                    /** @description Comma-separated root sources to leave out, e.g. `slack,chat`. Older sessions v2 clients send this; `showSource` replaces it. */
+                    hideSource?: string;
+                    /** @description Comma-separated root sources to keep (the sessions v2 source filter), e.g. `ui,slack`. Present and empty keeps none; omit to keep every source. */
+                    showSource?: string;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -18923,6 +20189,9 @@ export interface paths {
                     };
                     content: {
                         "application/json": {
+                            labels?: {
+                                [key: string]: string;
+                            };
                             groups: {
                                 total: number;
                                 unread: number;
@@ -18955,6 +20224,11 @@ export interface paths {
                                 running: number;
                                 needsYou: number;
                             };
+                            /** @description Each root source in this view with its session count, hidden sources included. */
+                            sources: {
+                                source: string;
+                                total: number;
+                            }[];
                         };
                     };
                 };
@@ -18971,6 +20245,83 @@ export interface paths {
         };
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/session-triage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Triage every session of one sidebar list
+         * @description The bulk bar's 'Select all N': Done, back to the Inbox, read, or unread for every session that one sessions v2 list shows the caller (the `GET /api/sessions?scope=tree` filters). Needs a picked user.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        action: "done" | "inbox" | "read" | "unread";
+                        /** @enum {string} */
+                        triage?: "inbox" | "later" | "done";
+                        noGroup?: boolean;
+                        groupKey?: string;
+                        /**
+                         * @description Sessions v2 view, for a user viewer with tree scope. mine (default): roots the user started from a human channel (not workflow, schedule, or system) plus sessions shared with the user. all: every tree session. Lists only: access is unchanged.
+                         * @enum {string}
+                         */
+                        show?: "mine" | "all";
+                        hideSource?: string[];
+                        showSource?: string[];
+                    };
+                };
+            };
+            responses: {
+                /** @description The number of sessions written */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            updated: number;
+                        };
+                    };
+                };
+                /** @description Validation error, or no picked user */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
         delete?: never;
         options?: never;
         head?: never;
@@ -19194,6 +20545,7 @@ export interface paths {
                             /** @enum {string} */
                             access: "owner" | "write" | "read";
                             owner: components["schemas"]["SessionOwner"];
+                            groupKey: string;
                             approvals?: {
                                 id: string;
                                 /** @enum {string} */
@@ -20519,6 +21871,7 @@ export interface paths {
                                     ignored: number;
                                     failed: number;
                                     uncertain: number;
+                                    ackNotReady: number;
                                     lastOutcomeAt: string | null;
                                     lastFailure: {
                                         code: string;
@@ -20530,6 +21883,7 @@ export interface paths {
                                     ignored: number;
                                     failed: number;
                                     uncertain: number;
+                                    ackNotReady: number;
                                     lastOutcomeAt: string | null;
                                     lastFailure: {
                                         code: string;
@@ -21404,6 +22758,23 @@ export interface paths {
                                     lastErrorAt?: string;
                                     lastSuccessAt?: string;
                                 };
+                                scriptRuns?: {
+                                    at: string;
+                                    rowsDeleted: number;
+                                    batches: number;
+                                    durationMs: number;
+                                    dryRun: boolean;
+                                    cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    outcome: "converged" | "budget_exhausted" | "error";
+                                    drained: boolean;
+                                    backlogRemaining: number;
+                                    batchSize: number;
+                                    slowestStatementMs: number;
+                                    lastError?: string;
+                                    lastErrorAt?: string;
+                                    lastSuccessAt?: string;
+                                };
                             };
                         };
                     };
@@ -21439,6 +22810,7 @@ export interface paths {
                     targetType?: "agent-task" | "workflow" | "script";
                     workflowId?: string;
                     scriptName?: string;
+                    limit?: number;
                     fields?: "full" | "slim";
                 };
                 header?: never;
@@ -22790,6 +24162,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/rbac/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List RBAC roles with their verbs */
+        get: operations["rbac_listRoles"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/users/{id}/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a user's RBAC roles */
+        get: operations["users_getRbacRoles"];
+        /**
+         * Set a user's RBAC roles
+         * @description Replaces the user's roles. The set holds exactly one of admin, requester, viewer plus any extra roles. Demoting a user below admin removes the ability to answer approval requests, even when the user is listed as an approver. Fails with 409 when it would leave no active admin.
+         */
+        put: operations["users_setRbacRoles"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/whoami": {
         parameters: {
             query?: never;
@@ -22817,6 +24227,11 @@ export interface paths {
                             /** @enum {string} */
                             kind: "operator" | "user";
                             user: components["schemas"]["User"] | null;
+                            grants?: {
+                                grantsAll: boolean;
+                                verbs: string[];
+                                roles: string[];
+                            };
                         };
                     };
                 };
@@ -23678,6 +25093,238 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/invites": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Invite a teammate with a one-time API link
+         * @description Creates an invited user with the given role (requester by default) and returns a 7-day single-use API link. The API redirects to the current APP_URL dashboard with the code in the URL fragment. The browser exchanges the code at POST /api/invites/exchange for a personal MCP token. Re-inviting an invited user replaces the role and link. Active or suspended users return 409 user_exists. No email is sent.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** Format: email */
+                        email: string;
+                        name?: string;
+                        /**
+                         * @default requester
+                         * @enum {string}
+                         */
+                        role?: "requester" | "viewer" | "admin";
+                    };
+                };
+            };
+            responses: {
+                /** @description The invited user, API link, dashboard URL, expiry and API reachability */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            user: (components["schemas"]["User"] & {
+                                identities: {
+                                    kind: string;
+                                    externalId: string;
+                                }[];
+                                tokens: {
+                                    id: string;
+                                    userId: string;
+                                    label: string | null;
+                                    tokenPreview: string;
+                                    createdAt: string;
+                                    lastUsedAt: string | null;
+                                    revokedAt: string | null;
+                                }[];
+                                recentEvents: {
+                                    id: string;
+                                    userId: string;
+                                    eventType: string;
+                                    actor: string;
+                                    before?: unknown;
+                                    after?: unknown;
+                                    createdAt: string;
+                                }[];
+                            }) | null;
+                            inviteUrl: string;
+                            appUrl: string;
+                            expiresAt: string;
+                            /** @enum {string} */
+                            apiReachable: "public" | "local";
+                        };
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Not allowed to manage roles */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description The email belongs to an active or suspended user */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/invite/{code}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Open an invite in the configured dashboard
+         * @description Redirects to the current APP_URL dashboard with the code in the URL fragment. Does not validate or consume the invite.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    code: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Redirect to the dashboard */
+                302: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Malformed code (code_invalid) */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/invites/exchange": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Exchange an invite code for the invited user's MCP token
+         * @description Unauthenticated: the single-use invite code is the credential. Rate limited per IP. Activates the invited user. Unknown, expired, used and connector codes, and codes for users who are no longer invited, all return 404 code_invalid.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        code: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Minted MCP token for the invited user */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            token: string;
+                            userId: string;
+                        };
+                    };
+                };
+                /** @description Code unknown, malformed, expired, already used or not an invite */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Request body too large */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Rate limited */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/connector/discovery": {
         parameters: {
             query?: never;
@@ -23802,6 +25449,15 @@ export interface paths {
                 };
                 /** @description Target or source user not found */
                 404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Source is the last active admin (last_admin) */
+                409: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -24643,6 +26299,8 @@ export interface paths {
                     key?: string;
                     /** @description Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form. */
                     keyPrefix?: string;
+                    q?: string;
+                    limit?: number;
                     fields?: "full" | "slim";
                 };
                 header?: never;
@@ -24689,7 +26347,10 @@ export interface paths {
         post: {
             parameters: {
                 query?: never;
-                header?: never;
+                header?: {
+                    /** @description Optional client-generated key, 1-255 visible ASCII characters (a UUID works). The first request the server accepts under a key creates one workflow; a retry with the same key and an equivalent body gets that request's status and body back (with `Idempotent-Replayed: true`) and changes nothing. The key is scoped to the caller's identity and this operation; it is not a credential. The same key with a different body is a 409. A request rejected before it is accepted (validation, auth, not found, disabled) does not use up the key. Accepted keys do not expire. */
+                    "Idempotency-Key"?: string;
+                };
                 path?: never;
                 cookie?: never;
             };
@@ -24797,8 +26458,26 @@ export interface paths {
                         };
                     };
                 };
-                /** @description Invalid definition */
+                /** @description Invalid definition, or a malformed Idempotency-Key */
                 400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Idempotency-Key was already used for a different request */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description The workflow created under this Idempotency-Key was deleted */
+                410: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -25174,11 +26853,20 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Trigger a workflow execution */
+        /**
+         * Trigger a workflow execution
+         * @description With an `Idempotency-Key`, a retry returns the accepted run's `runId` and `skipped` without starting, resuming or waiting for anything, even after the workflow was disabled or edited and whatever state the run is in now.
+         */
         post: {
             parameters: {
-                query?: never;
-                header?: never;
+                query?: {
+                    /** @description Default true: respond after the run's instant steps ran, when it finishes or parks at its first async step. false: respond as soon as the run is committed and walk it in the background. */
+                    wait?: "true" | "false";
+                };
+                header?: {
+                    /** @description Optional client-generated key, 1-255 visible ASCII characters (a UUID works). The first request the server accepts under a key starts one run; a retry with the same key and an equivalent body gets that request's status and body back (with `Idempotent-Replayed: true`) and changes nothing. The key is scoped to the caller's identity and this operation; it is not a credential. The same key with a different body is a 409. A request rejected before it is accepted (validation, auth, not found, disabled) does not use up the key. Accepted keys do not expire. */
+                    "Idempotency-Key"?: string;
+                };
                 path: {
                     id: string;
                 };
@@ -25198,7 +26886,7 @@ export interface paths {
                         };
                     };
                 };
-                /** @description Workflow is disabled */
+                /** @description Workflow is disabled, or a malformed Idempotency-Key */
                 400: {
                     headers: {
                         [name: string]: unknown;
@@ -25218,6 +26906,24 @@ export interface paths {
                 };
                 /** @description Workflow not found */
                 404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Idempotency-Key was already used for a different request */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description The workflow triggered under this Idempotency-Key was deleted */
+                410: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -25354,10 +27060,15 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get a workflow run with steps (includes retry columns) */
+        /**
+         * Get a workflow run with steps (includes retry columns)
+         * @description Returns the run with its `context` and every step with its `input` by default. A step's `input` is a snapshot of the context when the step started, so in runs with loops (polling, `wait`, iterations) the response grows with steps × context size. Pass `fields=slim` to drop `run.context` and `steps[].input`; outputs, errors, diagnostics, retry fields and `parent` stay.
+         */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    fields?: "full" | "slim";
+                };
                 header?: never;
                 path: {
                     id: string;
@@ -25376,11 +27087,78 @@ export interface paths {
                             run: components["schemas"]["WorkflowRun"];
                             steps: components["schemas"]["WorkflowRunStep"][];
                             parent?: components["schemas"]["WorkflowRunParent"];
+                        } | {
+                            run: components["schemas"]["WorkflowRunSummary"];
+                            steps: components["schemas"]["WorkflowRunStepSlim"][];
+                            parent?: components["schemas"]["WorkflowRunParent"];
                         };
                     };
                 };
                 /** @description Run not found */
                 404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workflow-runs/{id}/tree": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a workflow run and every sub-workflow run below it
+         * @description Follows stored parent links (`parentStepId` → step → run) through every attempt of every step, terminal runs included. `runs` holds list rows without `context`, root first. `hasOpenWork` is true while any run in the tree is live, has a pending, running or waiting step, a queued retry, an open task or a pending approval; after a cancel it turns false once the tree has settled. Both come from one read snapshot. The tree is not paginated. Links that form a cycle or nest deeper than 32 levels return 409.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The run tree */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            rootRunId: string;
+                            runs: components["schemas"]["WorkflowRunSummary"][];
+                            hasOpenWork: boolean;
+                        };
+                    };
+                };
+                /** @description Run not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Stored parent links form a cycle or nest past the depth bound */
+                409: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -26176,7 +27954,18 @@ export interface components {
             error: string | null;
             latency_ms: number;
             testedAt: number;
+            warning?: string;
+            keys?: components["schemas"]["AgentCredStatusKeyResult"][];
         } | null;
+        AgentCredStatusKeyResult: {
+            keyType: string;
+            index: number;
+            suffix: string;
+            ok: boolean;
+            error?: string;
+            httpStatus?: number;
+            latency_ms: number;
+        };
         /** @default null */
         AgentLatestModel: {
             model: string;
@@ -26247,6 +28036,19 @@ export interface components {
             })[];
             reportedAt: number;
         } | null;
+        AgentSlackIcon: {
+            /** @enum {string} */
+            type: "emoji";
+            emoji: string;
+        } | {
+            /** @enum {string} */
+            type: "url";
+            /** Format: uri */
+            url: string;
+        } | {
+            /** @enum {string} */
+            type: "app";
+        };
         Agent: {
             id: string;
             name: string;
@@ -26283,10 +28085,27 @@ export interface components {
                 icon: string;
                 color?: string;
             };
+            slackIcon?: components["schemas"]["AgentSlackIcon"] | null;
             /** Format: date-time */
             createdAt: string;
             /** Format: date-time */
             lastUpdatedAt: string;
+        };
+        SwarmConfig: {
+            /** Format: uuid */
+            id: string;
+            /** @enum {string} */
+            scope: "global" | "agent" | "repo";
+            scopeId: string | null;
+            key: string;
+            value: string;
+            isSecret: boolean;
+            envPath: string | null;
+            description: string | null;
+            createdAt: string;
+            lastUpdatedAt: string;
+            encrypted: boolean;
+            exportToEnv: boolean;
         };
         AssetSummary: {
             /** @enum {string} */
@@ -26344,22 +28163,6 @@ export interface components {
             userBudgetUsd?: number | null;
             followUpTaskId?: string | null;
             createdAt: number;
-        };
-        SwarmConfig: {
-            /** Format: uuid */
-            id: string;
-            /** @enum {string} */
-            scope: "global" | "agent" | "repo";
-            scopeId: string | null;
-            key: string;
-            value: string;
-            isSecret: boolean;
-            envPath: string | null;
-            description: string | null;
-            createdAt: string;
-            lastUpdatedAt: string;
-            encrypted: boolean;
-            exportToEnv: boolean;
         };
         ContextSnapshot: {
             /** Format: uuid */
@@ -27139,6 +28942,19 @@ export interface components {
             tags: string[];
             createdAt: string;
         };
+        RbacRole: {
+            id: string;
+            name: string;
+            description: string | null;
+            isBuiltin: boolean;
+            grantsAll: boolean;
+            primary: boolean;
+            verbs: string[];
+        };
+        UserRbacRoles: {
+            userId: string;
+            roles: components["schemas"]["RbacRole"][];
+        };
         User: {
             id: string;
             name: string;
@@ -27398,6 +29214,7 @@ export interface components {
             lastUpdatedAt: string;
             finishedAt?: string;
             parentStepId?: string;
+            parentStepAttempt?: number;
         };
         WorkflowRun: {
             /** Format: uuid */
@@ -27416,6 +29233,7 @@ export interface components {
             lastUpdatedAt: string;
             finishedAt?: string;
             parentStepId?: string;
+            parentStepAttempt?: number;
         };
         WorkflowRunStep: {
             /** Format: uuid */
@@ -27445,6 +29263,28 @@ export interface components {
             workflowId: string;
             stepId: string;
             nodeId: string;
+        };
+        WorkflowRunStepSlim: {
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            runId: string;
+            nodeId: string;
+            nodeType: string;
+            /** @enum {string} */
+            status: "pending" | "running" | "waiting" | "completed" | "failed" | "skipped" | "cancelled";
+            output?: unknown;
+            error?: string;
+            startedAt: string;
+            finishedAt?: string;
+            /** @default 0 */
+            retryCount: number;
+            /** @default 3 */
+            maxRetries: number;
+            nextRetryAt?: string;
+            idempotencyKey?: string;
+            diagnostics?: string;
+            nextPort?: string;
         };
         WorkflowVersion: {
             /** Format: uuid */
@@ -30621,6 +32461,8 @@ export interface operations {
                      * @enum {string}
                      */
                     fsMode?: "none" | "workspace-rw";
+                    /** @enum {string|null} */
+                    executor?: "native" | "quickjs" | null;
                 };
             };
         };
@@ -30685,6 +32527,8 @@ export interface operations {
                      * @enum {string}
                      */
                     fsMode?: "none" | "workspace-rw";
+                    /** @enum {string|null} */
+                    executor?: "native" | "quickjs" | null;
                     idempotencyKey?: string;
                 };
             };
@@ -30944,6 +32788,11 @@ export interface operations {
                             typeChecked: boolean;
                             /** @enum {string} */
                             fsMode: "none" | "workspace-rw";
+                            /**
+                             * @default null
+                             * @enum {string|null}
+                             */
+                            executor: "native" | "quickjs" | null;
                             createdByAgentId: string | null;
                             createdAt: string;
                             updatedAt: string;
@@ -31019,6 +32868,11 @@ export interface operations {
                             typeChecked: boolean;
                             /** @enum {string} */
                             fsMode: "none" | "workspace-rw";
+                            /**
+                             * @default null
+                             * @enum {string|null}
+                             */
+                            executor: "native" | "quickjs" | null;
                             createdByAgentId: string | null;
                             createdAt: string;
                             updatedAt: string;
@@ -31313,6 +33167,123 @@ export interface operations {
             };
             /** @description Endpoint not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    rbac_listRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Role catalog */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        roles: components["schemas"]["RbacRole"][];
+                    };
+                };
+            };
+        };
+    };
+    users_getRbacRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The user's roles */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserRbacRoles"];
+                };
+            };
+            /** @description User not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    users_setRbacRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    roles: string[];
+                };
+            };
+        };
+        responses: {
+            /** @description The user's roles after the change */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserRbacRoles"];
+                };
+            };
+            /** @description Invalid role set */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not allowed to change roles */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description User not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Would leave no active admin */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

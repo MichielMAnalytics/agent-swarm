@@ -18,6 +18,11 @@ import { promisify } from "node:util";
 import { deriveDefaultRoute, routeCredentialStatus, routeUnsetEnv } from "@desplega/model-routing";
 import { type Span, trace } from "@opentelemetry/api";
 import {
+  contextBoundNoteMarkerPath,
+  contextStatePath,
+  recordContextState,
+} from "../hooks/context-bound-note";
+import {
   type RunStopHookSessionSummaryOpts,
   runStopHookSessionSummarySubprocess,
 } from "../hooks/hook";
@@ -130,10 +135,17 @@ async function writeTaskFile(key: string | number, data: TaskFileData): Promise<
 }
 
 export async function cleanupTaskFile(key: string | number): Promise<void> {
-  try {
-    await unlink(getTaskFilePath(key));
-  } catch {
-    // File might already be deleted or never created
+  const taskFilePath = getTaskFilePath(key);
+  for (const path of [
+    taskFilePath,
+    contextStatePath(taskFilePath),
+    contextBoundNoteMarkerPath(taskFilePath),
+  ]) {
+    try {
+      await unlink(path);
+    } catch {
+      // File might already be deleted or never created
+    }
   }
 }
 
@@ -909,6 +921,8 @@ class ClaudeSession implements ProviderSession {
   private appliedReasoningEffort: ReasoningEffort | null;
   /** Last non-empty assistant text seen; surfaced as ProviderResult.output — same pattern as pi-mono/claude-managed. */
   private lastAssistantText = "";
+  /** Last value written to the context state file read by the context-bound note hook. */
+  private lastContextTokens: number | undefined;
   /** Per-session stream-json transcript used by the parent-owned session summarizer. */
   private transcript: string[];
   /** Keeps the session heartbeat fresh while Claude idles on background tasks. */
@@ -1263,6 +1277,17 @@ class ClaudeSession implements ProviderSession {
       if (normalized.contextWindowSize) this.contextWindowSize = normalized.contextWindowSize;
       if (normalized.cost) setCost(normalized.cost);
       if (normalized.assistantText) this.lastAssistantText = normalized.assistantText;
+      if (
+        normalized.requestContextTokens !== undefined &&
+        normalized.requestContextTokens !== this.lastContextTokens
+      ) {
+        this.lastContextTokens = normalized.requestContextTokens;
+        recordContextState(
+          getTaskFilePath(this.taskFileKey),
+          normalized.requestContextTokens,
+          this.model,
+        );
+      }
       this.transcript.push(...normalized.transcriptEntries);
       for (const event of normalized.events) this.emit(event);
 
@@ -1420,7 +1445,11 @@ export class ClaudeAdapter implements ProviderAdapter {
     // (headless) or block on the trust dialog (tmux), so seed trust for every session.
     if (isEnvFlagEnabled("CLAUDE_TRUST_PRESEED", true, sourceEnv)) {
       try {
-        await preseedClaudeTrustDialog(await resolveClaudeTrustDirs(config.cwd));
+        // Seed the ~/.claude.json the CLI reads: its HOME comes from the session env.
+        await preseedClaudeTrustDialog(
+          await resolveClaudeTrustDirs(config.cwd),
+          sourceEnv.HOME || undefined,
+        );
       } catch (err) {
         console.warn(
           `\x1b[33m[claude]\x1b[0m ${scrubSecrets(`Failed to pre-seed trust for ${config.cwd}: ${err}`)}`,

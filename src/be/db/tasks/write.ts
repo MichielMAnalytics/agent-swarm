@@ -1,5 +1,6 @@
 import pkg from "../../../../package.json";
 import { defaultAssetKey } from "../../../assets/key";
+import { sessionSourceKey } from "../../../assets/source-key";
 import type { TaskTelemetryEvent, TaskTelemetryInput } from "../../../telemetry-trigger";
 import type {
   Agent,
@@ -18,6 +19,7 @@ import { emitTaskStarted } from "../../task-lifecycle-events";
 import { publishWorkerNudge } from "../../worker-nudges";
 import { getAgentById, isAgentEligibleForTask } from "../agents";
 import { getDbClient } from "../runtime";
+import { dropSessionDescendants } from "../session-summaries";
 import {
   classifyTaskHumanFree,
   reclassifyTaskHumanFree,
@@ -89,7 +91,11 @@ export async function createTask(
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING *`,
     [
       id,
-      defaultAssetKey("task", id),
+      sessionSourceKey({
+        id,
+        slackChannelId: options?.slackChannelId,
+        slackThreadTs: options?.slackThreadTs,
+      }) ?? defaultAssetKey("task", id),
       agentId,
       scrubSecrets(task),
       "pending",
@@ -657,7 +663,15 @@ export async function overwriteTerminalTaskResultText(
   return row ? rowToAgentTask(row) : task;
 }
 
-export async function cancelTask(id: string, reason?: string): Promise<AgentTask | null> {
+/**
+ * `cascadeDependents: false` skips the dependents sweep for a caller that
+ * already knows no task depends on this one (a bulk cancel looks once).
+ */
+export async function cancelTask(
+  id: string,
+  reason?: string,
+  options: { cascadeDependents?: boolean } = {},
+): Promise<AgentTask | null> {
   const oldTask = await getTaskById(id);
   if (!oldTask) return null;
 
@@ -724,6 +738,25 @@ export async function cancelTask(id: string, reason?: string): Promise<AgentTask
           ),
         );
     });
+    // Deferral suppresses the original worker completion's Lead follow-up.
+    // If its wake-up is cancelled, report that outcome after the cancel commits.
+    if (row.source === "schedule" && row.taskType === "deferred" && row.parentTaskId) {
+      getDbClient().afterCommit(async () => {
+        try {
+          const { createWorkerTaskFollowUp } = await import("../../../tasks/worker-follow-up");
+          await createWorkerTaskFollowUp({
+            task: rowToAgentTask(row),
+            status: "failed",
+            failureReason: `Deferred continuation cancelled: ${cancelReason}`,
+          });
+        } catch (error) {
+          console.error(
+            "[cancelTask] deferred cancellation follow-up failed:",
+            scrubSecrets(error instanceof Error ? error.message : String(error)),
+          );
+        }
+      });
+    }
     try {
       await dependencies.promotePendingSteeringForTask(
         id,
@@ -736,10 +769,12 @@ export async function cancelTask(id: string, reason?: string): Promise<AgentTask
       );
     }
 
-    try {
-      await dependencies.cascadeFailDependents(id, "cancelled");
-    } catch (err) {
-      console.error("[cancelTask] cascade-fail dependents error:", err);
+    if (options.cascadeDependents !== false) {
+      try {
+        await dependencies.cascadeFailDependents(id, "cancelled");
+      } catch (err) {
+        console.error("[cancelTask] cascade-fail dependents error:", err);
+      }
     }
   }
 
@@ -1123,6 +1158,8 @@ export async function deleteTask(id: string): Promise<boolean> {
     const childIds = (
       await tx.query<{ id: string }>("SELECT id FROM agent_tasks WHERE parentTaskId = ?", [id])
     ).map((row) => row.id);
+    // Its descendants leave the session too; the delete trigger handles the rest.
+    await dropSessionDescendants(id);
     const result = await tx.run("DELETE FROM agent_tasks WHERE id = ?", [id]);
     await reclassifyTaskHumanFree(childIds);
     return result.changes > 0;

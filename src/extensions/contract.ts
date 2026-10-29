@@ -117,6 +117,35 @@ export interface TaskCreateEvent {
   description: string;
   origin: TaskCreateOrigin;
   requestInfo?: RequestInfo;
+  /** Slack ingress metadata; not persisted or writable through modify. */
+  slack?: {
+    trigger: "mention" | "thread-buffer";
+    messages: { ts: string; userId: string; text: string }[];
+  };
+}
+
+/** A pre.task.create hook blocked a task before it was created. */
+export interface TaskBlockedEvent {
+  /** The extension that blocked, or whose model/agent rewrite was rejected. */
+  extension: { id: string; name: string };
+  /** The scrubbed block reason. */
+  reason: string;
+  origin: TaskCreateOrigin;
+  source?: AgentTask["source"];
+  requester: { userId?: string; agentId?: string; slackUserId?: string };
+  context?: {
+    contextKey?: string;
+    scheduleId?: string;
+    workflowRunId?: string;
+    workflowRunStepId?: string;
+    parentTaskId?: string;
+    vcsRepo?: string;
+    vcsNumber?: number;
+    slackChannelId?: string;
+    slackThreadTs?: string;
+  };
+  /** The original task description, scrubbed and cut to 500 characters. */
+  description: string;
 }
 
 export type TaskCreateModify = Partial<
@@ -414,6 +443,7 @@ export interface SwarmEventMap {
     result: PreResult<ToolCallModify>;
   };
   "post.task.created": { event: TaskEvent; modify: never; result: void };
+  "post.task.blocked": { event: TaskBlockedEvent; modify: never; result: void };
   "post.task.completed": { event: TaskCompletedEvent; modify: never; result: void };
   "post.task.failed": { event: TaskFailedEvent; modify: never; result: void };
   "post.task.cancelled": { event: TaskEvent; modify: never; result: void };

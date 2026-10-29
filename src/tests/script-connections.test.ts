@@ -570,6 +570,9 @@ describe("script connections", () => {
       markMigrationApplied(database, "151_repair_scheduled_task_required_params.sql");
       // 152 indexes task routing context absent from this migration-112-only fixture.
       markMigrationApplied(database, "152_routing_decisions.sql");
+      // 153 drops a column, so SQLite revalidates 144's agent_tasks triggers
+      // against this fixture's id-only agent_tasks (Bun < 1.4.4 hid the error).
+      markMigrationApplied(database, "153_deferred_task_wait_members.sql");
       // 156 alters inbox_item_state, which this migration-112-only fixture does not create.
       markMigrationApplied(database, "156_inbox_item_state_read_at.sql");
       // 157 alters scheduled_tasks and slack_messages, neither of which this
@@ -638,6 +641,30 @@ describe("script connections", () => {
       markMigrationApplied(database, "231_slack_tasks_last_updated_index.sql");
       // 232 rebuilds session_tokens with the 207 columns, which this fixture skipped.
       markMigrationApplied(database, "232_agent_session_tokens.sql");
+      // 235 reads agent_tasks.deferredAt, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "235_chat_relay_defer.sql");
+      // 237 reads approval_requests and inbox_item_state, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "237_session_inbox_cleanup.sql");
+      // 239 indexes skills, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "239_skills_fts.sql");
+      // 240 alters workflow_runs, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "240_workflow_run_parent_step_attempt.sql");
+      // 241 indexes skills, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "241_skills_meta_fts.sql");
+      // 244 alters api_key_status, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "244_api_key_validation.sql");
+      // 245 alters scripts, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "245_script_executor.sql");
+      // 247 alters workflow_runs, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "247_workflow_run_triggered_by_agent.sql");
+      // 250 indexes workflow_run_steps, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "250_workflow_run_steps_runid_status_index.sql");
+      // 253 adds triggers on agent_tasks columns and approval_requests, which this fixture lacks.
+      markMigrationApplied(database, "253_session_summaries.sql");
+      // 254 indexes agent_tasks columns that this fixture's id-only agent_tasks lacks.
+      markMigrationApplied(database, "254_query_audit_indexes.sql");
+      // 256 alters agents, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "256_agent_slack_icon.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();

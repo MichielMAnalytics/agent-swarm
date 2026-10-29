@@ -44,12 +44,22 @@ export const getTasksInputSchema = z.object({
   readyOnly: z.boolean().optional().describe("Only return tasks whose dependencies are met."),
   taskType: z.string().optional().describe("Filter by task type (e.g., 'bug', 'feature')."),
   tags: z.array(z.string()).optional().describe("Filter by any matching tag."),
-  search: z.string().optional().describe("Search in task description."),
+  search: z
+    .string()
+    .optional()
+    .describe(
+      "Search task text and title by word or phrase, with a prefix match on the last word, or a task id by prefix. Not a substring match: '2443' does not find '12443', and '%' and '_' are not wildcards.",
+    ),
   scheduleId: z
     .string()
     .uuid()
     .optional()
     .describe("Filter by schedule ID to find tasks created by a specific schedule."),
+  workflowRunId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe("Filter by workflow run ID to find the tasks of a single run."),
   key: AssetKeySchema.optional().describe("Filter by exact logical namespace."),
   keyPrefix: AssetKeySchema.optional().describe("Filter by namespace subtree."),
   includeHeartbeat: z
@@ -130,6 +140,7 @@ export async function getTasksHandler(
     tags,
     search,
     scheduleId,
+    workflowRunId,
     key,
     keyPrefix,
     includeHeartbeat,
@@ -151,6 +162,7 @@ export async function getTasksHandler(
     tags,
     search,
     scheduleId,
+    workflowRunId,
     key,
     keyPrefix,
     includeHeartbeat,
@@ -192,6 +204,7 @@ export async function getTasksHandler(
   if (tags?.length) filters.push(`tags=[${tags.join(", ")}]`);
   if (search) filters.push(`search='${search}'`);
   if (scheduleId) filters.push(`scheduleId='${scheduleId}'`);
+  if (workflowRunId) filters.push(`workflowRunId='${workflowRunId}'`);
   if (key) filters.push(`key='${key}'`);
   if (keyPrefix) filters.push(`keyPrefix='${keyPrefix}'`);
 

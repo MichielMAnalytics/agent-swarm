@@ -1,5 +1,7 @@
 import type { Adapter, Message, Thread } from "chat";
 import { z } from "zod";
+import { sessionGroupKey } from "@/assets/key";
+import { sessionSourceKey } from "@/assets/source-key";
 import {
   getAgentById,
   getAgentWorkingOnContextKey,
@@ -9,6 +11,7 @@ import {
   getLeadAgent,
   isExtensionAgent,
 } from "@/be/db";
+import { rememberSessionLabel } from "@/be/db/session-labels";
 import { resolveIdentity } from "@/be/identity";
 import { recordUnmappedIdentity } from "@/be/unmapped-identities";
 import { dispatchPre } from "@/extensions/dispatcher";
@@ -32,6 +35,12 @@ import { getChatThreadResetAt } from "./commands";
 import { type ChatAddressedReason, formatChatHeaderFacts, readChatMessageFacts } from "./facts";
 import { errorMessage } from "./logger";
 import { emitChatMessageSent, postChatMessage } from "./outbound";
+import {
+  chatAdapterReacts,
+  clearChatMessageReactions,
+  setChatMessageReaction,
+  wantsChatTextAck,
+} from "./reactions";
 import {
   type ChatAgentMatch,
   type ChatRouteTarget,
@@ -154,9 +163,14 @@ export async function handleChatInbound(
       console.log(
         `[chat-sdk] ${adapter} message steered task ${steering.task.id} (${steering.result.outcome})`,
       );
+      await setChatMessageReaction(adapter, thread.id, message.id, "steered");
+      if (!(await wantsChatTextAck(adapter, thread.channelId))) return;
       try {
         const ack = formatChatSteeringAck(steering.result);
-        const sent = await thread.post({ markdown: ack });
+        // Telegram threads the ack under the steering message; other adapters post it.
+        const sent = thread.adapter.reply
+          ? await thread.reply(message, { markdown: ack })
+          : await thread.post({ markdown: ack });
         emitChatMessageSent({
           adapter,
           channelId: thread.channelId,
@@ -177,6 +191,10 @@ export async function handleChatInbound(
   }
 
   if (text || attachments.length > 0) {
+    // An unaddressed subscribed-thread message may be dropped by the router at
+    // flush time; it gets typing and a reaction once a task exists (see
+    // flushChatThread). A mention, reply to the bot, or DM is acknowledged now.
+    const acknowledge = kind !== "subscribed" || isDirectMessage || mentioned || facts.replyToBot;
     bufferChatMessage(thread.id, {
       messageId: message.id,
       channelId: thread.channelId,
@@ -186,12 +204,14 @@ export async function handleChatInbound(
       botMentioned: mentioned || facts.replyToBot,
       isDirectMessage,
       addressed,
+      reacted: acknowledge && chatAdapterReacts(adapter),
       facts,
       attachments,
     });
-    // Subscribed-thread messages may be dropped by the router at flush time;
-    // they get typing once a task exists (see flushChatThread).
-    if (kind !== "subscribed") startTypingKeepalive(adapter, thread.id);
+    if (acknowledge) {
+      startTypingKeepalive(adapter, thread.id);
+      await setChatMessageReaction(adapter, thread.id, message.id, immediate ? "now" : "accepted");
+    }
   }
   if (immediate) await instantFlushChat(thread.id);
 }
@@ -356,6 +376,20 @@ async function targetFromExtension(
  * Runs outside any transaction, so `pre.chat.route` is dispatched here, after
  * the flush and before any task exists.
  */
+/**
+ * The source group label a Telegram or Discord message gives: the DM sender,
+ * or a Telegram group title. Slack labels come from the Slack lookup instead.
+ */
+function chatSourceLabel(adapter: string, item: ChatBufferedMessage): string | undefined {
+  if (adapter !== "telegram" && adapter !== "discord") return undefined;
+  const { facts } = item;
+  if (facts.chatType === "dm" || item.isDirectMessage)
+    return facts.from ? `DM · ${facts.from}` : undefined;
+  if (adapter === "telegram" && (facts.chatType === "group" || facts.chatType === "supergroup"))
+    return facts.title || undefined;
+  return undefined;
+}
+
 export async function flushChatThread(
   threadId: string,
   items: ChatBufferedMessage[],
@@ -377,6 +411,9 @@ export async function flushChatThread(
   // One task carries every sender's text, so a batch from several people
   // gets no requester: one sender's identity must not vouch for another's words.
   const otherSenders = new Set(items.map((item) => item.userId)).size - 1;
+  // The task answers the newest message; it alone carries the reaction lifecycle.
+  const answered = items.at(-1) ?? first;
+  const reacted = items.filter((item) => item.reacted).map((item) => item.messageId);
 
   // After `/reset` the thread's earlier tasks are not context: the new task gets
   // no parent and no thread history older than the reset.
@@ -418,6 +455,7 @@ export async function flushChatThread(
       scrubSecrets(routeResult.reason),
     );
     stopTypingKeepalive(threadId);
+    await clearChatMessageReactions(adapter, threadId, reacted);
     return;
   }
 
@@ -433,12 +471,14 @@ export async function flushChatThread(
   if (!target) {
     console.log(`[chat-sdk] ${threadId}: message not addressed to the swarm, ignored`);
     stopTypingKeepalive(threadId);
+    await clearChatMessageReactions(adapter, threadId, reacted);
     return;
   }
 
   if (target.kind === "workflow") {
-    // A workflow run has no relay that would stop the indicator.
+    // A workflow run has no relay that would stop the indicator or end the reaction.
     stopTypingKeepalive(threadId);
+    await clearChatMessageReactions(adapter, threadId, reacted);
     try {
       // The adapter verified the platform signature, and the workflow id comes
       // from an operator mapping or an extension, never from the message.
@@ -515,6 +555,7 @@ export async function flushChatThread(
   const latestActive = await getLatestActiveTaskByContextKey(contextKey, "chat");
   const dependsOn = !immediate && latestActive ? [latestActive.id] : undefined;
   let created = 0;
+  let sourceKey: string | null = null;
   for (const match of target.matches) {
     const options: CreateTaskOptions = {
       agentId: match.agent?.id ?? null,
@@ -533,9 +574,15 @@ export async function flushChatThread(
       // A human message in the thread: never answer it in the previous task's
       // structured-output contract.
       inheritParentOutputSchema: false,
+      // The relay answers as a reply to the newest buffered message. Always set
+      // explicitly: `createTask` copies the parent's anchor into a child that
+      // has none, and that would point at an older ask.
+      mentionMessageId: answered.messageId,
+      mentionChannelId: first.channelId,
     };
     try {
       const { task, unattached } = await createChatTaskWithFiles(description, options, inbound);
+      sourceKey ??= sessionSourceKey(task);
       created++;
       console.log(
         `[chat-sdk] ${threadId}: task ${task.id} for ${match.agent ? `agent ${match.agent.id}` : "no agent (queued)"} (${match.matchedText}, dependsOn: ${dependsOn?.join(", ") ?? "none"}${unattached.length ? `, ${unattached.length} file(s) not attached` : ""})`,
@@ -550,13 +597,29 @@ export async function flushChatThread(
       }
     }
   }
+  const label = chatSourceLabel(adapter, requester);
+  if (sourceKey && label) {
+    // Every message refreshes the label, so a renamed group shows its new title.
+    // The error may echo the label, which can hold a person's name: do not log it.
+    await rememberSessionLabel(sessionGroupKey(sourceKey), label).catch(() => {
+      console.warn("[chat-sdk] Could not save a session source label");
+    });
+  }
   if (created > 0) {
     await rememberChatThreadRequester(threadId, requester.userId);
     await subscribe(thread);
-    // Subscribed-thread messages start typing only here, once a task exists.
+    // Unaddressed subscribed-thread messages start typing only here, once a task exists.
     startTypingKeepalive(adapter, threadId);
+    await clearChatMessageReactions(
+      adapter,
+      threadId,
+      reacted.filter((id) => id !== answered.messageId),
+    );
+    if (!answered.reacted)
+      await setChatMessageReaction(adapter, threadId, answered.messageId, "accepted");
   } else {
     stopTypingKeepalive(threadId);
+    await clearChatMessageReactions(adapter, threadId, reacted);
   }
 }
 

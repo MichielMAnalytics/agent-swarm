@@ -6,16 +6,18 @@ import { createValueScrubber, scrubObject, scrubSecrets } from "../utils/secret-
 import type { ScriptApiConnectionDescriptor, ScriptMcpConnectionDescriptor } from "./api-types";
 import type { FailedCredentialBinding } from "./credential-broker";
 import { buildEgressSecrets } from "./egress-secrets";
-import { getScriptExecutor } from "./executors/registry";
+import { isExecutorAllowedByDeployment, resolveScriptExecutor } from "./executors/registry";
 import {
   DEFAULT_SCRIPT_RESOURCES,
   type EgressSecretEntry,
   type ExecutorOutput,
   type ScriptAgentFsDescriptor,
+  type ScriptExecutorName,
   type ScriptFsMode,
   type ScriptResourcePolicy,
   type SwarmConfigPayload,
 } from "./executors/types";
+import { HOST_VALIDATED_ARGS } from "./host-validated-args";
 import { validateScriptImports } from "./import-allowlist";
 
 /**
@@ -38,8 +40,27 @@ const CAPACITY_EXCEEDED_RETRY_DELAYS_MS = [200, 750];
 export type RunScriptInput = {
   source: string;
   args?: unknown;
+  /**
+   * Unforgeable host-only capability symbol set only when the host has already
+   * validated `args` against the script's `argsJsonSchema` (e.g. `POST /api/x/script/{endpointId}`).
+   * Keyed by a `Symbol` so request-shaped JSON inputs forwarded into `RunScriptInput`
+   * can never opt out of `argsSchema` validation.
+   */
+  [HOST_VALIDATED_ARGS]?: boolean;
   fsMode?: ScriptFsMode;
+  /**
+   * Optional per-script executor override ("native" | "quickjs"). When null or
+   * undefined, `getScriptExecutor` falls back to `SCRIPT_EXECUTOR ?? "native"`.
+   */
+  executor?: ScriptExecutorName | null;
   agentId: string;
+  /**
+   * Bearer for the run's `ctx.swarm` SDK calls. Api-side callers pass a
+   * per-run token bound to the executing agent (`runScriptWithRunCredential`
+   * in `src/be/scripts/run-credential.ts`, which also revokes it). Omitted, the
+   * run presents the swarm API key.
+   */
+  apiKey?: string;
   /** Per-boot runtime identity of the invoking worker; system context, never script input. */
   runtimeInstanceId?: string;
   signal?: AbortSignal;
@@ -74,7 +95,7 @@ export function scriptEgressPolicy(env: NodeJS.ProcessEnv = process.env): Egress
 }
 
 async function buildConfigPayload(input: RunScriptInput): Promise<SwarmConfigPayload> {
-  const apiKey = getApiKey();
+  const apiKey = input.apiKey ?? getApiKey();
   if (!apiKey) throw new Error("Swarm API key is required to run scripts");
 
   return {
@@ -104,6 +125,18 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
       result: undefined,
       stdout: "",
       stderr: "workspace-rw not supported in scripts-runtime v1",
+      truncated: { stdout: false, stderr: false },
+      durationMs: 0,
+      exitCode: 1,
+      error: "executor_error",
+    };
+  }
+
+  if (!isExecutorAllowedByDeployment(input.executor)) {
+    return {
+      result: undefined,
+      stdout: "",
+      stderr: 'Executor "native" is not permitted when deployment SCRIPT_EXECUTOR="quickjs"',
       truncated: { stdout: false, stderr: false },
       durationMs: 0,
       exitCode: 1,
@@ -143,6 +176,7 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
   const executorInput = {
     source: input.source,
     args: input.args ?? null,
+    ...(input[HOST_VALIDATED_ARGS] === true ? { hostValidatedArgs: true } : {}),
     configPayload,
     resources,
     fsMode: input.fsMode ?? "none",
@@ -150,11 +184,11 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
     signal: input.signal,
   };
 
-  let output = await getScriptExecutor().run(executorInput);
+  let output = await resolveScriptExecutor(input.executor).run(executorInput);
   for (const delayMs of CAPACITY_EXCEEDED_RETRY_DELAYS_MS) {
     if (output.error !== "capacity_exceeded" || input.signal?.aborted) break;
     await Bun.sleep(delayMs);
-    output = await getScriptExecutor().run(executorInput);
+    output = await resolveScriptExecutor(input.executor).run(executorInput);
   }
 
   return {

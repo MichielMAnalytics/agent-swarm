@@ -1,4 +1,4 @@
-import { type RunScriptOutput, runScript } from "../../scripts-runtime/loader";
+import type { RunScriptOutput } from "../../scripts-runtime/loader";
 import type { ScriptRecord } from "../../types";
 import {
   getScriptApiConnectionDescriptors,
@@ -6,6 +6,7 @@ import {
 } from "../script-connections";
 import { buildScriptCredentialBindingsWithFailures } from "../script-credential-broker";
 import { restoreScratchScriptLastUsedIfUnchanged, touchScratchScriptLastUsed } from "./db";
+import { runScriptWithRunCredential } from "./run-credential";
 
 export function getSavedScriptOwnerAgentId(script: ScriptRecord): string | null {
   return script.scopeId ?? script.createdByAgentId;
@@ -45,10 +46,11 @@ export async function runSavedScriptAsAgent(
         exitCode: 1,
         error: "killed",
       }
-    : await runScript({
+    : await runScriptWithRunCredential({
         source: args.script.source,
         args: args.input,
         fsMode: args.script.fsMode,
+        executor: args.script.executor,
         agentId: args.agentId,
         egressSecrets: credentials.egressSecrets,
         failedBindings: credentials.failedBindings,

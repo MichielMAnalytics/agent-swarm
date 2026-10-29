@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { renderContextBoundNote } from "../prompts/context-bound-note";
 import type {
   AgentMessageItem,
   CommandExecutionItem,
@@ -33,6 +34,8 @@ import {
   resolveCodexModel,
 } from "../providers/codex-models";
 import type { ProviderEvent, ProviderResult, ProviderSessionConfig } from "../providers/types";
+import { isCodexAuthFailureReason } from "../utils/codex-auth-failure";
+import { HELD_NOTE_TEXT, holdTemplateRender } from "./fixtures/held-template-render";
 
 /**
  * Build a tiny fake `Thread` whose `runStreamed` returns a fixed sequence of
@@ -406,8 +409,10 @@ describe("Codex app-server session", () => {
     });
     const result = await session.waitForCompletion();
     const threadStart = requests.find((request) => request.method === "thread/start");
+    // Regression: an ephemeral thread has no rollout, so `spawn_agent` with
+    // `fork_context` fails with "no rollout found for thread id".
     expect(threadStart?.params).toMatchObject({
-      ephemeral: true,
+      ephemeral: false,
       config: { model: "gpt-5.4" },
     });
     const steer = requests.find((request) => request.method === "turn/steer");
@@ -1175,23 +1180,38 @@ describe("CodexSession event mapping", () => {
     expect(result.failureReason).toContain("[rate-limit]");
   });
 
-  test("turn.failed with auth error rewrites + sets errorCategory=authentication_failed", async () => {
+  test.each([
+    undefined,
+    0,
+    2,
+  ])("turn.failed auth error identifies pool slot %p", async (codexSlot) => {
+    const raw = "Request failed: HTTP 401 Unauthorized — Invalid API key provided.";
     const events: ThreadEvent[] = [
       { type: "thread.started", thread_id: "thread-auth" },
       { type: "turn.started" },
       {
         type: "turn.failed",
-        error: { message: "Request failed: HTTP 401 Unauthorized — Invalid API key provided." },
+        error: { message: raw },
       },
     ];
 
     const { emitted, result } = await runSessionWithFakeThread(
       events,
-      testConfig({ logFile: join(tmpLogDir, "auth.log"), cwd: "" }),
+      testConfig({
+        logFile: join(tmpLogDir, "auth.log"),
+        cwd: "",
+        codexSlot,
+        apiUrl: "",
+        apiKey: "",
+      }),
     );
 
+    const expected =
+      codexSlot === undefined
+        ? `[auth-error] Codex authentication failed — check OPENAI_API_KEY or ChatGPT login. Original error: ${raw}`
+        : `[auth-error] Codex pool slot ${codexSlot} authentication failed — re-run agent-swarm codex-login --slot ${codexSlot}. Original error: ${raw}`;
     const errorEvent = emitted.find((e) => e.type === "error");
-    expect(errorEvent?.type === "error" && errorEvent.message).toContain("[auth-error]");
+    expect(errorEvent?.type === "error" && errorEvent.message).toBe(expected);
 
     const resultEvent = emitted.findLast((e) => e.type === "result");
     expect(resultEvent?.type === "result" && resultEvent.errorCategory).toBe(
@@ -1199,7 +1219,8 @@ describe("CodexSession event mapping", () => {
     );
 
     expect(result.isError).toBe(true);
-    expect(result.failureReason).toContain("[auth-error]");
+    expect(result.failureReason).toBe(expected);
+    expect(isCodexAuthFailureReason(result.failureReason)).toBe(true);
   });
 
   test("abort() resolves the session with cancelled result", async () => {
@@ -2515,7 +2536,9 @@ describe("CodexSession — rate-limit error preservation", () => {
     expect(resetMs).toBeGreaterThan(Date.now());
   });
 
-  test("revoked-while-valid OAuth pool failure ('Failed to refresh token') classifies as [auth-error]/authentication_failed", async () => {
+  test.each([
+    0, 2,
+  ])("revoked-while-valid OAuth failure identifies pool slot %i after transport exit", async (codexSlot) => {
     // A credential revoked server-side while its access token is still
     // unexpired never enters getValidCodexOAuth (the token looks fresh, it
     // fast-returns) — the spawned Codex CLI self-refreshes straight from the
@@ -2532,13 +2555,32 @@ describe("CodexSession — rate-limit error preservation", () => {
     ];
     const sdkThrow = new Error("Codex Exec exited with code 1: Reading prompt from stdin");
 
-    const { result } = await runSessionWithThrowingThread(
+    const { emitted, result } = await runSessionWithThrowingThread(
       events,
       sdkThrow,
-      testConfig({ logFile: join(tmpLogDir, "authfail-preserve.log"), cwd: "" }),
+      testConfig({
+        logFile: join(tmpLogDir, "authfail-preserve.log"),
+        cwd: "",
+        codexSlot,
+        apiUrl: "",
+        apiKey: "",
+      }),
     );
 
     expect(result.failureReason).toMatch(/\[auth-error\]/);
+    expect(result.failureReason).toContain(`pool slot ${codexSlot}`);
+    expect(result.failureReason).toContain(`agent-swarm codex-login --slot ${codexSlot}`);
+    expect(result.failureReason).toContain(refreshFailMsg);
+    expect(isCodexAuthFailureReason(result.failureReason)).toBe(true);
+    const errorEvents = emitted.filter((e) => e.type === "error");
+    expect(errorEvents.length).toBeGreaterThan(0);
+    for (const event of errorEvents) {
+      expect(event.message).toBe(result.failureReason);
+    }
+    const resultEvent = emitted.findLast((e) => e.type === "result");
+    expect(resultEvent?.type === "result" && resultEvent.errorCategory).toBe(
+      "authentication_failed",
+    );
     expect(result.isError).toBe(true);
   });
 
@@ -2609,5 +2651,166 @@ describe("CodexSession — rate-limit error preservation", () => {
     expect(result.failureReason).toBe("unexpected network failure");
     expect(result.isError).toBe(true);
     expect(result.rateLimitResetAt).toBeUndefined();
+  });
+});
+
+describe("CodexSession context-bound note", () => {
+  let prevSkipEnv: string | undefined;
+
+  beforeAll(() => {
+    prevSkipEnv = process.env.SKIP_SESSION_SUMMARY;
+    process.env.SKIP_SESSION_SUMMARY = "1";
+  });
+
+  afterAll(() => {
+    if (prevSkipEnv === undefined) delete process.env.SKIP_SESSION_SUMMARY;
+    else process.env.SKIP_SESSION_SUMMARY = prevSkipEnv;
+  });
+
+  /** One `context.updated` per request; each request's input tokens in order. */
+  function requestEvents(inputs: unknown[]): ThreadEvent[] {
+    return inputs.map(
+      (input_tokens) =>
+        ({
+          type: "context.updated",
+          usage: { input_tokens, cached_input_tokens: 0, output_tokens: 1 },
+        }) as ThreadEvent,
+    );
+  }
+
+  /**
+   * Runs the session over `events` and records every `thread.steer` call. The
+   * turn stays open briefly after the requests so the async note can land.
+   */
+  async function runWithSteers(
+    events: ThreadEvent[],
+    env: Record<string, string>,
+    steer: (input: string) => Promise<void> = async () => {},
+    beforeTurnCompleted: () => Promise<unknown> = () => Bun.sleep(50),
+    model?: string,
+  ): Promise<{ steers: string[]; result: ProviderResult }> {
+    const steers: string[] = [];
+    const thread = {
+      id: null,
+      async steer(input: string) {
+        steers.push(input);
+        await steer(input);
+      },
+      async interrupt() {},
+      async close() {},
+      async runStreamed() {
+        async function* generate(): AsyncGenerator<ThreadEvent> {
+          yield { type: "thread.started", thread_id: "thread-bound-note" };
+          yield { type: "turn.started" };
+          for (const event of events) yield event;
+          await beforeTurnCompleted();
+          yield {
+            type: "turn.completed",
+            usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 },
+          };
+        }
+        return { events: generate() };
+      },
+    };
+    const adapter = new CodexAdapter({
+      bypassSubprocess: true,
+      threadFactory: () => thread as never,
+    });
+    const session = await adapter.createSession(testConfig({ env, ...(model ? { model } : {}) }));
+    const result = await session.waitForCompletion();
+    return { steers, result };
+  }
+
+  test("steers the note once at the threshold, not again on a larger request", async () => {
+    const { steers, result } = await runWithSteers(requestEvents([400, 1_200, 5_000]), {
+      CONTEXT_BOUND_NOTE_TOKENS: "1000",
+    });
+    expect(result.isError).toBe(false);
+    expect(steers).toEqual([await renderContextBoundNote(1_200, "gpt-5.4")]);
+    expect(steers[0]).toContain("1,200");
+  });
+
+  test("the note shows the window share for a known model and omits it for an unknown one", async () => {
+    const noteFor = async (model: string) =>
+      (
+        await runWithSteers(
+          requestEvents([525_000]),
+          { CONTEXT_BOUND_NOTE_TOKENS: "1000" },
+          undefined,
+          undefined,
+          model,
+        )
+      ).steers;
+    const rest =
+      "Keep this task bounded: finish the current step, store-progress, and complete or defer instead of starting new exploration.";
+    expect(await noteFor("gpt-5.4")).toEqual([
+      `Context is 525,000 tokens (50% of the 1,050,000-token window). ${rest}`,
+    ]);
+    expect(await noteFor("made-up-codex-model")).toEqual([`Context is 525,000 tokens. ${rest}`]);
+  });
+
+  test("off when CONTEXT_BOUND_NOTE_TOKENS is unset", async () => {
+    const { steers } = await runWithSteers(requestEvents([250_000, 900_000]), {});
+    expect(steers).toEqual([]);
+  });
+
+  test("no-op below the threshold", async () => {
+    const { steers } = await runWithSteers(requestEvents([400, 999]), {
+      CONTEXT_BOUND_NOTE_TOKENS: "1000",
+    });
+    expect(steers).toEqual([]);
+  });
+
+  test("off at 0", async () => {
+    const { steers } = await runWithSteers(requestEvents([250_000, 500_000]), {
+      CONTEXT_BOUND_NOTE_TOKENS: "0",
+    });
+    expect(steers).toEqual([]);
+  });
+
+  test("fails open on missing or corrupt usage", async () => {
+    const { steers, result } = await runWithSteers(requestEvents([undefined, "lots", null]), {
+      CONTEXT_BOUND_NOTE_TOKENS: "1000",
+    });
+    expect(steers).toEqual([]);
+    expect(result.isError).toBe(false);
+  });
+
+  test("a rejected steer still lets the session complete", async () => {
+    const { steers, result } = await runWithSteers(
+      requestEvents([5_000]),
+      { CONTEXT_BOUND_NOTE_TOKENS: "1000" },
+      async () => {
+        throw new Error("steer refused");
+      },
+    );
+    expect(steers).toHaveLength(1);
+    expect(result.isError).toBe(false);
+  });
+
+  test("a note rendered after the turn completed is dropped", async () => {
+    const lateSteers = async (releaseInTurn: boolean) => {
+      const held = holdTemplateRender();
+      try {
+        const run = await runWithSteers(
+          requestEvents([5_000]),
+          { CONTEXT_BOUND_NOTE_TOKENS: "1000" },
+          undefined,
+          async () => {
+            await held.requested;
+            if (releaseInTurn) held.release();
+            await Bun.sleep(50);
+          },
+        );
+        held.release();
+        await Bun.sleep(50);
+        return run.steers;
+      } finally {
+        held.stop();
+      }
+    };
+    expect(await lateSteers(false)).toEqual([]);
+    // Control: ready while the turn is still open.
+    expect(await lateSteers(true)).toEqual([HELD_NOTE_TEXT]);
   });
 });

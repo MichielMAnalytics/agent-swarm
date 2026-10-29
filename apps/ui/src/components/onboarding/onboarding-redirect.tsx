@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 import { isOnboardingOpen, useOnboarding } from "@/api/hooks/use-onboarding";
 import { useConfig } from "@/hooks/use-config";
+import { useCan, useGrantsState } from "@/lib/use-can";
 
 // API URLs whose `/setup` was opened during this page load. The redirect is a
 // landing rule: once the operator has seen setup for a connection, in-app
@@ -15,6 +16,11 @@ export function markSetupVisited(apiUrl: string) {
   setupVisited.add(apiUrl);
 }
 
+/** `/setup` was opened for this connection during this page load. */
+export function wasSetupVisited(apiUrl: string): boolean {
+  return setupVisited.has(apiUrl);
+}
+
 // Links from `/setup` open other dashboard pages in a new tab. A new tab is a
 // new page load, so it carries this marker instead of the in-memory flag.
 const FROM_SETUP_PARAM = "fromSetup";
@@ -25,8 +31,11 @@ export function setupExitHref(path: string): string {
 }
 
 /**
- * Mounted in the configured app shell. Sends the operator to `/setup` while
- * onboarding is open and not minimized. It is also the one poller of the
+ * Mounted in the configured app shell. Sends an admin to `/setup` while
+ * onboarding is open and not minimized. A Requester or Viewer stays where they
+ * are: setup writes swarm config. A token-bound tab waits for whoami before it
+ * decides, so a non-admin never sees `/setup` flash by; once whoami answers
+ * without grants (an older API), today's redirect applies. It is also the one poller of the
  * onboarding query in the shell, so the pill and the home card stay current.
  */
 export function OnboardingRedirect() {
@@ -37,6 +46,8 @@ export function OnboardingRedirect() {
     refetchInterval: (query) => (isOnboardingOpen(query.state.data) ? 30_000 : false),
   });
   const [mountedAt] = useState(Date.now);
+  const canSetup = useCan("config.write.any");
+  const { pending: grantsPending } = useGrantsState();
 
   // Record the marker after render. This render already skips the redirect.
   useEffect(() => {
@@ -44,6 +55,7 @@ export function OnboardingRedirect() {
   }, [fromSetup, config.apiUrl]);
 
   if (fromSetup || setupVisited.has(config.apiUrl) || pendingConnection || !data) return null;
+  if (grantsPending || !canSetup) return null;
   // Decide on a payload fetched after this mount, never on the persisted
   // cache: hydration can count as "fetched after mount" without a request,
   // so the timestamp check backs up `isFetchedAfterMount`.

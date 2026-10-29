@@ -27,11 +27,14 @@ import { scrubSecrets } from "../utils/secret-scrubber";
 import { combAgentFs } from "./agent-fs";
 import { getCombConfig } from "./config";
 import { sentMarker, sentTaskId } from "./markers";
+import { batchRequester, commentAuthorUsers } from "./requester";
 // Side-effect import: registers the comb.review.* templates.
 import "./templates";
 
 /** Most comments one batch may carry. */
 export const REVIEW_BATCH_MAX = 50;
+/** Longest note for the lead about a whole batch (the UI's `COMB_NOTE_MAX`). */
+export const REVIEW_NOTE_MAX = 4000;
 /** Most agent-fs reads one batch runs at the same time (they use the bootstrap key). */
 export const REVIEW_BATCH_READ_CONCURRENCY = 5;
 
@@ -63,8 +66,18 @@ export interface ReviewBatchInput {
   commentIds: string[];
   /** The file or folder the batch was sent from. */
   scopePath: string;
+  /** The sender's note for the lead about the whole batch. Blank means none. */
+  note?: string;
+  /** The authenticated sender. Null: the author of the newest mapped comment (`./requester`). */
   requestedByUserId: string | null;
 }
+
+/**
+ * Who got the new task: `online` (a lead that is not offline), `offline` (every
+ * lead is offline, so the task waits for one), or `none` (no lead, so the
+ * task waits unassigned in the pool).
+ */
+export type ReviewBatchLead = "online" | "offline" | "none";
 
 export interface ReviewBatchResult {
   /** The new task. Null when the batch only repaired replies of earlier sends. */
@@ -72,6 +85,8 @@ export interface ReviewBatchResult {
   sent: string[];
   skipped: SkippedComment[];
   repaired: RepairedComment[];
+  /** Set with a new task only. */
+  lead?: ReviewBatchLead;
 }
 
 export interface ReviewBatchDeps {
@@ -114,6 +129,9 @@ export async function sendReviewBatch(
   if (ids.length === 0 || ids.length > REVIEW_BATCH_MAX) {
     throw new ReviewBatchError(400, `Send between 1 and ${REVIEW_BATCH_MAX} comments`);
   }
+  if ((input.note?.length ?? 0) > REVIEW_NOTE_MAX) {
+    throw new ReviewBatchError(400, `The note is longer than ${REVIEW_NOTE_MAX} characters`);
+  }
   const agentFs = combAgentFs();
   if (!agentFs) throw new ReviewBatchError(503, "agent-fs is not set up for this swarm");
   const drive: AgentFsDrive = { orgId: input.orgId, driveId: input.driveId };
@@ -137,6 +155,18 @@ export async function sendReviewBatch(
     if (skip) skipped.push(skip);
     else candidates.push(read);
   }
+  // Without an authenticated sender, map the comment authors to swarm users
+  // now: it may read the drive members from agent-fs. Without the service
+  // identity, a swarm-authored comment could pass for a person: no requester.
+  // The caller picks the comments, so an author requester is caller-chosen
+  // attribution: TRUST_BODY_REQUESTED_BY_USER_ID=false turns it off, like a
+  // body `requestedByUserId` on POST /api/tasks.
+  const authorUsers =
+    input.requestedByUserId ||
+    !serviceUserId ||
+    process.env.TRUST_BODY_REQUESTED_BY_USER_ID === "false"
+      ? null
+      : await commentAuthorUsers(agentFs, drive, candidates.map(commentOf), serviceUserId);
 
   // 2. Claim in one transaction, so two sends never split one set of comments.
   const claim = crypto.randomUUID();
@@ -157,9 +187,13 @@ export async function sendReviewBatch(
   // 4. One task for the won comments. On failure, free the claims again.
   const wonIds = won.map((read) => read.id);
   let taskId: string | null = null;
+  let leadState: ReviewBatchLead = "none";
   if (won.length > 0) {
+    const requestedByUserId =
+      input.requestedByUserId ??
+      (authorUsers ? batchRequester(won.map(commentOf), authorUsers) : null);
     try {
-      const text = await renderTaskText(input, won);
+      const text = await renderTaskText({ ...input, requestedByUserId }, won);
       if (text === null) {
         throw new ReviewBatchError(503, "The Comb review template is disabled", [
           ...skipped,
@@ -167,6 +201,7 @@ export async function sendReviewBatch(
         ]);
       }
       const lead = await getLeadAgent();
+      leadState = !lead ? "none" : lead.status === "offline" ? "offline" : "online";
       const task = await createTask(
         text,
         {
@@ -176,7 +211,7 @@ export async function sendReviewBatch(
           source: "comb",
           taskType: "comb-review",
           tags: ["comb"],
-          requestedByUserId: input.requestedByUserId ?? undefined,
+          requestedByUserId: requestedByUserId ?? undefined,
         },
         { origin: "rest" },
       );
@@ -217,7 +252,9 @@ export async function sendReviewBatch(
   if (taskId === null && repaired.length === 0) {
     throw new ReviewBatchError(409, "Nothing to send", skipped);
   }
-  return { taskId, sent: wonIds, skipped, repaired };
+  return taskId === null
+    ? { taskId, sent: wonIds, skipped, repaired }
+    : { taskId, sent: wonIds, skipped, repaired, lead: leadState };
 }
 
 /** `items.map(fn)` with at most `limit` calls in flight. Results keep the input order. */
@@ -257,6 +294,11 @@ async function readComment(
   const { comment } = thread;
   const version = comment.fileVersion ?? (comment.parentId ? undefined : await versionOf(comment));
   return { id, thread, version };
+}
+
+/** The root comment of a read that `skipOf` kept. */
+function commentOf(read: CommentRead): AgentFsComment {
+  return (read.thread as AgentFsCommentThread).comment;
 }
 
 function skipOf({ id, thread }: CommentRead, serviceUserId: string | null): SkippedComment | null {
@@ -427,6 +469,7 @@ async function renderTaskText(
     requested_by: await requesterLabel(input.requestedByUserId),
     org_id: input.orgId,
     drive_id: input.driveId,
+    note_block: noteBlock(input.note),
     comments_block: blocks.join("\n"),
   });
   return batch.skipped ? null : batch.text;
@@ -443,6 +486,12 @@ function lineRange(comment: AgentFsComment): string {
   return end === comment.lineStart
     ? `line ${comment.lineStart}`
     : `lines ${comment.lineStart}-${end}`;
+}
+
+/** The sender's note in a fenced block, or "" when there is none. */
+function noteBlock(note: string | undefined): string {
+  const text = note?.trim();
+  return text ? `\nNote from the sender, about all the comments:\n${fenced(text)}\n` : "";
 }
 
 /**

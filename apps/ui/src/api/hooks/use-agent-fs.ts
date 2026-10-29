@@ -15,7 +15,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { toast } from "sonner";
 import { api } from "@/api/client";
 import type { CombReviewBatchInput, CombReviewBatchResult } from "@/api/types";
@@ -36,18 +36,31 @@ import type {
   CommentUpdateResult,
   DiffResult,
   DriveMembersResult,
+  FindResult,
+  FtsResult,
   LogResult,
   LsResult,
+  RecentResult,
   RevertParams,
   RevertResult,
+  SearchResult,
   StatResult,
 } from "@/lib/agent-fs/types";
+import { BULK_CONCURRENCY, type BulkOutcome, runLimited } from "@/lib/comb/bulk";
 import {
   COMB_LOG_LIMIT,
   commentReadPaths,
   type FileThreads,
   listFileThreads,
 } from "@/lib/comb/comments";
+import { loadTextToCopy } from "@/lib/comb/copy-contents";
+import {
+  HTML_SITE_TTL_SECONDS,
+  siteBaseUrl,
+  siteFileUrl,
+  siteFolderOf,
+  siteShareFreshFor,
+} from "@/lib/comb/html-view";
 import {
   blobUrlPlan,
   COMB_MEDIA_MAX_BYTES,
@@ -59,6 +72,16 @@ import {
 } from "@/lib/comb/media";
 import { markMentionsRead } from "@/lib/comb/mentions";
 import type { DrivePath } from "@/lib/comb/paths";
+import { RECENT_CHANGES_LIMIT, recentChanges } from "@/lib/comb/recent";
+import {
+  isSearchable,
+  isUnknownOpError,
+  SEARCH_OPS,
+  type SearchMode,
+  type SearchOutcome,
+  searchOutcome,
+  searchParams,
+} from "@/lib/comb/search";
 import { type AgentFsText, COMB_TEXT_MAX_BYTES, readDriveText } from "@/lib/comb/text-content";
 
 export { agentFsKey, agentFsRetry };
@@ -162,8 +185,42 @@ export function useAgentFsText(target: DrivePath) {
     // One entry per revision: drop each as soon as no viewer reads it, so a
     // file that changes on every poll does not pile up copies of its bytes.
     gcTime: 0,
-    placeholderData: keepSameFile(fileKey),
+    placeholderData: keepUnderPrefix(fileKey),
   });
+}
+
+/**
+ * Loads a file's text to copy (`loadTextToCopy`). Rejects with a
+ * `CopyRejected` when the file cannot be copied. Reuses the bytes
+ * `useAgentFsText` already loaded for this revision, and the cached `stat`
+ * when the caller has none.
+ */
+export function useLoadTextToCopy() {
+  const access = useAgentFsAccess();
+  const queryClient = useQueryClient();
+  return useCallback(
+    async (target: DrivePath, known?: StatResult): Promise<string> => {
+      const client = access.client;
+      if (!client) throw new Error("agent-fs is not connected");
+      const stat =
+        known ??
+        queryClient.getQueryData<StatResult>(drivePathKey(access, target, "stat")) ??
+        (await client.callOp<StatResult>(
+          target.orgId,
+          "stat",
+          { path: target.path },
+          target.driveId,
+        ));
+      const loaded = queryClient.getQueryData<AgentFsText>([
+        ...drivePathKey(access, target, "content"),
+        fileRevision(stat),
+      ]);
+      return loadTextToCopy(target.path, stat, loaded?.text ?? undefined, () =>
+        client.fetchRaw(target.orgId, target.driveId, target.path),
+      );
+    },
+    [access, queryClient],
+  );
 }
 
 function sameKeyPrefix(key: QueryKey, prefix: readonly unknown[]): boolean {
@@ -176,15 +233,16 @@ function fileRevision(stat: StatResult | undefined) {
 }
 
 /**
- * `placeholderData` that keeps the previous data of the same file (keys under
- * `fileKey`) on screen while a new revision loads.
+ * `placeholderData` that keeps the previous data of a query under `prefix` on
+ * screen while the next one loads: the same file at a new revision, or the
+ * same search mode with a new query.
  */
-function keepSameFile(fileKey: readonly unknown[]) {
+function keepUnderPrefix(prefix: readonly unknown[]) {
   return <T>(previous: T | undefined, previousQuery?: { queryKey: QueryKey }) =>
-    previousQuery && sameKeyPrefix(previousQuery.queryKey, fileKey) ? previous : undefined;
+    previousQuery && sameKeyPrefix(previousQuery.queryKey, prefix) ? previous : undefined;
 }
 
-// --- Media URLs (step-6: image, video, and PDF viewers) ---
+// --- Media URLs (step-6: image, video, and PDF viewers, then audio) ---
 
 /** Presigned media URLs live one hour. */
 const MEDIA_URL_EXPIRES_IN_SECONDS = 3600;
@@ -250,7 +308,7 @@ export function useAgentFsMediaUrl(target: DrivePath, kind: MediaKind): AgentFsM
     // PDF at page 1 and restarts a video.
     refetchInterval: false,
     refetchOnWindowFocus: false,
-    placeholderData: keepSameFile(mediaKey),
+    placeholderData: keepUnderPrefix(mediaKey),
   });
   const presignedUrl = freshPresignedUrl(signed.data, mountedAt);
   const blobMode = signed.data?.kind === "blob";
@@ -268,7 +326,7 @@ export function useAgentFsMediaUrl(target: DrivePath, kind: MediaKind): AgentFsM
     refetchInterval: false,
     // Never keep media bytes (or their object URLs) for a file that is not on screen.
     gcTime: 0,
-    placeholderData: keepSameFile(mediaKey),
+    placeholderData: keepUnderPrefix(mediaKey),
   });
   const plan = blobUrlPlan(kind, target.path, stat?.contentType);
   const blob = blobMode && !tooLarge ? raw.data : undefined;
@@ -411,7 +469,8 @@ export function agentFsCommentsKey(
 }
 
 function connectedClient(access: AgentFsAccess): AgentFsClient {
-  if (!access.client) throw new AgentFsError(0, "NOT_CONNECTED", "Comb is not connected");
+  if (!access.client)
+    throw new AgentFsError(0, "NOT_CONNECTED", "This browser is not connected to agent-fs");
   return access.client;
 }
 
@@ -495,6 +554,60 @@ export function useResolveComment(file: DrivePath) {
     onMutate: () => queryClient.cancelQueries({ queryKey: key }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: key }),
   });
+}
+
+/**
+ * Resolve or reopen many root threads of `drive` (the folder panel's bulk
+ * actions). agent-fs resolves one comment per call, so `run` sends
+ * `BULK_CONCURRENCY` at a time and never rejects: the outcome lists the ids
+ * that failed. `progress` counts the finished calls of the run in flight.
+ * Every comment query of the drive refreshes once, at the end.
+ */
+export function useBulkResolve(drive: { orgId: string; driveId: string }) {
+  const access = useAgentFsAccess();
+  const queryClient = useQueryClient();
+  const [progress, setProgress] = useState<{ finished: number; total: number } | null>(null);
+  // An Undo can start a run while another one is in flight: progress clears after the last.
+  const inFlight = useRef(0);
+  const run = useCallback(
+    async (ids: string[], resolved: boolean): Promise<BulkOutcome<string>> => {
+      const client = connectedClient(access);
+      const key = agentFsCommentsKey(access, drive);
+      inFlight.current++;
+      setProgress({ finished: 0, total: ids.length });
+      try {
+        // A poll that started before the writes must not bring the old state back.
+        await queryClient.cancelQueries({ queryKey: key });
+        return await runLimited(
+          ids,
+          BULK_CONCURRENCY,
+          (id) =>
+            client.callOp<CommentResolveResult>(
+              drive.orgId,
+              "comment-resolve",
+              { id, resolved },
+              drive.driveId,
+            ),
+          {
+            onProgress: (finished) => setProgress({ finished, total: ids.length }),
+            // Without the editor role every call fails the same way: stop at the first.
+            stopOn: isAccessDenied,
+          },
+        );
+      } finally {
+        inFlight.current--;
+        if (inFlight.current === 0) setProgress(null);
+        void queryClient.invalidateQueries({ queryKey: key });
+      }
+    },
+    [access, drive, queryClient],
+  );
+  return { run, progress };
+}
+
+/** agent-fs refused the key (401) or the role (403). */
+export function isAccessDenied(error: unknown): boolean {
+  return error instanceof AgentFsError && (error.status === 401 || error.status === 403);
 }
 
 /**
@@ -650,6 +763,130 @@ export function useRevertFile(file: DrivePath) {
   });
 }
 
+// --- Rendered HTML -------------------------------------------------------------
+
+/**
+ * The preview frame URL of an HTML file: the file inside a 15-minute site
+ * share of its folder (`share-create` on the folder, feature `html-sites`).
+ * One share per folder, kept in memory until 3 minutes before it expires, so
+ * two pages of one folder and a quick reopen reuse it. Nothing persists the
+ * token. `enabled: false` mints nothing. Key: `(..., "html-site", folder)`.
+ */
+export function useHtmlSiteUrl(file: DrivePath, enabled: boolean) {
+  const access = useAgentFsAccess();
+  const folder = siteFolderOf(file.path);
+  // A cached share near its expiry never shows on mount: it is stale, so the
+  // mount mints a new one and the frame loads once.
+  const [mountedAt] = useState(Date.now);
+  const site = useQuery({
+    queryKey: agentFsKey(
+      access.endpoint,
+      access.userId,
+      file.orgId,
+      file.driveId,
+      "html-site",
+      folder,
+    ),
+    queryFn: async () => {
+      const client = connectedClient(access);
+      const result = await client.createShare(file.orgId, file.driveId, folder, {
+        expiresIn: HTML_SITE_TTL_SECONDS,
+      });
+      const expiresAt = Date.parse(result.expiresAt);
+      return {
+        base: siteBaseUrl(access.endpoint || client.endpoint, result.sharePath),
+        expiresAt: Number.isFinite(expiresAt) ? expiresAt : Date.now() + result.expiresIn * 1000,
+      };
+    },
+    enabled: enabled && access.client !== null,
+    retry: agentFsRetry,
+    staleTime: ({ state }) =>
+      state.data ? siteShareFreshFor(state.data.expiresAt, state.dataUpdatedAt) : 0,
+    gcTime: HTML_SITE_TTL_SECONDS * 1000,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+  });
+  const fresh = site.data && siteShareFreshFor(site.data.expiresAt, mountedAt) > 0;
+  return {
+    url: site.data && fresh ? siteFileUrl(site.data.base, file.path) : null,
+    error: site.error,
+  };
+}
+
+// --- Search ------------------------------------------------------------------
+
+/**
+ * Search the drive by name (`find`), full text (`fts`), or meaning (`search`).
+ * Key: `(..., "search", mode, query)`. A query too short for its mode does not
+ * run. Results do not poll: a new query or mode is a new search.
+ */
+export function useCombSearch(
+  drive: { orgId: string; driveId: string },
+  mode: SearchMode,
+  query: string,
+  /** A Comb folder: name search only looks below it. */
+  scope?: string,
+) {
+  const access = useAgentFsAccess();
+  const trimmed = query.trim();
+  const modeKey = agentFsKey(
+    access.endpoint,
+    access.userId,
+    drive.orgId,
+    drive.driveId,
+    "search",
+    mode,
+    scope ?? "/",
+  );
+  return useQuery({
+    queryKey: [...modeKey, trimmed] as const,
+    queryFn: async ({ signal }): Promise<SearchOutcome> => {
+      const result = await connectedClient(access).callOp<FindResult | FtsResult | SearchResult>(
+        drive.orgId,
+        SEARCH_OPS[mode],
+        searchParams(mode, trimmed, scope),
+        drive.driveId,
+        { signal },
+      );
+      return searchOutcome(mode, result);
+    },
+    enabled: access.client !== null && isSearchable(mode, trimmed),
+    // An older agent-fs without the op answers 500: retrying cannot help.
+    retry: (count, error) =>
+      !isUnknownOpError(error, SEARCH_OPS[mode]) && agentFsRetry(count, error),
+    staleTime: 30_000,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+    // The previous answer of the same mode stays on screen while the next query runs.
+    placeholderData: keepUnderPrefix(modeKey),
+  });
+}
+
+/**
+ * The drive's recently changed files (the agent-fs `recent` op): the newest
+ * version of each, deletes left out, at most `max`. Undefined data while an
+ * older agent-fs without the op answers: the lists hide then. A
+ * `file.changed` event refreshes it while the drive's stream is live.
+ */
+export function useRecentChanges(drive: { orgId: string; driveId: string }, max: number) {
+  const access = useAgentFsAccess();
+  return useQuery({
+    queryKey: agentFsKey(access.endpoint, access.userId, drive.orgId, drive.driveId, "recent"),
+    queryFn: ({ signal }) =>
+      connectedClient(access).callOp<RecentResult>(
+        drive.orgId,
+        "recent",
+        { limit: RECENT_CHANGES_LIMIT },
+        drive.driveId,
+        { signal },
+      ),
+    select: (result) => recentChanges(result.entries, max),
+    enabled: access.client !== null,
+    retry: (count, error) => !isUnknownOpError(error, "recent") && agentFsRetry(count, error),
+    refetchInterval: drivePoll(access, drive, "recent"),
+  });
+}
+
 // --- Send to swarm (step-9) --------------------------------------------------
 
 /**
@@ -698,7 +935,7 @@ export function useSendCombReviewBatch(
   const access = useAgentFsAccess();
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (input: Pick<CombReviewBatchInput, "commentIds" | "scopePath">) =>
+    mutationFn: (input: Pick<CombReviewBatchInput, "commentIds" | "scopePath" | "note">) =>
       api.sendCombReviewBatch({ orgId: drive.orgId, driveId: drive.driveId, ...input }),
     onSuccess: callbacks.onSuccess,
     onError: callbacks.onError,

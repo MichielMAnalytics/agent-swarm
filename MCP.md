@@ -270,8 +270,9 @@ Returns a list of tasks in the swarm with various filters. Sorted by priority (d
 | `readyOnly` | `boolean` | No | - | Only return tasks whose dependencies are met. |
 | `taskType` | `string` | No | - | Filter by task type (e.g., 'bug', 'feature'). |
 | `tags` | `array` | No | - | Filter by any matching tag. |
-| `search` | `string` | No | - | Search in task description. |
+| `search` | `string` | No | - | Search task text and title by word or phrase, with a prefix match on the last word, or a task id by prefix. Not a substring match: '2443' does not find '12443', and '%' and '_' are not wildcards. |
 | `scheduleId` | `string` | No | - | Filter by schedule ID to find tasks created by a specific schedule. |
+| `workflowRunId` | `string` | No | - | Filter by workflow run ID to find the tasks of a single run. |
 | `key` | `unknown` | No | - | Filter by exact logical namespace. |
 | `keyPrefix` | `unknown` | No | - | Filter by namespace subtree. |
 | `includeHeartbeat` | `boolean` | No | - | Include heartbeat/system tasks in results (excluded by default). |
@@ -358,6 +359,7 @@ Stores the progress of a specific task. Can also mark task as completed or faile
 | `failureReason` | `string` | No | - | The reason for failure (used when failing). |
 | `attachments` | `array` | No | - | Pointer-based artifacts produced by this step — agent-fs path, URL, shared-fs path, or swarm Page. No inline file data; upload to agent-fs first and attach by path. Agent-fs pointers are verified before task state changes, using the explicit org/drive pair or the registering agent's configured defaults. May be sent on any call (progress or completion) and accumulates across calls; duplicates are de-duped by sha256 (when present) or by (kind, pointer, name). |
 | `citations` | `array` | No | - | Claim sources, upserted by index across calls. Use only for factual claims the reader cannot already see in the thread or task tree, 1-2 sources; none on delegation, routing, acks, or status replies. Reference each one in output with [citation:N], or set general: true for a source that backs the whole answer (it renders under "General sources"). ref per kind: task = task UUID; memory = memory UUID (optional quote must appear verbatim in it); github = owner/repo#N, owner/repo@<sha>, or a github.com pull, issues, or commit URL; slack = permalink or channel/ts; agent-fs = file path; page = page id; script-run = script run id; url = http(s) URL. The first completing call is refused, and the task stays in progress, if a marker has no entry, a citation fails validation, or a non-general citation is unreferenced; the response lists each problem. After one refusal, completion proceeds and those markers and sources are dropped from rendered output. At most 50 citations per call/task, refs up to 2048 characters, labels up to 200. Invalid or oversized batches are ignored; existing indices can still be updated at capacity. |
+| `learning` | `unknown` | No | - | A lesson to keep. Add one only when it would change how the next agent works: a gotcha, a dead end, a pattern that worked. Not a progress line. Stored as a swarm memory at /learnings/<workstream>/<slug>, tagged "learning" and tied to this task. The first line of text is the title. At most ~500 tokens and 5 kebab tags. workstream defaults to the task's repo name, else "general". Send it on or before the completing call: a call on a finished task stores nothing. A failed learning write is reported in the result and never blocks the progress update. |
 | `persistMemory` | `boolean` | No | - | Opt in to task_completion memory persistence for automatic/recurring tasks. Manual tasks are persisted by default; scheduled, system, heartbeat/boot-triage, monitor, and digest tasks are skipped unless this is true. |
 | `force` | `boolean` | No | - | On an already-terminal task, overwrite explicitly provided output and/or failureReason text while preserving status and finishedAt and without replaying events, memory writes, follow-up creation, business-use ensure, or capacity updates. Differing terminal text is otherwise discarded and reported as a failure. |
 
@@ -481,7 +483,7 @@ Perform task pool operations: create unassigned tasks, claim/release tasks from 
 |-----------|------|----------|---------|-------------|
 | `action` | `create \| claim \| release \| accept \| reject \| to_backlog \| from_backlog` | Yes | - | The action to perform: 'create' creates an unassigned task, 'claim' takes a task from pool, 'release' returns task to pool, 'accept' accepts offered task, 'reject' declines offered task, 'to_backlog' moves task to backlog, 'from_backlog' moves task from backlog to pool. |
 | `task` | `string` | No | - | Task description (required for 'create'). |
-| `key` | `unknown` | No | - | Logical namespace for a created task. Defaults to a shared/task:<id>/ resource key. |
+| `key` | `unknown` | No | - | Logical namespace for a created task. Default: the Slack or chat source key of the task (for example shared/slack/<channel>/thread:<ts>/), else shared/task:<id>/. |
 | `taskType` | `string` | No | - | Task type (e.g., 'bug', 'feature'). |
 | `tags` | `array` | No | - | Tags for filtering (e.g., ['urgent', 'frontend']). |
 | `priority` | `number` | No | - | Priority 0-100, default 50. |
@@ -689,6 +691,7 @@ Manage external HTTP API endpoints for swarm scripts (POST /api/x/script/<id>). 
 | `intent` | `string` | No | "" | Why this script is being run. |
 | `scope` | `unknown` | No | - | Optional scope for named script resolution. |
 | `fsMode` | `unknown` | No | "none" | Filesystem mode. v1 supports none only. |
+| `executor` | `unknown` | No | - | Optional executor override ("native" or "quickjs"). When omitted, named scripts use their saved executor or SCRIPT_EXECUTOR. |
 | `idempotencyKey` | `string` | No | - | When set, output is auto-persisted to kv under script:executions/{key}. Re-running with the same key overwrites. Queryable via kv-get. |
 
 ### script-upsert
@@ -703,6 +706,7 @@ Manage external HTTP API endpoints for swarm scripts (POST /api/x/script/<id>). 
 | `intent` | `string` | No | "" | Why this script exists. |
 | `scope` | `unknown` | No | "agent" | Persist under agent or global scope. |
 | `fsMode` | `unknown` | No | "none" | Filesystem mode. v1 supports none only. |
+| `executor` | `unknown` | No | - | Optional per-script executor override ("native" or "quickjs"). Null or omitted inherits SCRIPT_EXECUTOR. |
 
 ### extension-delete
 
@@ -1003,6 +1007,7 @@ Updates an agent's profile information (name, description, role, capabilities). 
 | `toolsMd` | `string` | No | - | Environment-specific operational knowledge. Synced to /workspace/TOOLS.md. Above 20,000 characters, updates may only keep or reduce the stored size; move durable overflow into memory. |
 | `heartbeatMd` | `string` | No | - | Heartbeat checklist content (HEARTBEAT.md). Checked periodically — add standing orders for the lead to review. Synced to /workspace/HEARTBEAT.md. |
 | `avatar` | `unknown` | No | - | Custom avatar: { type: 'lucide', icon: '<kebab-case-lucide-name>', color?: '#RRGGBB' }. Pass null to reset to the default deterministic icon/color. |
+| `slackIcon` | `unknown` | No | - | Slack icon for this agent's messages: { type: 'emoji', emoji: ':owl:' } or { type: 'url', url: 'https://…' }, or { type: 'app' } for the Slack app's own icon. A link Slack cannot load falls back to the Slack app's icon. Pass null to reset to the default. |
 
 ### context-history
 
@@ -1498,6 +1503,8 @@ Manually trigger a workflow execution, optionally passing trigger data as contex
 |-----------|------|----------|---------|-------------|
 | `id` | `string` | Yes | - | Workflow ID to trigger |
 | `triggerData` | `object` | No | - | Optional data to pass as trigger context to the workflow |
+| `wait` | `boolean` | No | - | Default true: return after the run's instant steps ran, when it finishes or parks at its first async step. false: return as soon as the run is created and walk it in the background. Use false from a script or step that only needs the runId. |
+| `idempotencyKey` | `string` | No | - | Optional, 1-255 visible ASCII characters, scoped to the calling agent and this workflow. The first trigger accepted under a key starts one run; the key is recorded in the run's own transaction and never expires. A retry with the same key and triggerData starts nothing and returns that run (replayed: true), even if the earlier call was killed before it saw the answer. The same key with other triggerData is an error with idempotencyConflict: true. |
 
 ### list-workflow-runs
 
@@ -1522,6 +1529,7 @@ Get details of a workflow run by ID, including all steps and their statuses.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `id` | `string` | Yes | - | Workflow run ID |
+| `fields` | `full \| slim` | No | - | `slim` omits run.context and each step's input (a context snapshot per step, large in runs with loops). Outputs, errors and retry fields stay. Default: full. |
 
 ### retry-workflow-run
 
@@ -1537,7 +1545,7 @@ Resume the same failed workflow run from its failed step(s); completed steps are
 
 **Cancel Workflow Run**
 
-Cancel a running or waiting workflow run. Cancels all non-terminal steps and their associated tasks.
+Cancel a running or waiting workflow run and every child run below it. Cancels their non-terminal steps, tasks, pending approvals and queued retries in one transaction; finished child runs keep their status. Repeating the cancel on a cancelled run finishes any child runs still open.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -1563,7 +1571,7 @@ Send a state and typed questions (noul, choice, score) to a SystemOne decision h
 
 **Request human input**
 
-Create an approval request and return at once with the request id and URL. The answer arrives later as a hitl-follow-up task. Supports multiple question types: approval (yes/no), text, single-select, multi-select, and boolean. Returns the request ID and URL for the human to respond. The dashboard renders each label and description as markdown: put long content in description, fence code with a language, and put an image URL alone on its own line to show it. No Slack message is sent; share the URL yourself.
+Create an approval request and return at once with the request id and URL. The answer arrives later as a hitl-follow-up task. Supports multiple question types: approval (yes/no), text, single-select, multi-select, boolean, and config. Returns the request ID and URL for the human to respond. config asks a person to set one swarm config key on the dashboard; secrets are stored encrypted and you receive only {key, scope, isSecret, status, updatedAt}, never the value. The dashboard renders each label and description as markdown: put long content in description, fence code with a language, and put an image URL alone on its own line to show it. No Slack message is sent; share the URL yourself.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -2252,7 +2260,7 @@ Deletes a Slack message that THIS bot authored (e.g. a message previously posted
 
 **Edit a Slack message**
 
-Edits (in place) the text of a Slack message that THIS bot authored — use it to post corrections to your own messages. Cannot edit messages authored by humans or other apps. Note: editing may reset the message's display name/icon to the app default (Slack's chat.update cannot set the crown persona). Requires lead privileges.
+Edits (in place) the text of a Slack message that THIS bot authored — use it to post corrections to your own messages. Cannot edit messages authored by humans or other apps. Editing keeps the icon the message was posted with. Requires lead privileges.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -2450,7 +2458,7 @@ Read the most recent messages of a Chat SDK thread, oldest first. Every agent ca
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `threadId` | `string` | Yes | - | Full SDK thread id with the adapter prefix, such as telegram:12345. |
-| `limit` | `number` | No | - | Number of messages to return (default ${DEFAULT_LIMIT}). |
+| `limit` | `number` | No | - | Number of messages to return (default 30). |
 
 ### register-chat-channel
 

@@ -98,6 +98,45 @@ describe("script SDK allowlist", () => {
     }
   });
 
+  test("workflow_getRun forwards fields to the run route and rejects an unknown value", async () => {
+    const requests: URL[] = [];
+    const httpServer = Bun.serve({
+      port: 0,
+      fetch(req) {
+        requests.push(new URL(req.url));
+        return Response.json({ run: { id: "run-1" }, steps: [] });
+      },
+    });
+    const config = new SwarmConfig({
+      system: {
+        apiKey: { value: "sdk-test-key", isSecret: true },
+        agentId: { value: "sdk-test-agent", isSecret: false },
+        mcpBaseUrl: { value: `http://127.0.0.1:${httpServer.port}`, isSecret: false },
+      },
+      user: {},
+    });
+    const sdk = createSwarmSdk(config);
+
+    try {
+      await sdk.workflow_getRun({ id: "run-1", fields: "slim" });
+      await sdk.workflow_getRun({ id: "run-1" });
+      expect(requests.map((url) => url.pathname)).toEqual([
+        "/api/workflow-runs/run-1",
+        "/api/workflow-runs/run-1",
+      ]);
+      expect(requests[0]?.searchParams.get("fields")).toBe("slim");
+      // Omitted `fields` sends no query, so the route keeps its full default.
+      expect(requests[1]?.search).toBe("");
+
+      await expect(sdk.workflow_getRun({ id: "run-1", fields: "tiny" })).rejects.toThrow(
+        '`fields` must be "full" or "slim"',
+      );
+      expect(requests).toHaveLength(2);
+    } finally {
+      httpServer.stop(true);
+    }
+  });
+
   test("approval_cancel posts to the cancel route with the reason", async () => {
     let request: { method: string; path: string; body: unknown } | undefined;
     const httpServer = Bun.serve({
@@ -252,8 +291,9 @@ describe("script SDK allowlist", () => {
 
   test("bundled swarm-sdk.d.ts uses triggerData (not input) for workflow_trigger", async () => {
     const types = await Bun.file("src/scripts-runtime/types/swarm-sdk.d.ts").text();
-    expect(types).toContain("workflow_trigger(args: { id: string; triggerData?");
-    expect(types).not.toContain("workflow_trigger(args: { id: string; input?");
+    expect(types).toMatch(/workflow_trigger\(args: \{\s*id: string;\s*triggerData\?/);
+    expect(types).toMatch(/workflow_trigger\(args: \{[^}]*\bwait\?: boolean;/);
+    expect(types).not.toMatch(/workflow_trigger\(args: \{\s*id: string;\s*input\?/);
   });
 });
 

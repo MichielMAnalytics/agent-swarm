@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import type { AgentTask } from "../api/types";
+import type { AgentTask, SessionDetailResponse } from "../api/types";
 import {
   closeSplit,
   closeTab,
   closeUrlTab,
+  detailGroupKey,
   focusedTab,
   GROUP_TAB,
   isSessionTab,
@@ -14,6 +15,7 @@ import {
   parseView,
   replaceTab,
   serializeTabs,
+  sessionCostUsd,
   splitTo,
   tabPath,
   tabsWithFocus,
@@ -182,6 +184,22 @@ describe("sessions v2 URL state", () => {
   });
 });
 
+describe("sessionCostUsd", () => {
+  const task = (totalCostUsd?: number) => ({ totalCostUsd }) as AgentTask;
+
+  test("totals every task in the chain, not only the root", () => {
+    // The lead's root, two delegated worker tasks and a follow-up.
+    const chain = [task(0.2051), task(0.5), task(0.25), task(0.335)];
+    expect(sessionCostUsd(chain)).toBeCloseTo(1.2901, 6);
+  });
+
+  test("skips tasks without a cost and is null when none has one", () => {
+    expect(sessionCostUsd([task(), task(0.1), task()])).toBeCloseTo(0.1, 6);
+    expect(sessionCostUsd([task(), task()])).toBeNull();
+    expect(sessionCostUsd([task(0)])).toBe(0);
+  });
+});
+
 describe("latestTask", () => {
   const task = (id: string, parentTaskId: string | null, lastUpdatedAt: string, status: string) =>
     ({ id, parentTaskId, lastUpdatedAt, status }) as unknown as AgentTask;
@@ -214,5 +232,20 @@ describe("latestTask", () => {
       task("b", "r", "2026-10-21T10:00:00.000Z", "in_progress"),
     ];
     expect(latestTask({ root, chain }).id).toBe("b");
+  });
+});
+
+describe("detailGroupKey", () => {
+  const detail = (key: string | undefined, groupKey?: string) =>
+    ({ root: { key }, groupKey }) as unknown as SessionDetailResponse;
+
+  test("the server's group wins, so a shared thread opens its own group", () => {
+    const thread = "shared/slack/c1/thread:1.2/";
+    expect(detailGroupKey(detail(thread, thread))).toBe(thread);
+  });
+
+  test("an older server's detail falls back to the key rule", () => {
+    expect(detailGroupKey(detail("shared/slack/c1/thread:1.2/"))).toBe("shared/slack/c1/");
+    expect(detailGroupKey(detail(undefined))).toBeUndefined();
   });
 });

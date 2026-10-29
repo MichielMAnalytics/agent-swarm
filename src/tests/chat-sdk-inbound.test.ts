@@ -7,6 +7,7 @@ import {
   closeDb,
   completeTask,
   createAgent,
+  createScheduledTask,
   createTaskExtended,
   createUser,
   getDbClient,
@@ -20,10 +21,12 @@ import {
 import { linkIdentity } from "../be/users";
 import { resetFileStorageProviderForTests } from "../fs/registry";
 import { drainBackground } from "../integrations/chat-sdk/background";
-import { formatChatRelayText } from "../integrations/chat-sdk/relay";
+import { CHAT_CHANNEL_SETTINGS_NAMESPACE } from "../integrations/chat-sdk/reactions";
+import { formatChatRelayText, formatChatTaskTag } from "../integrations/chat-sdk/relay";
 import { CHAT_CHANNELS_NAMESPACE, routeChatMessage } from "../integrations/chat-sdk/router";
 import { getChatInstance } from "../integrations/chat-sdk/runtime";
 import { isChatThreadBuffered } from "../integrations/chat-sdk/thread-buffer";
+import { createStandaloneScheduleTask } from "../scheduler/schedule-task";
 import { chatSdkContextKey } from "../tasks/context-key";
 import { registerDeferTaskTool } from "../tools/defer-task";
 import type { Agent } from "../types";
@@ -144,6 +147,25 @@ function buildDeferTaskTool(): DeferTaskTool {
 const dm = (id: number): TelegramChat => ({ id, type: "private" });
 const group = (id: number): TelegramChat => ({ id, type: "group" });
 
+const messageIdOf = (update: Record<string, unknown>) =>
+  (update.message as { message_id: number }).message_id;
+
+/** Every `setMessageReaction` call on one message, as the emoji it set (`""` = cleared). */
+function reactionsOn(chatId: number, update: Record<string, unknown>): string[] {
+  return harness.mock.calls
+    .filter((call) => call.method === "setMessageReaction")
+    .map((call) => call.body as { chat_id: unknown; message_id: unknown; reaction: unknown })
+    .filter(
+      (body) =>
+        String(body.chat_id) === String(chatId) && Number(body.message_id) === messageIdOf(update),
+    )
+    .map((body) => {
+      const reaction =
+        typeof body.reaction === "string" ? JSON.parse(body.reaction) : body.reaction;
+      return (reaction as Array<{ emoji?: string }>).map((r) => r.emoji ?? "").join("");
+    });
+}
+
 describe("Chat SDK inbound pipeline", () => {
   test("two messages inside the buffer window become one task", async () => {
     await postTelegramUpdate(telegramUpdate(dm(2001), "first part of the request"));
@@ -233,19 +255,121 @@ describe("Chat SDK inbound pipeline", () => {
       first!.id,
     ]);
 
-    const acksBefore = harness.mock.calls.filter((call) =>
-      /^send(Rich)?Message$/.test(call.method),
-    ).length;
-    await postTelegramUpdate(telegramUpdate(group(-2005), "also add the charts"));
+    const sendCount = () =>
+      harness.mock.calls.filter((call) => /^send(Rich)?Message$/.test(call.method)).length;
+    const sendsBefore = sendCount();
+    const steer = telegramUpdate(group(-2005), "also add the charts");
+    await postTelegramUpdate(steer);
     await flushChatBuffers();
 
     expect(await chatTasks(-2005)).toHaveLength(1);
     expect(await steeringRows(first!.id)).toEqual([
       { body: "also add the charts", source: "chat" },
     ]);
-    expect(
-      harness.mock.calls.filter((call) => /^send(Rich)?Message$/.test(call.method)).length,
-    ).toBe(acksBefore + 1);
+    // A reaction acknowledges the steering message; no text reply.
+    expect(reactionsOn(-2005, steer)).toEqual(["✍"]);
+    expect(sendCount()).toBe(sendsBefore);
+  });
+
+  test("a channel that opts into text acks also gets the steering reply", async () => {
+    await upsertKv({
+      namespace: CHAT_CHANNEL_SETTINGS_NAMESPACE,
+      key: "telegram:-2015",
+      value: { textAcks: true },
+      valueType: "json",
+    });
+    await postTelegramUpdate(telegramUpdate(group(-2015), "@swarm_test_bot draft the report"));
+    await flushChatBuffers();
+    const [first] = await chatTasks(-2015);
+    await getDbClient().run("UPDATE agent_tasks SET status = 'in_progress' WHERE id = ?", [
+      first!.id,
+    ]);
+
+    const steer = telegramUpdate(group(-2015), "also add the charts");
+    await postTelegramUpdate(steer);
+
+    expect(reactionsOn(-2015, steer)).toEqual(["✍"]);
+    const sends = harness.mock.calls.filter((call) => /^send(Rich)?Message$/.test(call.method));
+    // The acknowledgement replies to the steering message.
+    expect(sends.at(-1)?.body.reply_parameters).toEqual({
+      message_id: messageIdOf(steer),
+      allow_sending_without_reply: true,
+    });
+  });
+
+  test("an ask gets one reaction at a time; earlier buffered messages are cleared at flush", async () => {
+    const firstPart = telegramUpdate(dm(2016), "first part");
+    const secondPart = telegramUpdate(dm(2016), "second part");
+    await postTelegramUpdate(firstPart);
+    expect(reactionsOn(2016, firstPart)).toEqual(["👀"]);
+    await postTelegramUpdate(secondPart);
+    await flushChatBuffers();
+
+    expect(await chatTasks(2016)).toHaveLength(1);
+    // The task answers the newest message, which keeps 👀; the earlier one is cleared.
+    expect(reactionsOn(2016, secondPart)).toEqual(["👀"]);
+    expect(reactionsOn(2016, firstPart)).toEqual(["👀", ""]);
+
+    const quick = telegramUpdate(dm(2017), "!now ship it");
+    await postTelegramUpdate(quick);
+    expect(reactionsOn(2017, quick)).toEqual(["⚡"]);
+  });
+
+  test("a REACTION_INVALID answer is logged and the ask still becomes a task", async () => {
+    const warn = spyOn(console, "warn");
+    harness.mock.failReactions(1);
+    try {
+      const ask = telegramUpdate(dm(2018), "!now plan the sprint");
+      await postTelegramUpdate(ask);
+      expect(await chatTasks(2018)).toHaveLength(1);
+      expect(reactionsOn(2018, ask)).toHaveLength(1);
+      expect(
+        warn.mock.calls.some((args) => String(args[0]).includes("Could not set the now reaction")),
+      ).toBe(true);
+    } finally {
+      harness.mock.failReactions(0);
+      warn.mockRestore();
+    }
+  });
+
+  test("a mention in a subscribed group gets 👀 before the flush, and the flush does not react again", async () => {
+    await postTelegramUpdate(telegramUpdate(group(-2991), "@swarm_test_bot first ask"));
+    await flushChatBuffers();
+    const ask = telegramUpdate(group(-2991), "@swarm_test_bot second ask");
+    await postTelegramUpdate(ask);
+    expect(reactionsOn(-2991, ask)).toEqual(["👀"]);
+    await flushChatBuffers();
+    expect(await chatTasks(-2991)).toHaveLength(2);
+    expect(reactionsOn(-2991, ask)).toEqual(["👀"]);
+  });
+
+  test("a !now mention in a subscribed group gets ⚡, not 👀", async () => {
+    await postTelegramUpdate(telegramUpdate(group(-2992), "@swarm_test_bot first ask"));
+    await flushChatBuffers();
+    const ask = telegramUpdate(group(-2992), "@swarm_test_bot !now second ask");
+    await postTelegramUpdate(ask);
+    expect(await chatTasks(-2992)).toHaveLength(2);
+    expect(reactionsOn(-2992, ask)).toEqual(["⚡"]);
+  });
+
+  test("two asks back to back each anchor to their own message, not the parent's", async () => {
+    const firstAsk = telegramUpdate(group(-2010), "@swarm_test_bot !now summarize the PR");
+    await postTelegramUpdate(firstAsk);
+    const secondAsk = telegramUpdate(group(-2010), "@swarm_test_bot !now and list the risks");
+    await postTelegramUpdate(secondAsk);
+    await flushChatBuffers();
+
+    const rows = await chatTasks(-2010);
+    expect(rows).toHaveLength(2);
+    const [first, second] = await Promise.all(rows.map((row) => getTaskById(row.id)));
+    const idOf = (update: Record<string, unknown>) =>
+      `-2010:${(update.message as { message_id: number }).message_id}`;
+    expect(first?.mentionMessageId).toBe(idOf(firstAsk));
+    // The second task is a child of the first; `createTask` would copy the
+    // parent's anchor if inbound did not set its own.
+    expect(second?.parentTaskId).toBe(first!.id);
+    expect(second?.mentionMessageId).toBe(idOf(secondAsk));
+    expect(second?.mentionChannelId).toBeTruthy();
   });
 
   test("a Telegram private-chat DM steers too (DMs never reach onSubscribedMessage)", async () => {
@@ -280,6 +404,52 @@ describe("Chat SDK inbound pipeline", () => {
     expect(followUp?.dependsOn).toEqual([first!.id]);
     expect(followUp?.parentTaskId).toBe(first!.id);
     expect(followUp?.task).toContain("include the changelog");
+  });
+
+  test("a deferred wake-up is the thread's chat task: steering, a follow-up dependency and /cancel reach it", async () => {
+    await postTelegramUpdate(telegramUpdate(dm(2040), "check the deploy"));
+    await flushChatBuffers();
+    const [first] = await chatTasks(2040);
+    await completeTask(first!.id, "Deferred.", { deferredAt: new Date().toISOString() });
+    const schedule = await createScheduledTask({
+      name: `deferred-${first!.id.slice(0, 8)}-${crypto.randomUUID()}`,
+      taskTemplate: "Check the deploy and answer.",
+      targetType: "agent-task",
+      scheduleType: "one_time",
+      nextRunAt: new Date().toISOString(),
+      targetAgentId: lead.id,
+      createdByAgentId: lead.id,
+      taskType: "deferred",
+      parentTaskId: first!.id,
+    });
+    const wakeUp = await createStandaloneScheduleTask(schedule);
+    expect(wakeUp.source).toBe("schedule");
+    expect(wakeUp.contextKey).toBe(chatSdkContextKey("telegram:2040"));
+
+    // In progress: a plain message steers the wake-up.
+    await startTask(wakeUp.id);
+    await postTelegramUpdate(telegramUpdate(dm(2040), "use the staging cluster"));
+    await flushChatBuffers();
+    expect(await chatTasks(2040)).toHaveLength(1);
+    expect(await steeringRows(wakeUp.id)).toEqual([
+      { body: "use the staging cluster", source: "chat" },
+    ]);
+
+    // Pending: a new message becomes a follow-up that waits for it.
+    await getDbClient().run("UPDATE agent_tasks SET status = 'pending' WHERE id = ?", [wakeUp.id]);
+    await postTelegramUpdate(telegramUpdate(dm(2040), "and the canary"));
+    await flushChatBuffers();
+    const tasks = await chatTasks(2040);
+    expect(tasks).toHaveLength(2);
+    expect((await getTaskById(tasks[1]!.id))?.dependsOn).toEqual([wakeUp.id]);
+
+    // /cancel stops the follow-up and the wake-up.
+    const cancel = telegramUpdate(dm(2040), "/cancel", {
+      entities: [{ type: "bot_command", offset: 0, length: "/cancel".length }],
+    });
+    await postTelegramUpdate(cancel);
+    expect((await getTaskById(wakeUp.id))?.status).toBe("cancelled");
+    expect((await getTaskById(tasks[1]!.id))?.status).toBe("cancelled");
   });
 
   test("a document attachment becomes a task attachment and a [File: ...] line", async () => {
@@ -451,7 +621,11 @@ describe("Chat SDK requester and group addressing", () => {
     const deferred = await getTaskById(task!.id);
     expect(deferred?.output).toMatch(new RegExp(`at ${madrid}$`));
     expect(deferred?.output).not.toContain("UTC");
-    expect(formatChatRelayText(deferred!)).toBe(deferred!.output!);
+    // The relay posts the placeholder text after the task tag (here the trigger
+    // drops it: a deferral posts nothing).
+    expect(formatChatRelayText(deferred!)).toBe(
+      `${formatChatTaskTag(deferred!)}\n\n${deferred!.output!}`,
+    );
   });
 
   test("an unknown sender gets no requester and lands in the Unmapped tracker", async () => {

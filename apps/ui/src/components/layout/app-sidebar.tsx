@@ -6,7 +6,6 @@ import { useDashboardCosts } from "@/api/hooks/use-costs";
 import { useFeatureGate } from "@/api/hooks/use-feature-gate";
 import { useMetrics } from "@/api/hooks/use-metrics";
 import { useUsers } from "@/api/hooks/use-users";
-import type { UserRole } from "@/api/types";
 import { useStatusContext } from "@/app/status-context";
 import { BookOpenIcon } from "@/components/icons/book-open";
 import { BrainIcon } from "@/components/icons/brain";
@@ -53,6 +52,7 @@ import { modKeyLabel } from "@/lib/approval-shortcuts";
 import { formatCost } from "@/lib/cost-format";
 import { isDemoMode } from "@/lib/deployment-config";
 import { SESSIONS_V2_MIN_VERSION } from "@/lib/sessions-v2";
+import { useIsAdmin } from "@/lib/use-can";
 import { cn, formatCompactNumber } from "@/lib/utils";
 import { CombSidebarPins } from "./comb-sidebar-pins";
 import { SwarmSwitcher } from "./swarm-switcher";
@@ -87,15 +87,15 @@ interface NavItem {
   newTag?: { tooltip: string; minVersion: string };
   /**
    * Runtime switch: the item renders only when the named feature is on.
-   * `comb` reads `/status` `agent_fs.comb.enabled` (COMB_ENABLED + agent-fs).
+   * `comb` reads `/status` `agent_fs.comb.enabled` (agent-fs set up, browser-reachable, COMB_ENABLED not false).
    */
   requires?: "comb";
   /**
-   * Declarative minimum role required to see this item. Purely a type-level
-   * annotation for future RBAC: render logic does NOT consult it today, so
-   * every item stays visible to everyone. See plan Phase 1 / Appendix.
+   * Hidden unless the caller holds a grants-all role (`useIsAdmin()`). The
+   * server still gates the routes; this only drops links a Requester or a
+   * Viewer could not use. Unknown grants (operator key, older API) show it.
    */
-  minRole?: UserRole;
+  adminOnly?: boolean;
 }
 
 interface NavGroup {
@@ -111,6 +111,8 @@ interface FlyoutEntry {
   path: string;
   /** Match the path exactly (index routes) rather than by prefix. */
   end?: boolean;
+  /** Hidden unless `useIsAdmin()`; see `NavItem.adminOnly`. */
+  adminOnly?: boolean;
 }
 
 /** Footer destination: optionally carrying a hover flyout of sub-routes. */
@@ -141,12 +143,11 @@ const navGroups: NavGroup[] = [
         icon: GlobeIcon,
         gate: { minVersion: "1.79.0" },
       },
-      { title: "Apps", path: "/apps", icon: LayoutGridIcon },
+      { title: "Apps", path: "/apps", icon: LayoutGridIcon, adminOnly: true },
       {
-        title: "Comb",
+        title: "Files",
         path: "/file",
         icon: FolderOpenIcon,
-        beta: { tooltip: "Review agent-fs files with the swarm" },
         requires: "comb",
       },
       { title: "Approvals", path: "/approval-requests", icon: ClipboardCheckIcon },
@@ -157,21 +158,27 @@ const navGroups: NavGroup[] = [
     label: "SWARM",
     items: [
       { title: "Agents", path: "/agents", icon: UsersIcon },
-      { title: "People", path: "/people", icon: ContactIcon, gate: { minVersion: "1.80.0" } },
-      { title: "Workflows", path: "/workflows", icon: WorkflowIcon },
-      { title: "Scripts", path: "/scripts", icon: FileClockIcon },
-      { title: "Schedules", path: "/schedules", icon: ClockIcon },
+      {
+        title: "People",
+        path: "/people",
+        icon: ContactIcon,
+        gate: { minVersion: "1.80.0" },
+        adminOnly: true,
+      },
+      { title: "Workflows", path: "/workflows", icon: WorkflowIcon, adminOnly: true },
+      { title: "Scripts", path: "/scripts", icon: FileClockIcon, adminOnly: true },
+      { title: "Schedules", path: "/schedules", icon: ClockIcon, adminOnly: true },
     ],
   },
   {
     id: "resources",
     label: "RESOURCES",
     items: [
-      { title: "Skills", path: "/skills", icon: BookOpenIcon },
-      { title: "MCP Servers", path: "/mcp-servers", icon: CableIcon },
-      { title: "Connections", path: "/connections", icon: Link2Icon },
-      { title: "Memory", path: "/memory", icon: BrainIcon },
-      { title: "Templates", path: "/templates", icon: FileTextIcon },
+      { title: "Skills", path: "/skills", icon: BookOpenIcon, adminOnly: true },
+      { title: "MCP Servers", path: "/mcp-servers", icon: CableIcon, adminOnly: true },
+      { title: "Connections", path: "/connections", icon: Link2Icon, adminOnly: true },
+      { title: "Memory", path: "/memory", icon: BrainIcon, adminOnly: true },
+      { title: "Templates", path: "/templates", icon: FileTextIcon, adminOnly: true },
     ],
   },
 ];
@@ -191,19 +198,20 @@ const footerNav: FooterItem[] = [
     flyout: [
       { title: "Connections", path: "/settings/connections" },
       { title: "Appearance", path: "/settings/appearance" },
-      { title: "Secrets", path: "/settings/secrets" },
-      { title: "API Keys", path: "/settings/api-keys" },
-      { title: "Integrations", path: "/settings/integrations" },
-      { title: "Configuration", path: "/settings/configuration" },
-      { title: "Extensions", path: "/settings/extensions" },
-      { title: "Repos", path: "/settings/repos" },
-      { title: "Debug", path: "/settings/debug" },
+      { title: "Secrets", path: "/settings/secrets", adminOnly: true },
+      { title: "Provider keys", path: "/settings/api-keys", adminOnly: true },
+      { title: "Integrations", path: "/settings/integrations", adminOnly: true },
+      { title: "Configuration", path: "/settings/configuration", adminOnly: true },
+      { title: "Extensions", path: "/settings/extensions", adminOnly: true },
+      { title: "Repos", path: "/settings/repos", adminOnly: true },
+      { title: "Debug", path: "/settings/debug", adminOnly: true },
     ],
   },
   {
     title: "Usage",
     path: "/usage",
     icon: ChartColumnIcon,
+    adminOnly: true,
     flyout: [
       { title: "Usage", path: "/usage", end: true },
       { title: "Budgets", path: "/usage/budgets" },
@@ -361,12 +369,113 @@ const TOGGLE_KEY = SIDEBAR_KEYBOARD_SHORTCUT.toUpperCase();
 const TOGGLE_ARIA_KEYS = `Meta+${TOGGLE_KEY} Control+${TOGGLE_KEY}`;
 const TOGGLE_HINT = modKeyLabel() === "⌘" ? `⌘${TOGGLE_KEY}` : `Ctrl+${TOGGLE_KEY}`;
 
-function SidebarLogo({ src, alt, className }: { src: string; alt: string; className?: string }) {
+interface TrimmedLogo {
+  src: string;
+  /** The content is much wider than tall (a wordmark). */
+  wide: boolean;
+}
+
+const trimmedLogos = new Map<string, Promise<TrimmedLogo | null>>();
+
+/** Larger images are not scanned. */
+const TRIM_MAX_PIXELS = 1024 * 1024;
+
+/**
+ * The logo with its transparent padding cut off. The website logo proxy can
+ * return a wordmark centered in a padded square (desplega.ai), which shows as
+ * a thin line in a 32 px slot. Null when nothing needs a cut, or when the
+ * pixels cannot be read (the image host sends no CORS header): the logo then
+ * shows as it is.
+ */
+function trimLogo(src: string): Promise<TrimmedLogo | null> {
+  let pending = trimmedLogos.get(src);
+  if (!pending) {
+    pending = new Promise((resolve) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => resolve(cropPadding(img));
+      img.onerror = () => resolve(null);
+      img.src = src;
+    });
+    trimmedLogos.set(src, pending);
+  }
+  return pending;
+}
+
+function cropPadding(img: HTMLImageElement): TrimmedLogo | null {
+  const { naturalWidth: w, naturalHeight: h } = img;
+  if (!w || !h || w * h > TRIM_MAX_PIXELS) return null;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.drawImage(img, 0, 0);
+  let pixels: Uint8ClampedArray;
+  try {
+    pixels = ctx.getImageData(0, 0, w, h).data;
+  } catch {
+    return null; // A cross-origin image without CORS taints the canvas.
+  }
+  let [left, top, right, bottom] = [w, h, -1, -1];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (pixels[(y * w + x) * 4 + 3] <= 8) continue; // Transparent.
+      left = Math.min(left, x);
+      right = Math.max(right, x);
+      top = Math.min(top, y);
+      bottom = Math.max(bottom, y);
+    }
+  }
+  if (right < 0) return null;
+  const cw = right - left + 1;
+  const ch = bottom - top + 1;
+  if (cw > w * 0.9 && ch > h * 0.9) return null;
+  canvas.width = cw;
+  canvas.height = ch;
+  ctx.drawImage(img, left, top, cw, ch, 0, 0, cw, ch);
+  return { src: canvas.toDataURL("image/png"), wide: cw > ch * 1.5 };
+}
+
+function useTrimmedLogo(src: string): TrimmedLogo | null {
+  const [trimmed, setTrimmed] = useState<{ from: string; logo: TrimmedLogo | null } | null>(null);
+  useEffect(() => {
+    let current = true;
+    void trimLogo(src).then((logo) => {
+      if (current) setTrimmed({ from: src, logo });
+    });
+    return () => {
+      current = false;
+    };
+  }, [src]);
+  return trimmed?.from === src ? trimmed.logo : null;
+}
+
+function SidebarLogo({
+  src,
+  alt,
+  className,
+  allowWide = false,
+}: {
+  src: string;
+  alt: string;
+  className?: string;
+  /**
+   * A wordmark may grow wider than the square slot (the expanded row).
+   * Otherwise the square shows its left end, where most wordmarks put their mark.
+   */
+  allowWide?: boolean;
+}) {
+  const trimmed = useTrimmedLogo(src);
   return (
     <img
-      src={src}
+      src={trimmed?.src ?? src}
       alt={alt}
-      className={cn("h-8 w-8 min-h-[32px] min-w-[32px] shrink-0 rounded object-contain", className)}
+      className={cn(
+        "h-8 w-8 min-h-[32px] min-w-[32px] shrink-0 rounded object-contain",
+        trimmed?.wide && (allowWide ? "w-auto max-w-24" : "object-cover object-left"),
+        className,
+      )}
       onError={(e) => {
         // Fall back to bundled logo if the configured logo URL fails.
         const img = e.currentTarget;
@@ -429,7 +538,7 @@ function SidebarBrandRow({
         to="/"
         className="flex min-w-0 flex-1 items-center gap-2 group-data-[collapsible=icon]:hidden"
       >
-        <SidebarLogo src={logo} alt={`${name} logo`} />
+        <SidebarLogo src={logo} alt={`${name} logo`} allowWide />
         <span
           className="text-lg font-semibold tracking-tight text-sidebar-foreground truncate"
           style={brandColor ? { color: brandColor } : undefined}
@@ -494,8 +603,10 @@ export function AppSidebar() {
     "1.82.0": useFeatureGate("1.82.0"), // Live nav-item counts
     [SESSIONS_V2_MIN_VERSION]: useFeatureGate(SESSIONS_V2_MIN_VERSION), // Sessions "NEW" tag
   };
+  const isAdmin = useIsAdmin();
   const isGated = (item: NavItem) =>
-    !!item.gate && gates[item.gate.minVersion]?.supported === false;
+    (!!item.gate && gates[item.gate.minVersion]?.supported === false) ||
+    (!!item.adminOnly && !isAdmin);
   const isHidden = (item: NavItem) =>
     isGated(item) || !navRequirementMet(item.requires, status?.agent_fs?.comb);
 
@@ -547,7 +658,8 @@ export function AppSidebar() {
 
       <SidebarContent>
         {navGroups.map((group) => {
-          const items = group.items;
+          // A Viewer has no RESOURCES items: drop the empty section header too.
+          const items = group.items.filter((item) => !isHidden(item));
           if (items.length === 0) return null;
           return (
             <SidebarGroup key={group.id}>
@@ -626,10 +738,11 @@ export function AppSidebar() {
         <SidebarMenu>
           {footerNav.map((item) => {
             if (isGated(item)) return null;
+            const flyout = item.flyout?.filter((entry) => isAdmin || !entry.adminOnly);
             return (
               <FooterNavItem
                 key={item.path}
-                item={item}
+                item={{ ...item, flyout }}
                 isActive={location.pathname.startsWith(item.path)}
                 badge={badges[item.path]}
               />

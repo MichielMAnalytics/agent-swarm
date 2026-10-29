@@ -1,11 +1,12 @@
 import { Check, CircleCheck, CircleX } from "lucide-react";
 import { type ReactNode, useEffect, useRef } from "react";
-import type { ApprovalQuestion } from "@/api/types";
+import type { ApprovalConfigState, ApprovalQuestion } from "@/api/types";
 import { Input } from "@/components/ui/input";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { WRAP } from "./answer-view";
+import { ConfigQuestionField } from "./config-question-field";
 import { KeyHint, MOD } from "./keyboard";
 
 type Options = NonNullable<ApprovalQuestion["options"]>;
@@ -34,7 +35,7 @@ export function optionValues(question: ApprovalQuestion): string[] {
  * the control itself only knows the amber pill. Each radio gets its
  * `aria-keyshortcuts` after render (the control does not forward props).
  */
-function DecisionSegments<T extends string>({
+export function DecisionSegments<T extends string>({
   value,
   onValueChange,
   options,
@@ -79,7 +80,7 @@ function DecisionSegments<T extends string>({
   );
 }
 
-function SegmentLabel({
+export function SegmentLabel({
   icon,
   text,
   keyName,
@@ -105,8 +106,12 @@ function SegmentLabel({
   );
 }
 
-/** Option chips (few, short) or option rows (with descriptions), single or multi. */
-function OptionChoices({
+/**
+ * Option chips (few, short) or option rows (with descriptions), single or
+ * multi. `layout="grid"` puts many short options (no descriptions) in a
+ * compact grid of equal tiles instead of full-width rows.
+ */
+export function OptionChoices({
   question,
   options,
   selected,
@@ -115,6 +120,7 @@ function OptionChoices({
   cursor,
   showKeys,
   disabled,
+  layout = "auto",
 }: {
   question: ApprovalQuestion;
   options: Options;
@@ -124,14 +130,23 @@ function OptionChoices({
   cursor: number;
   showKeys: boolean;
   disabled: boolean;
+  layout?: "auto" | "grid";
 }) {
-  const rows = options.some((option) => option.description) || options.length > 8;
+  const described = options.some((option) => option.description);
+  const grid = layout === "grid" && !described;
+  const rows = !grid && (described || options.length > 8);
   return (
     <div
       {...(multi
         ? { role: "group", "aria-label": question.label }
         : { role: "radiogroup", "aria-label": question.label })}
-      className={cn(rows ? "flex flex-col gap-1.5" : "flex flex-wrap gap-2")}
+      className={cn(
+        grid
+          ? "grid grid-cols-2 gap-2 sm:grid-cols-3"
+          : rows
+            ? "flex flex-col gap-1.5"
+            : "flex flex-wrap gap-2",
+      )}
     >
       {options.map((option, index) => {
         const isSelected = selected.includes(option.value);
@@ -150,8 +165,8 @@ function OptionChoices({
             className={cn(
               "group/opt relative flex items-center gap-2 border text-left text-sm transition-[background-color,border-color,color,box-shadow,scale] duration-150 ease-snappy outline-none",
               "focus-visible:ring-2 focus-visible:ring-ring/60 disabled:opacity-50 active:scale-[0.96] motion-reduce:active:scale-100",
-              rows
-                ? "min-h-11 w-full rounded-lg px-3 py-2 sm:min-h-10"
+              rows || grid
+                ? "min-h-11 w-full min-w-0 rounded-lg px-3 py-2 sm:min-h-10"
                 : "min-h-11 rounded-full px-3.5 py-1.5 sm:min-h-8",
               isSelected
                 ? "border-primary/60 bg-primary/10 text-foreground"
@@ -195,10 +210,13 @@ export function QuestionField({
   cursor,
   showKeys,
   onSubmitShortcut,
+  configState,
 }: {
   question: ApprovalQuestion;
   value: unknown;
   onChange: (value: unknown) => void;
+  /** Live state of a config question's key (from `request.configState`). */
+  configState?: ApprovalConfigState;
   disabled: boolean;
   /** Multi-select highlight for Space (−1: none). */
   cursor: number;
@@ -380,6 +398,19 @@ export function QuestionField({
         </div>
       );
     }
+
+    case "config":
+      return (
+        <ConfigQuestionField
+          question={question}
+          state={configState}
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+          showKeys={showKeys}
+          onSubmitShortcut={onSubmitShortcut}
+        />
+      );
 
     default:
       return <span className="text-sm text-muted-foreground">Unsupported question type</span>;

@@ -37,6 +37,10 @@ export const PERMISSIONS = {
     description: "Mint, rotate, or revoke an agent-bound worker token.",
     namespace: "agent",
   },
+  "user.role.manage": {
+    description: "Assign or remove a person's RBAC roles.",
+    namespace: "user",
+  },
   "task.cancel.any": {
     description: "Cancel any task (beyond tasks the caller created).",
     namespace: "task",
@@ -310,6 +314,10 @@ export const PERMISSIONS = {
     description: "Use dashboard presence rooms for Comb drives.",
     namespace: "comb",
   },
+  "fs.join.own": {
+    description: "Join the swarm's shared agent-fs drive with your own account email.",
+    namespace: "fs",
+  },
   "page.delete.any": {
     description: "Delete a page the caller does not own.",
     namespace: "page",
@@ -353,6 +361,10 @@ export const PERMISSIONS = {
   "script.api.delete": {
     description: "Delete an external script API endpoint.",
     namespace: "script",
+  },
+  "schedule.deferral.update.any": {
+    description: "Change a defer-task schedule the caller did not create.",
+    namespace: "schedule",
   },
   "runtime_pool.write": {
     description: "Create, update, or delete runtime pools (image, provider kind, placement).",

@@ -7,7 +7,9 @@ import {
   getChatSdkStatus,
   registerTelegramWebhook,
 } from "../integrations/chat-sdk/status";
+import { getSlackAppIconUrl } from "../slack/app-icon";
 import { buildSlackManifest } from "../slack/manifest";
+import { selectCredential } from "../utils/credentials";
 import { ensureHttpPermission } from "./config";
 import { resolveConfigValue, resolveMcpBaseUrl } from "./config-values";
 import { route } from "./route-def";
@@ -116,6 +118,20 @@ const slackManifestRoute = route({
   },
 });
 
+const slackAppIconRoute = route({
+  method: "get",
+  path: "/api/integrations/slack/app-icon",
+  pattern: ["api", "integrations", "slack", "app-icon"],
+  summary: "The Slack app's own avatar, shown on posts with no icon override",
+  tags: ["Integrations"],
+  responses: {
+    200: {
+      description: "`imageUrl` is null when Slack is off or the lookup fails.",
+      schema: z.object({ imageUrl: z.string().nullable() }),
+    },
+  },
+});
+
 const chatSdkStatusRoute = route({
   method: "get",
   path: "/api/integrations/chat/status",
@@ -175,6 +191,11 @@ export function createIntegrationsHandler(deps: TestConnectionDeps = {}) {
       return true;
     }
 
+    if (slackAppIconRoute.match(req.method, pathSegments)) {
+      slackAppIconRoute.respond(res, 200, { imageUrl: await getSlackAppIconUrl() });
+      return true;
+    }
+
     if (chatSdkStatusRoute.match(req.method, pathSegments)) {
       chatSdkStatusRoute.respond(res, 200, await getChatSdkStatus());
       return true;
@@ -231,7 +252,10 @@ export function createIntegrationsHandler(deps: TestConnectionDeps = {}) {
       }
 
       try {
-        const client = buildClient(apiKey);
+        // A comma pool is one key per call, as the runner does.
+        const client = buildClient(
+          selectCredential(apiKey, undefined, "ANTHROPIC_API_KEY").selected,
+        );
         const agent = await client.beta.agents.retrieve(agentId);
         // `agent.model` is `BetaManagedAgentsModelConfig` ({id, speed}). Flatten
         // to a string so the UI can render it directly without type guards.

@@ -335,6 +335,16 @@ export function isTerminalTaskStatus(status: string): status is TerminalTaskStat
   return (TERMINAL_TASK_STATUSES as readonly string[]).includes(status);
 }
 
+/**
+ * Every status that is not terminal, derived so a new status lands here unless
+ * it is added to `TERMINAL_TASK_STATUSES`. Open tasks are a handful of rows,
+ * so hot queries filter `status IN (open)` (an index seek) rather than
+ * `status NOT IN (terminal)` (a scan of every finished task).
+ */
+export const OPEN_TASK_STATUSES = AgentTaskStatusSchema.options.filter(
+  (status) => !isTerminalTaskStatus(status),
+) as Exclude<AgentTaskStatus, TerminalTaskStatus>[];
+
 // ============================================================================
 // Lead Inbox Types
 // ============================================================================
@@ -1076,6 +1086,22 @@ export const UserSchema = z
 
 export type User = z.infer<typeof UserSchema>;
 
+export const RbacRoleSchema = z
+  .object({
+    id: z.string(),
+    name: z.string(),
+    description: z.string().nullable(),
+    isBuiltin: z.boolean(),
+    grantsAll: z.boolean(),
+    primary: z.boolean(),
+    verbs: z.array(z.string()),
+  })
+  .openapi("RbacRole");
+
+export const UserRbacRolesSchema = z
+  .object({ userId: z.string(), roles: z.array(RbacRoleSchema) })
+  .openapi("UserRbacRoles");
+
 /**
  * Structured communication preferences read from `users.metadata.comms`.
  * All fields are free-form strings; values render verbatim into the requester
@@ -1232,6 +1258,37 @@ export const AgentAvatarSchema = z.discriminatedUnion("type", [
 ]);
 export type AgentAvatar = z.infer<typeof AgentAvatarSchema>;
 
+// Separate from `avatar` so an agent can keep its lucide disc and still post
+// to Slack with its own emoji or image.
+export const AgentSlackIconSchema = z
+  .discriminatedUnion("type", [
+    z.object({
+      type: z.literal("emoji"),
+      emoji: z
+        .string()
+        .max(102)
+        .regex(/^:[a-z0-9_+'-]+:$/),
+    }),
+    z.object({
+      type: z.literal("url"),
+      url: z
+        .url({ protocol: /^https$/ })
+        .max(2048)
+        .refine((value) => {
+          try {
+            const parsed = new URL(value);
+            return !parsed.username && !parsed.password;
+          } catch {
+            return false;
+          }
+        }, "URL must be valid and contain no credentials"),
+    }),
+    // No icon override: Slack shows the app's own avatar.
+    z.object({ type: z.literal("app") }),
+  ])
+  .openapi("AgentSlackIcon");
+export type AgentSlackIcon = z.infer<typeof AgentSlackIconSchema>;
+
 export const AgentSchema = z
   .object({
     // Plain string, NOT .uuid(): agents may join with custom IDs (AGENT_ID env /
@@ -1305,6 +1362,12 @@ export const AgentSchema = z
       .nullable()
       .optional(),
 
+    // Null/missing = the default emoji (getAgentEmoji).
+    slackIcon: z
+      .lazy(() => AgentSlackIconSchema)
+      .nullable()
+      .optional(),
+
     // No function defaults — see AgentTaskSchema's timestamp comment
     // (OpenAPI-generation reproducibility).
     createdAt: z.iso.datetime(),
@@ -1325,12 +1388,27 @@ export const AgentSchema = z
 //
 // The cache-hit post-task path does NOT produce a new report; the row's
 // `reportedAt` deliberately stays at the last actual check.
+/** One pool member's live test. `suffix` is its last 5 chars, as in `api_key_status`. */
+export const AgentCredStatusKeyResultSchema = z
+  .object({
+    keyType: z.string(),
+    index: z.number(),
+    suffix: z.string(),
+    ok: z.boolean(),
+    error: z.string().optional(),
+    httpStatus: z.number().optional(),
+    latency_ms: z.number(),
+  })
+  .openapi("AgentCredStatusKeyResult");
+
 export const AgentCredStatusLiveTestSchema = z
   .object({
     ok: z.boolean(),
     error: z.string().nullable().default(null),
     latency_ms: z.number(),
     testedAt: z.number(), // unix ms
+    warning: z.string().optional(),
+    keys: z.array(AgentCredStatusKeyResultSchema).optional(),
   })
   .openapi("AgentCredStatusLiveTest");
 export type AgentCredStatusLiveTest = z.infer<typeof AgentCredStatusLiveTestSchema>;
@@ -2251,7 +2329,14 @@ export const ExecutorMetaSchema = z
     inputCtx: z.record(z.string(), z.unknown()).optional(),
   })
   .openapi("ExecutorMeta");
-export type ExecutorMeta = z.infer<typeof ExecutorMetaSchema>;
+export type ExecutorMeta = z.infer<typeof ExecutorMetaSchema> & {
+  /**
+   * Aborted when the step's watchdog budget runs out (`startStepDeadline`).
+   * Runtime-only, never serialized. An executor with a long or one-shot side
+   * effect should forward it so a timed-out step stops instead of finishing.
+   */
+  signal?: AbortSignal;
+};
 
 // --- Validation ---
 
@@ -2942,6 +3027,13 @@ export const WorkflowRunSchema = z
     finishedAt: z.string().optional(),
     /** The `sub-workflow` step that started this run. Unset on a top-level run. */
     parentStepId: z.string().optional(),
+    /**
+     * The parent step's attempt (its `retryCount`) that started this run. A
+     * step has at most one child per attempt, so `(parentStepId,
+     * parentStepAttempt)` identifies the invocation; a node `retry` adds a
+     * child with the next attempt. Unset on a top-level run.
+     */
+    parentStepAttempt: z.number().int().min(0).optional(),
   })
   .openapi("WorkflowRun");
 
@@ -3067,6 +3159,15 @@ export const WorkflowRunStepSchema = z
   .openapi("WorkflowRunStep");
 export type WorkflowRunStep = z.infer<typeof WorkflowRunStepSchema>;
 
+/**
+ * Step of `GET /api/workflow-runs/{id}?fields=slim`: no `input`, the context
+ * snapshot taken when the step started. Loops repeat it once per iteration.
+ */
+export const WorkflowRunStepSlimSchema = WorkflowRunStepSchema.omit({ input: true }).openapi(
+  "WorkflowRunStepSlim",
+);
+export type WorkflowRunStepSlim = z.infer<typeof WorkflowRunStepSlimSchema>;
+
 // --- Wait State (workflow `wait` node side table) ---
 
 export const WaitModeSchema = z.enum(["time", "event"]);
@@ -3156,6 +3257,9 @@ export type ScriptScope = z.infer<typeof ScriptScopeSchema>;
 export const ScriptFsModeSchema = z.enum(["none", "workspace-rw"]);
 export type ScriptFsMode = z.infer<typeof ScriptFsModeSchema>;
 
+export const ScriptExecutorNameSchema = z.enum(["native", "quickjs"]);
+export type ScriptExecutorName = z.infer<typeof ScriptExecutorNameSchema>;
+
 export const ScriptRecordSchema = z
   .object({
     id: z.string(),
@@ -3172,6 +3276,7 @@ export const ScriptRecordSchema = z
     isScratch: z.boolean(),
     typeChecked: z.boolean(),
     fsMode: ScriptFsModeSchema,
+    executor: ScriptExecutorNameSchema.nullable().default(null),
     createdByAgentId: z.string().nullable(),
     createdAt: z.string(),
     updatedAt: z.string(),

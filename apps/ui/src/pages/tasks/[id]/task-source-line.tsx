@@ -1,22 +1,10 @@
-import {
-  Bot,
-  CalendarClock,
-  CircleDot,
-  Code,
-  Cog,
-  type LucideIcon,
-  Mail,
-  MessageSquare,
-  MessagesSquare,
-  Monitor,
-  Workflow,
-} from "lucide-react";
 import { Fragment, type ReactNode, useId, useMemo } from "react";
 import { Link } from "react-router-dom";
 import type { AgentTask } from "@/api/types";
-import { BrandLogo } from "@/components/shared/brand-logo";
 import { CopyValueButton } from "@/components/shared/copy-value-button";
 import { MarkdownView } from "@/components/shared/markdown-view";
+import { PromptContext } from "@/components/shared/prompt-context";
+import { TaskSourceMark, taskSourceLabel } from "@/components/shared/task-source-mark";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -27,32 +15,10 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { parsePromptDisplay } from "@/lib/prompt-display";
 import { formatSlackMentions, parseSlackPrompt, type SlackPrompt } from "@/lib/slack-text";
 import { cn } from "@/lib/utils";
 import { NARROW_INLINE_TARGET, NARROW_TARGET } from "./touch-targets";
-
-const TASK_SOURCE_LABELS: Record<string, string> = {
-  agentmail: "Email",
-  api: "API",
-  bitbucket: "Bitbucket",
-  chat: "Chat",
-  comb: "Comb",
-  github: "GitHub",
-  gitlab: "GitLab",
-  jira: "Jira",
-  linear: "Linear",
-  mcp: "MCP",
-  schedule: "Schedule",
-  slack: "Slack",
-  system: "System",
-  ui: "Dashboard",
-  workflow: "Workflow",
-};
-
-/** Where a task came from, as people say it ("Slack", "GitHub", "Dashboard"). */
-export function taskSourceLabel(source: string): string {
-  return TASK_SOURCE_LABELS[source] ?? source.charAt(0).toUpperCase() + source.slice(1);
-}
 
 type SourceTask = Pick<
   AgentTask,
@@ -67,29 +33,6 @@ type SourceTask = Pick<
   | "vcsEventType"
 >;
 
-/** Monochrome marks in `public/integration-logos/`. */
-const SOURCE_LOGOS: Record<string, string> = {
-  slack: "/integration-logos/slack.svg",
-  github: "/integration-logos/github.svg",
-  gitlab: "/integration-logos/gitlab.svg",
-  bitbucket: "/integration-logos/bitbucket.svg",
-  linear: "/integration-logos/linear.svg",
-  jira: "/integration-logos/jira.svg",
-};
-
-/** Icons for the sources that have no brand mark. */
-const SOURCE_ICONS: Record<string, LucideIcon> = {
-  agentmail: Mail,
-  api: Code,
-  chat: MessageSquare,
-  comb: MessagesSquare,
-  mcp: Bot,
-  schedule: CalendarClock,
-  system: Cog,
-  ui: Monitor,
-  workflow: Workflow,
-};
-
 const LINK_CLASS = "text-primary hover:underline";
 /** A short link in the line: 44 px tall in the narrow layout. */
 const TARGET_LINK_CLASS = cn(LINK_CLASS, NARROW_INLINE_TARGET);
@@ -100,13 +43,6 @@ const TARGET_LINK_CLASS = cn(LINK_CLASS, NARROW_INLINE_TARGET);
  */
 function Who({ children }: { children: ReactNode }) {
   return <span className="min-w-0 truncate font-medium text-foreground">{children}</span>;
-}
-
-function SourceMark({ source }: { source: string }) {
-  const logo = SOURCE_LOGOS[source];
-  if (logo) return <BrandLogo src={logo} className="size-3.5" />;
-  const Icon = SOURCE_ICONS[source] ?? CircleDot;
-  return <Icon aria-hidden className="size-3.5 shrink-0" />;
 }
 
 /** "PR", "MR" or "Issue" for a VCS event type. Empty when unknown. */
@@ -317,8 +253,15 @@ function TaskPromptDialog({
 }) {
   const threadHeadingId = useId();
   const askHeadingId = useId();
-  // A prompt that is only a thread block has no ask: show the whole prompt.
-  const ask = formatSlackMentions(prompt.ask).trim() || formatSlackMentions(task.task).trim();
+  // The thread renders below from `prompt`; the other wrapper blocks and markers
+  // render above the ask.
+  const display = parsePromptDisplay(task.task);
+  const context = {
+    meta: display.meta,
+    sections: display.sections.filter((s) => s.tag !== "thread_context"),
+  };
+  // A prompt that is only wrapper blocks has no ask: show the whole prompt.
+  const ask = display.ask || formatSlackMentions(task.task).trim();
   const hasThread = prompt.thread.length > 0;
   return (
     <Dialog>
@@ -362,6 +305,7 @@ function TaskPromptDialog({
               </ol>
             </section>
           ) : null}
+          <PromptContext display={context} />
           <section aria-labelledby={hasThread ? askHeadingId : undefined} className="space-y-2">
             {hasThread ? (
               <h3 id={askHeadingId} className="text-xs font-medium text-muted-foreground">
@@ -429,7 +373,7 @@ export function TaskSourceLine({
       <span
         className={cn("inline-flex items-center gap-1.5", view.shrinks ? "min-w-0" : "shrink-0")}
       >
-        <SourceMark source={source} />
+        <TaskSourceMark source={source} />
         {view.named ? null : <span className="sr-only">{label}: </span>}
         {view.lead}
       </span>

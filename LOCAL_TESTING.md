@@ -180,7 +180,7 @@ Amp needs `AMP_API_KEY` and a preinstalled `amp` executable (`AMP_BINARY`), and 
 Grok needs `XAI_API_KEY` and a preinstalled `grok` executable (`GROK_BINARY`), and defaults to `grok-build-0.1`, xAI's cheapest model. `E2E_MODEL_GROK=openrouter/deepseek/deepseek-v4.1-flash` runs it on `OPENROUTER_API_KEY` instead.
 Acp runs `HARNESS_PROVIDER=acp` with `ACP_TARGET=opencode`, needs a preinstalled `opencode` executable plus the opencode credentials, defaults to `openrouter/deepseek/deepseek-v4-flash`, and requires a cost record with input and output tokens. The nightly workflow has no acp leg.
 Dsh defaults to `openrouter/deepseek/deepseek-v4.1-flash` and needs `OPENROUTER_API_KEY`.
-Provision `npm install --global @deepseek-ai/dsh@0.2.1-rc.2` first, then run
+Provision `npm install --global @deepseek-ai/dsh@0.2.2-alpha.2` first, then run
 `DSH_BINARY=$(command -v dsh) bun run e2e --only health --harness dsh`.
 A native `E2E_MODEL_DSH=deepseek-flash` override instead requires `DEEPSEEK_API_KEY`.
 The nightly dsh leg installs that pin explicitly because its slim image omits dsh.
@@ -189,7 +189,8 @@ Amp defaults to its cheapest mode, `low`, and needs `AMP_API_KEY` plus an `amp` 
 thread on ampcode.com and costs about a cent. The nightly workflow has no amp leg.
 Create a Codex blob with `bun scripts/e2e/codex-oauth-blob.ts /path/to/.codex/auth.json | gh secret set E2E_CODEX_OAUTH`.
 Use a dedicated Codex login for that blob. CI refresh rotates the token and can break a main login.
-The blob goes stale after its first refresh, about ten days after issue.
+The CLI rotates the refresh token on every refresh, so the blob alone survives one refresh, about ten days after issue.
+The nightly carries the rotated auth.json between main runs in the Actions cache (`E2E_CODEX_AUTH_STATE`, sealed under the secret), so reseed only when the chain breaks.
 Set `E2E_HARNESS_TIMEOUT_MS` to change the five-minute harness timeout.
 
 The same command runs locally, in GitHub Actions, and inside a swarm worker container.
@@ -498,8 +499,8 @@ agent-fs write qa/agent-swarm/$(date +%F)-<topic>/ui-tasks-1.5x.mp4 --file /tmp/
 |---|---|
 | Image or GIF | GitHub user attachment. Fallback only when the token is a GitHub App token: `agent-fs signed-url <path> --inline --json` (expires in 7 days) |
 | Video (mp4) | GitHub user attachment on its own line, else an `agent-fs share-create` link. Never a presigned link |
-| Doc (plan, research, report) | `agent-fs share-create <path> --expires-in 604800` |
-| Durable `live.agent-fs.dev` path, swarm task links | Only under `## Swarm provenance` |
+| Doc (plan, research, report) | The live app link `${AGENT_FS_LIVE_URL}/file/~/<org>/<drive>/<path>`, under `## Swarm provenance`. `agent-fs share-create <path> --expires-in 604800` only when the requester asks for one or a reader has no agent-fs login |
+| `live.agent-fs.dev` links, swarm task links | Only under `## Swarm provenance` |
 
 **PR requirement**: any PR touching `apps/ui/` or `apps/templates-ui/` must fill `## Before / after` with `agent-browser` screenshots of the change running locally: a before (main) and after table of `![caption](<attachment-url>)`. Interaction/flow changes (navigation, form, modal, drag, animation, or multi-step flow) also need a recording, as an attachment mp4 on its own line. The PR Body check requires the section for those paths; the media itself is a reviewer convention.
 

@@ -85,7 +85,9 @@ describe("validateRoute", () => {
       [500, "failed"],
     ] as const) {
       stubFetch(status);
-      expect((await validateRoute(route(GATEWAY), GATEWAY)).status).toBe(expected);
+      const result = await validateRoute(route(GATEWAY), GATEWAY);
+      expect(result.status).toBe(expected);
+      if (result.status === "failed") expect(result.httpStatus).toBe(status);
     }
   });
 
@@ -104,11 +106,56 @@ describe("validateRoute", () => {
     expect(calls[0]?.url).toBe("https://api.anthropic.com/v1/models");
   });
 
-  test("subscription: presence only, no network", async () => {
+  test("subscription: GET /api/oauth/profile with the token as bearer", async () => {
     const env = { CLAUDE_CODE_OAUTH_TOKEN: "oauth" };
-    const { calls } = stubFetch(500);
-    expect((await validateRoute(route(env), env)).status).toBe("verified");
-    expect(calls).toEqual([]);
+    const { calls } = stubFetch(200);
+    expect(await validateRoute(route(env), env)).toEqual({ status: "verified" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe("https://api.anthropic.com/api/oauth/profile");
+    expect(calls[0]?.headers.Authorization).toBe("Bearer oauth");
+  });
+
+  test("subscription: a setup token's 403 permission_error is verified", async () => {
+    const env = { CLAUDE_CODE_OAUTH_TOKEN: "oauth" };
+    stubFetch(
+      403,
+      JSON.stringify({
+        type: "error",
+        error: {
+          type: "permission_error",
+          message: "OAuth token does not meet scope requirement any_of(user:profile, user:office)",
+        },
+      }),
+    );
+    expect(await validateRoute(route(env), env)).toEqual({ status: "verified" });
+  });
+
+  test("subscription: a 429 or 5xx is not tested, not failed", async () => {
+    const env = { CLAUDE_CODE_OAUTH_TOKEN: "oauth" };
+    for (const status of [429, 503]) {
+      stubFetch(status);
+      expect((await validateRoute(route(env), env)).status).toBe("configured");
+    }
+  });
+
+  test("subscription: 401 and other 403s fail with the HTTP status", async () => {
+    const env = { CLAUDE_CODE_OAUTH_TOKEN: "oauth" };
+    stubFetch(
+      401,
+      JSON.stringify({
+        type: "error",
+        error: { type: "authentication_error", message: "OAuth access token is invalid." },
+      }),
+    );
+    const rejected = await validateRoute(route(env), env);
+    expect(rejected).toMatchObject({ status: "failed", httpStatus: 401 });
+    expect(rejected.status === "failed" && rejected.reason).toContain("claude setup-token");
+
+    stubFetch(403, JSON.stringify({ type: "error", error: { type: "forbidden" } }));
+    expect(await validateRoute(route(env), env)).toMatchObject({
+      status: "failed",
+      httpStatus: 403,
+    });
   });
 
   test("cloud routes are configured without a network call", async () => {
@@ -136,6 +183,55 @@ describe("validateRoute", () => {
       status: "failed",
       reason: "ECONNREFUSED",
     });
+  });
+});
+
+describe("codex gateway", () => {
+  const CODEX_GW = {
+    CODEX_GATEWAY_BASE_URL: "https://sub2api.example.com/v1",
+    CODEX_GATEWAY_API_KEY: "sk-gw",
+    OPENAI_API_KEY: "sk-openai",
+  };
+  const codexRoute = (env: Env) => {
+    const r = deriveDefaultRoute("codex", env);
+    if (!r) throw new Error("no route");
+    return r;
+  };
+
+  test("the gateway URL + key alone is ready; a missing key is named", () => {
+    expect(routeCredentialStatus(codexRoute(CODEX_GW), CODEX_GW).ready).toBe(true);
+    const noKey = { CODEX_GATEWAY_BASE_URL: "http://gw:8080/v1", CODEX_OAUTH: "{}" };
+    expect(routeCredentialStatus(codexRoute(noKey), noKey)).toMatchObject({
+      ready: false,
+      missing: ["CODEX_GATEWAY_API_KEY"],
+    });
+  });
+
+  test("checks GET /v1/models on the gateway with the gateway key, never api.openai.com", async () => {
+    const { calls } = stubFetch(200, JSON.stringify({ data: [{ id: "gpt-5.5" }] }));
+    const result = await validateRoute(codexRoute(CODEX_GW), CODEX_GW);
+    expect(result).toEqual({ status: "verified", models: ["gpt-5.5"] });
+    expect(calls.map((c) => c.url)).toEqual(["https://sub2api.example.com/v1/models"]);
+    expect(calls[0]?.headers.Authorization).toBe("Bearer sk-gw");
+  });
+
+  test("401 fails with the status; 404/405 are configured", async () => {
+    for (const [status, expected] of [
+      [401, "failed"],
+      [404, "configured"],
+      [405, "configured"],
+    ] as const) {
+      stubFetch(status);
+      const result = await validateRoute(codexRoute(CODEX_GW), CODEX_GW);
+      expect(result.status).toBe(expected);
+      if (result.status === "failed") expect(result.httpStatus).toBe(status);
+    }
+  });
+
+  test("the gateway provider is codex-only", () => {
+    const gw = codexRoute(CODEX_GW);
+    expect(assertRouteHarness(gw, "codex")).toBeNull();
+    expect(assertRouteHarness(gw, "claude")).toContain("only available to the codex harness");
   });
 });
 

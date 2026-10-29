@@ -14,6 +14,7 @@ import {
   fetchResolvedEnv,
   RELOADABLE_ENV_KEYS,
 } from "../commands/runner";
+import { contextBoundNoteThreshold } from "../hooks/context-bound-note";
 import { checkCodexCredentials } from "../providers/codex-adapter";
 import { MASKED_SECRET_VALUE } from "../utils/config-secrets";
 import { registerVolatileSecret } from "../utils/secret-scrubber";
@@ -40,8 +41,12 @@ const defaultMockResponse: MockResponse = {
 const mockResponsesByAgentId = new Map<string, MockResponse>();
 const requestedRepoIds = new Map<string, string | null>();
 const requestedTaskIds = new Map<string, string | null>();
-/** Every `GET /api/keys/available` query string observed by the mock server, most recent last. */
+/**
+ * Every `GET /api/keys/available` query string observed by the mock server,
+ * most recent last, without `keySuffixes` (recorded in `keysAvailableSuffixes`).
+ */
 const keysAvailableRequests: string[] = [];
+const keysAvailableSuffixes: Array<string | null> = [];
 
 beforeAll(() => {
   server = Bun.serve({
@@ -62,7 +67,10 @@ beforeAll(() => {
       }
 
       if (url.pathname === "/api/keys/available") {
-        keysAvailableRequests.push(url.search);
+        const params = new URLSearchParams(url.search);
+        keysAvailableSuffixes.push(params.get("keySuffixes"));
+        params.delete("keySuffixes");
+        keysAvailableRequests.push(`?${params}`);
         const totalKeys = Number(url.searchParams.get("totalKeys") ?? "1");
         const availableIndices = Array.from({ length: totalKeys }, (_, i) => i);
         return Response.json({ success: true, availableIndices, totalKeys });
@@ -454,6 +462,13 @@ describe("fetchResolvedEnv", () => {
       expect(keysAvailableRequests).toEqual([
         "?keyType=CLAUDE_CODE_OAUTH_TOKEN&totalKeys=32&model=fable",
       ]);
+      // The pool's own suffixes, in order, so status is matched by key (issue #2425).
+      expect(keysAvailableSuffixes.at(-1)).toBe(
+        Object.values(envWithOauthPool(32))[0]!
+          .split(",")
+          .map((key) => key.slice(-5))
+          .join(","),
+      );
     });
 
     test("model: 'claude-fable-5-1' issues the same model=fable", async () => {
@@ -792,6 +807,22 @@ describe("agent-scoped PI_CODEMODE_MODELS reaches the worker env", () => {
     const changed = applyResolvedEnvToProcessEnv(result.env);
     expect(changed).toContain("PI_CODEMODE_MODELS");
     expect(process.env.PI_CODEMODE_MODELS).toBe("true");
+  });
+});
+
+describe("agent-scoped CONTEXT_BOUND_NOTE_TOKENS turns the note on for one agent", () => {
+  // Each session's env is this agent's /api/config/resolved result (global,
+  // then agent, then repo rows), and every adapter reads the threshold from it.
+  test("the agent with the row gets the threshold; an agent without it stays off", async () => {
+    mockResponsesByAgentId.set("bound-note-pilot", {
+      status: 200,
+      body: { configs: [{ key: "CONTEXT_BOUND_NOTE_TOKENS", value: "150000" }] },
+    });
+    const baseEnv: Record<string, string | undefined> = {};
+    const pilot = await fetchResolvedEnv(testUrl, "key", "bound-note-pilot", baseEnv);
+    const other = await fetchResolvedEnv(testUrl, "key", "bound-note-other", baseEnv);
+    expect(contextBoundNoteThreshold(pilot.env)).toBe(150_000);
+    expect(contextBoundNoteThreshold(other.env)).toBe(0);
   });
 });
 

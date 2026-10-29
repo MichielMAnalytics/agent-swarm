@@ -36,6 +36,7 @@ import {
   useEnvPresence,
   useReloadConfig,
 } from "@/api/hooks/use-integrations-meta";
+import { usePoolKeysSupport } from "@/api/hooks/use-pool-keys-support";
 import { useInstallRemoteSkill } from "@/api/hooks/use-skills";
 import type { SwarmConfig } from "@/api/types";
 import { FieldRenderer } from "@/components/integrations/field-renderer";
@@ -77,6 +78,7 @@ import {
 } from "@/lib/integration-form-state";
 import {
   getIntegrationFields,
+  getPresenceKeys,
   INTEGRATIONS,
   type IntegrationConfigGroup,
   type IntegrationDef,
@@ -84,7 +86,7 @@ import {
 } from "@/lib/integrations-catalog";
 import { deriveIntegrationStatus, findConfigForKey } from "@/lib/integrations-status";
 
-// Mirror of the ICON_MAP in integration-card — keeps the detail page rendering
+// Mirror of the ICON_MAP in integration-card. Keeps the detail page rendering
 // the same icon as the card without a round-trip import.
 const ICON_MAP: Record<string, LucideIcon> = {
   "message-square": MessageSquare,
@@ -122,12 +124,9 @@ export default function IntegrationDetailPage() {
 
   const envPresenceKeys = useMemo(() => {
     if (!def) return [];
-    const keys = getIntegrationFields(def).map((f) => f.key);
-    keys.push(...(def.presenceKeys ?? []));
-    if (def.disableKey) keys.push(def.disableKey);
-    return keys;
+    return getPresenceKeys(def);
   }, [def]);
-  const { data: envPresence } = useEnvPresence(envPresenceKeys);
+  const { data: envPresence, dataUpdatedAt: envPresenceRevision } = useEnvPresence(envPresenceKeys);
 
   // Compute initial state only when configs/def land. We intentionally keep
   // local form state keyed by the catalog def id so navigating between
@@ -166,6 +165,7 @@ export default function IntegrationDetailPage() {
       deleteBatch={deleteBatch}
       reloadConfig={reloadConfig}
       envPresence={envPresence ?? {}}
+      envPresenceRevision={envPresenceRevision}
     />
   );
 }
@@ -178,6 +178,7 @@ interface InnerProps {
   deleteBatch: ReturnType<typeof useDeleteConfigsBatch>;
   reloadConfig: ReturnType<typeof useReloadConfig>;
   envPresence: EnvPresenceMap;
+  envPresenceRevision: number;
 }
 
 function IntegrationDetailInner({
@@ -188,6 +189,7 @@ function IntegrationDetailInner({
   deleteBatch,
   reloadConfig,
   envPresence,
+  envPresenceRevision,
 }: InnerProps) {
   const Icon = resolveIcon(def.iconKey);
   // A provider glyph (`ProviderIcon`) wins, then a logo file, then the lucide icon.
@@ -222,7 +224,9 @@ function IntegrationDetailInner({
     }));
   }
 
-  const dirtyEntries = computeDirtyEntries(allFields, state, configs);
+  // An older API has no pool-keys route: its pool fields save with the page.
+  const poolLists = usePoolKeysSupport() !== "legacy";
+  const dirtyEntries = computeDirtyEntries(allFields, state, configs, { poolLists });
   const hasDirty = dirtyEntries.length > 0;
 
   const handleSave = useCallback(async () => {
@@ -284,7 +288,7 @@ function IntegrationDetailInner({
   }, [hasDirty, dirtyEntries, upsertBatch, reloadConfig, def, installRemoteSkill, allFields]);
 
   // Cmd/Ctrl+S = Save. We intentionally let it fire even when focus is inside
-  // a textarea (private keys, etc.) — users expect cmd+S universally and can
+  // a textarea (private keys, etc.): users expect cmd+S universally and can
   // always fall back to the Save button if that shortcut is captured.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -362,7 +366,7 @@ function IntegrationDetailInner({
         </Button>
         <PageHeader
           title={
-            /* Integration name lives in the breadcrumb — logo + blurb here. */
+            /* Integration name lives in the breadcrumb. Logo + blurb here. */
             <div className="flex items-center gap-3 min-w-0">
               <div className="flex h-10 w-10 items-center justify-center rounded-md bg-muted/50 shrink-0">
                 {logo}
@@ -377,7 +381,7 @@ function IntegrationDetailInner({
       <DetailPageBody
         main={
           <div className="space-y-6">
-            {/* Action bar — hidden when a special flow replaces the generic form. */}
+            {/* Action bar, hidden when a special flow replaces the generic form. */}
             {!isReplaced && (
               <div className="flex flex-wrap items-center gap-2 border border-border rounded-md p-3 bg-muted/20">
                 <Button
@@ -419,9 +423,14 @@ function IntegrationDetailInner({
               </div>
             )}
 
-            {/* Special flow (OAuth card, CLI explainer, embeddings form) — ABOVE the generic form. */}
+            {/* Special flow (OAuth card, CLI explainer, embeddings form), ABOVE the generic form. */}
             {specialFlow && (
-              <specialFlow.Section def={def} configs={configs} envPresence={envPresence} />
+              <specialFlow.Section
+                def={def}
+                configs={configs}
+                envPresence={envPresence}
+                envPresenceRevision={envPresenceRevision}
+              />
             )}
 
             {/* Body */}
@@ -429,7 +438,7 @@ function IntegrationDetailInner({
               <EmptyState
                 icon={Plug}
                 title="No configurable fields"
-                description="This integration has no key/value fields — see the docs for the required setup steps."
+                description="This integration has no key/value fields. See the docs for the required setup steps."
               />
             ) : hasConfigGroups ? (
               <ConfigGroupSections
@@ -664,6 +673,7 @@ function FieldGroup({
   onClearField,
   bare,
 }: FieldGroupProps) {
+  const poolLists = usePoolKeysSupport() !== "legacy";
   const content = (
     <div className="space-y-5">
       {fields.map((f) => {
@@ -682,7 +692,10 @@ function FieldGroup({
             onUnmarkForReplace={() =>
               onUpdate(f.key, { value: SECRET_MASK_SENTINEL, markedForReplace: false })
             }
-            onClearExisting={existing ? () => onClearField(f.key) : undefined}
+            // A pool field removes its keys one at a time in its own list.
+            onClearExisting={
+              existing && !(f.credentialPool && poolLists) ? () => onClearField(f.key) : undefined
+            }
           />
         );
       })}

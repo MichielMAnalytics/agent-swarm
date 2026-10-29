@@ -1,10 +1,173 @@
-import type { WorkflowRunStatus } from "../../types";
+import {
+  TERMINAL_TASK_STATUSES,
+  type WorkflowRun,
+  type WorkflowRunStatus,
+  type WorkflowRunStep,
+  type WorkflowRunStepSlim,
+  type WorkflowRunStepStatus,
+  type WorkflowRunSummary,
+} from "../../types";
 import { scrubSecrets } from "../../utils/secret-scrubber";
+import { normalizeDate, normalizeDateRequired } from "../date-utils";
 import { scrubJsonValue } from "../scrub-json";
+import { defineWorkflowPayload, type WorkflowPayloadView } from "../workflow-replay";
 import { getDbClient } from "./runtime";
 
 // Parent/child links between workflow runs (migration 203): a `sub-workflow`
-// step starts a child run that records the step in `parentStepId`.
+// step starts a child run that records the step in `parentStepId`, and the
+// step's `retryCount` at that time in `parentStepAttempt` (migration 240).
+
+export type WorkflowRunRow = {
+  id: string;
+  workflowId: string;
+  status: string;
+  triggerType: string;
+  triggerData: string | null;
+  /** Absent from list rows: see `WORKFLOW_RUN_SUMMARY_COLUMNS`. */
+  context?: string | null;
+  /** Sealed exact `context` (migration 201). Absent from list rows. */
+  context_replay?: string | null;
+  error: string | null;
+  created_by: string | null;
+  startedAt: string;
+  lastUpdatedAt: string;
+  finishedAt: string | null;
+  /** The `sub-workflow` step that started this run (migration 203). */
+  parentStepId?: string | null;
+  /** That step's attempt (`retryCount`) when it started this run (migration 240). */
+  parentStepAttempt?: number | null;
+};
+
+/**
+ * `view` picks the `context` copy: `replay` (default) is the exact sealed value
+ * the engine resumes from; `display` is the scrubbed column for API, MCP and UI
+ * responses. See `src/be/workflow-replay.ts`.
+ */
+export function rowToWorkflowRun(
+  row: WorkflowRunRow,
+  view: WorkflowPayloadView = "replay",
+): WorkflowRun {
+  const run: WorkflowRun = {
+    id: row.id,
+    workflowId: row.workflowId,
+    status: row.status as WorkflowRunStatus,
+    triggerData: row.triggerData ? JSON.parse(row.triggerData) : undefined,
+    context: undefined,
+    error: row.error ?? undefined,
+    createdBy: row.created_by ?? undefined,
+    startedAt: normalizeDateRequired(row.startedAt),
+    lastUpdatedAt: normalizeDateRequired(row.lastUpdatedAt),
+    finishedAt: normalizeDate(row.finishedAt) ?? undefined,
+    parentStepId: row.parentStepId ?? undefined,
+    parentStepAttempt: row.parentStepId ? (row.parentStepAttempt ?? 0) : undefined,
+  };
+  return defineWorkflowPayload(run, "context", row.context, row.context_replay, view, {
+    runId: row.id,
+    target: "its context",
+  });
+}
+
+// Everything but `context`. `triggerData` stays: it is small, and stored
+// scripts read it off list rows (dedupe by trigger, failure reports). The
+// parent link and attempt stay so a list row identifies a child's invocation.
+export const WORKFLOW_RUN_SUMMARY_COLUMNS =
+  "id, workflowId, status, triggerType, triggerData, error, created_by, startedAt, lastUpdatedAt, finishedAt, parentStepId, parentStepAttempt";
+
+export type WorkflowRunStepRow = {
+  id: string;
+  runId: string;
+  nodeId: string;
+  nodeType: string;
+  status: string;
+  /** Absent from slim rows: see `WORKFLOW_RUN_STEP_SLIM_COLUMNS`. */
+  input?: string | null;
+  output: string | null;
+  /** Sealed exact `output` (migration 201). Absent from slim rows. */
+  output_replay?: string | null;
+  error: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  retryCount: number;
+  maxRetries: number;
+  nextRetryAt: string | null;
+  idempotencyKey: string | null;
+  diagnostics: string | null;
+  nextPort: string | null;
+};
+
+/** `view` picks the `output` copy, as in `rowToWorkflowRun`. */
+export function rowToWorkflowRunStep(
+  row: WorkflowRunStepRow,
+  view: WorkflowPayloadView = "replay",
+): WorkflowRunStep {
+  const step: WorkflowRunStep = {
+    id: row.id,
+    runId: row.runId,
+    nodeId: row.nodeId,
+    nodeType: row.nodeType,
+    status: row.status as WorkflowRunStepStatus,
+    input: row.input ? JSON.parse(row.input) : undefined,
+    output: undefined,
+    error: row.error ?? undefined,
+    startedAt: normalizeDateRequired(row.startedAt),
+    finishedAt: normalizeDate(row.finishedAt) ?? undefined,
+    retryCount: row.retryCount,
+    maxRetries: row.maxRetries,
+    nextRetryAt: normalizeDate(row.nextRetryAt) ?? undefined,
+    idempotencyKey: row.idempotencyKey ?? undefined,
+    diagnostics: row.diagnostics ?? undefined,
+    nextPort: row.nextPort ?? undefined,
+  };
+  return defineWorkflowPayload(step, "output", row.output, row.output_replay, view, {
+    runId: row.runId,
+    target: `the output of step ${row.id} (node ${row.nodeId})`,
+  });
+}
+
+// Everything but `input` (a context snapshot per step, so loops grow it with
+// every iteration) and `output_replay` (the display view never opens it).
+const WORKFLOW_RUN_STEP_SLIM_COLUMNS =
+  "id, runId, nodeId, nodeType, status, output, error, startedAt, finishedAt, retryCount, maxRetries, nextRetryAt, idempotencyKey, diagnostics, nextPort";
+
+/**
+ * `getWorkflowRun` without `context`, in the display view. Backs
+ * `GET /api/workflow-runs/{id}?fields=slim`: the large column is neither read
+ * nor parsed.
+ */
+/**
+ * The agent a run's creator-less `swarm-script` nodes act as: the agent the
+ * server stamped when the run started (migration 247), or null for a run with
+ * no starting agent (webhook, event, a run from before the migration).
+ */
+export async function getWorkflowRunTriggeredByAgentId(runId: string): Promise<string | null> {
+  const row = await getDbClient().get<{ triggeredByAgentId: string | null }>(
+    "SELECT triggeredByAgentId FROM workflow_runs WHERE id = ?",
+    [runId],
+  );
+  return row?.triggeredByAgentId ?? null;
+}
+
+export async function getWorkflowRunSummary(id: string): Promise<WorkflowRunSummary | null> {
+  const row = await getDbClient().get<WorkflowRunRow>(
+    `SELECT ${WORKFLOW_RUN_SUMMARY_COLUMNS} FROM workflow_runs WHERE id = ?`,
+    [id],
+  );
+  return row ? rowToWorkflowRun(row, "display") : null;
+}
+
+/**
+ * `getWorkflowRunStepsByRunId` without `input`, in the display view. Same
+ * order, including the rowid tie-break for steps that share `startedAt`.
+ */
+export async function getWorkflowRunStepsSlimByRunId(
+  runId: string,
+): Promise<WorkflowRunStepSlim[]> {
+  const rows = await getDbClient().query<WorkflowRunStepRow>(
+    `SELECT ${WORKFLOW_RUN_STEP_SLIM_COLUMNS} FROM workflow_run_steps WHERE runId = ? ORDER BY startedAt ASC, rowid ASC`,
+    [runId],
+  );
+  return rows.map((row) => rowToWorkflowRunStep(row, "display"));
+}
 
 const TERMINAL_STATUSES = new Set<WorkflowRunStatus>([
   "completed",
@@ -13,13 +176,405 @@ const TERMINAL_STATUSES = new Set<WorkflowRunStatus>([
   "skipped",
 ]);
 
-/** The id of the child run a `sub-workflow` step started, if any. */
-export async function getChildWorkflowRunId(parentStepId: string): Promise<string | null> {
+/**
+ * Deepest run tree the lineage guard and the cascade cancel walk. Twice the
+ * sub-workflow nesting cap (MAX_SUB_WORKFLOW_DEPTH, 16), so any tree the
+ * engine admits fits; a deeper chain is corrupt and fails closed.
+ */
+export const WORKFLOW_RUN_TREE_MAX_DEPTH = 32;
+
+/** Thrown when a run's stored parent links cannot be walked: a cycle, or a chain past the depth bound. */
+export class WorkflowRunTreeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkflowRunTreeError";
+  }
+}
+
+/**
+ * Thrown when work is created for a workflow step that may no longer run: the
+ * step is not `running`, its run is not live, or the run's lineage is blocked
+ * (see `getRunLineageBlock`).
+ */
+export class WorkflowStepNotExecutableError extends Error {
+  constructor(stepId: string, reason: string) {
+    super(`Workflow step ${stepId} may not start new work: ${reason}`);
+    this.name = "WorkflowStepNotExecutableError";
+  }
+}
+
+/**
+ * Why the run and its ancestors forbid new engine work, or null when they
+ * allow it. Blocked when the run is missing, the run or an ancestor is
+ * `cancelled`, a stored parent link points at a missing step or run, the
+ * links form a cycle, or the chain is deeper than WORKFLOW_RUN_TREE_MAX_DEPTH.
+ * A completed or failed ancestor does not block: a child of an earlier
+ * attempt may outlive its parent's run. The run's own live status is left to
+ * the caller, since the retry claim also revives a `failed` run.
+ *
+ * Call it inside the transaction that writes the new work, so a cascade
+ * cancel either commits first and is seen here or sees the new row itself.
+ */
+export async function getRunLineageBlock(runId: string): Promise<string | null> {
+  const rows = await getDbClient().query<{
+    id: string;
+    status: WorkflowRunStatus;
+    parentStepId: string | null;
+    depth: number;
+  }>(
+    `WITH RECURSIVE lineage(id, status, parentStepId, depth) AS (
+       SELECT id, status, parentStepId, 0 FROM workflow_runs WHERE id = ?
+       UNION ALL
+       SELECT r.id, r.status, r.parentStepId, l.depth + 1
+         FROM lineage l
+         JOIN workflow_run_steps s ON s.id = l.parentStepId
+         JOIN workflow_runs r ON r.id = s.runId
+        WHERE l.depth < ?
+     )
+     SELECT id, status, parentStepId, depth FROM lineage ORDER BY depth`,
+    [runId, WORKFLOW_RUN_TREE_MAX_DEPTH],
+  );
+  if (rows.length === 0) return `Workflow run ${runId} is missing`;
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (seen.has(row.id)) return `Workflow run ${runId} has a cycle in its parent links`;
+    seen.add(row.id);
+    if (row.status === "cancelled") {
+      return row.id === runId
+        ? `Workflow run ${runId} is cancelled`
+        : `Ancestor workflow run ${row.id} is cancelled`;
+    }
+  }
+  const top = rows[rows.length - 1]!;
+  if (top.parentStepId == null) return null;
+  if (top.depth >= WORKFLOW_RUN_TREE_MAX_DEPTH) {
+    return `Workflow run ${runId} is nested deeper than ${WORKFLOW_RUN_TREE_MAX_DEPTH} levels`;
+  }
+  return `Parent step ${top.parentStepId} of workflow run ${top.id} is missing`;
+}
+
+/**
+ * The run and every run below it, root first: children of every attempt of
+ * every step, through terminal runs too, since a run that ended can still have
+ * a live child of an earlier attempt. The tree comes from stored links only
+ * (child.parentStepId → step → run). There is no size limit: the engine admits
+ * any number of children per run, and a tree it admitted must stay
+ * cancellable. Throws WorkflowRunTreeError on a cycle or past `maxDepth`, so
+ * the caller's transaction rolls back whole.
+ */
+export async function getWorkflowRunTreeIds(
+  rootId: string,
+  bounds: { maxDepth?: number } = {},
+): Promise<string[]> {
+  const maxDepth = bounds.maxDepth ?? WORKFLOW_RUN_TREE_MAX_DEPTH;
+  const ids = [rootId];
+  const seen = new Set(ids);
+  // One level per pass, so a cycle stops at its first repeated run instead of
+  // unrolling down to the depth bound.
+  let level = [rootId];
+  for (let depth = 1; level.length > 0; depth++) {
+    const next: string[] = [];
+    for (let i = 0; i < level.length; i += TREE_QUERY_CHUNK) {
+      const chunk = level.slice(i, i + TREE_QUERY_CHUNK);
+      const rows = await getDbClient().query<{ id: string }>(
+        `SELECT c.id
+           FROM workflow_run_steps s
+           JOIN workflow_runs c ON c.parentStepId = s.id
+          WHERE s.runId IN (${chunk.map(() => "?").join(", ")})`,
+        chunk,
+      );
+      for (const { id } of rows) {
+        // Each run has one parent link, so reaching a run twice means a cycle.
+        if (seen.has(id)) {
+          throw new WorkflowRunTreeError(`Workflow run tree of ${rootId} has a cycle at run ${id}`);
+        }
+        seen.add(id);
+        next.push(id);
+      }
+    }
+    if (next.length > 0 && depth > maxDepth) {
+      throw new WorkflowRunTreeError(
+        `Workflow run tree of ${rootId} is nested deeper than ${maxDepth} levels`,
+      );
+    }
+    ids.push(...next);
+    level = next;
+  }
+  return ids;
+}
+
+/** Parent runs per children query, well under SQLite's bound-parameter limit. */
+const TREE_QUERY_CHUNK = 500;
+
+/** A run's status alone, without opening its sealed context. Null when the run is missing. */
+export async function getWorkflowRunStatus(runId: string): Promise<WorkflowRunStatus | null> {
+  const row = await getDbClient().get<{ status: WorkflowRunStatus }>(
+    "SELECT status FROM workflow_runs WHERE id = ?",
+    [runId],
+  );
+  return row?.status ?? null;
+}
+
+/** Run `fn` over `ids` in chunks small enough for one statement's bound parameters. */
+async function forEachChunk(
+  ids: string[],
+  fn: (chunk: string[], placeholders: string) => Promise<void>,
+): Promise<void> {
+  for (let i = 0; i < ids.length; i += TREE_QUERY_CHUNK) {
+    const chunk = ids.slice(i, i + TREE_QUERY_CHUNK);
+    await fn(chunk, chunk.map(() => "?").join(", "));
+  }
+}
+
+/**
+ * Ids of the non-terminal tasks of the given runs, including tasks of earlier
+ * attempts: a retry detaches a task from its step, but the run link stays.
+ */
+export async function getOpenWorkflowTreeTaskIds(runIds: string[]): Promise<string[]> {
+  const ids: string[] = [];
+  const terminal = TERMINAL_TASK_STATUSES.map(() => "?").join(", ");
+  await forEachChunk(runIds, async (chunk, placeholders) => {
+    const rows = await getDbClient().query<{ id: string }>(
+      `SELECT id FROM agent_tasks
+        WHERE workflowRunId IN (${placeholders}) AND status NOT IN (${terminal})`,
+      [...chunk, ...TERMINAL_TASK_STATUSES],
+    );
+    for (const row of rows) ids.push(row.id);
+  });
+  return ids;
+}
+
+/**
+ * Ids of tasks that a non-terminal task lists in `dependsOn`: the only
+ * dependents a cancel can fail. One scan over open tasks, so a cancel of many
+ * tasks looks for dependents once instead of once per task.
+ */
+export async function getTaskIdsWithDependents(): Promise<Set<string>> {
+  const rows = await getDbClient().query<{ id: string }>(
+    `SELECT DISTINCT dep.value AS id
+       FROM agent_tasks t, json_each(t.dependsOn) AS dep
+      WHERE t.status NOT IN (${TERMINAL_TASK_STATUSES.map(() => "?").join(", ")})
+        AND t.dependsOn IS NOT NULL AND t.dependsOn != '[]'`,
+    [...TERMINAL_TASK_STATUSES],
+  );
+  return new Set(rows.map((row) => row.id));
+}
+
+/**
+ * True when any of the given runs still has work a cancel would close: a live
+ * run, a pending, running or waiting step, a queued retry, an open task or a
+ * pending approval. Reads only, with a LIMIT 1 probe per chunk.
+ */
+export async function workflowRunTreeHasOpenWork(runIds: string[]): Promise<boolean> {
+  const terminal = TERMINAL_TASK_STATUSES.map(() => "?").join(", ");
+  const probes: Array<{ sql: (ids: string) => string; params: string[] }> = [
+    {
+      sql: (ids) =>
+        `SELECT 1 FROM workflow_runs WHERE id IN (${ids}) AND status IN ('running', 'waiting') LIMIT 1`,
+      params: [],
+    },
+    {
+      sql: (ids) => `SELECT 1 FROM workflow_run_steps
+        WHERE runId IN (${ids})
+          AND (status IN ('pending', 'running', 'waiting')
+               OR (status = 'failed' AND nextRetryAt IS NOT NULL))
+        LIMIT 1`,
+      params: [],
+    },
+    {
+      sql: (ids) =>
+        `SELECT 1 FROM agent_tasks WHERE workflowRunId IN (${ids}) AND status NOT IN (${terminal}) LIMIT 1`,
+      params: [...TERMINAL_TASK_STATUSES],
+    },
+    {
+      sql: (ids) =>
+        `SELECT 1 FROM approval_requests WHERE workflowRunId IN (${ids}) AND status = 'pending' LIMIT 1`,
+      params: [],
+    },
+  ];
+  let open = false;
+  await forEachChunk(runIds, async (chunk, placeholders) => {
+    for (const probe of probes) {
+      if (open) return;
+      if (await getDbClient().get(probe.sql(placeholders), [...chunk, ...probe.params])) {
+        open = true;
+      }
+    }
+  });
+  return open;
+}
+
+export type WorkflowRunTree = {
+  rootRunId: string;
+  /** Root first, in `getWorkflowRunTreeIds` order. List rows: no `context`. */
+  runs: WorkflowRun[];
+  hasOpenWork: boolean;
+};
+
+/**
+ * The run and every run below it, with whether any of them still has open
+ * work (see `workflowRunTreeHasOpenWork`). One read transaction, so `runs` and
+ * `hasOpenWork` come from the same snapshot. Null when the root is missing.
+ * Throws WorkflowRunTreeError on a cycle or a chain past the depth bound.
+ */
+export async function getWorkflowRunTree(rootRunId: string): Promise<WorkflowRunTree | null> {
+  return getDbClient().transaction(
+    async () => {
+      if ((await getWorkflowRunStatus(rootRunId)) === null) return null;
+      const ids = await getWorkflowRunTreeIds(rootRunId);
+      const byId = new Map<string, WorkflowRun>();
+      await forEachChunk(ids, async (chunk, placeholders) => {
+        const rows = await getDbClient().query<WorkflowRunRow>(
+          `SELECT ${WORKFLOW_RUN_SUMMARY_COLUMNS} FROM workflow_runs WHERE id IN (${placeholders})`,
+          chunk,
+        );
+        for (const row of rows) byId.set(row.id, rowToWorkflowRun(row, "display"));
+      });
+      const runs = ids.flatMap((id) => byId.get(id) ?? []);
+      return { rootRunId, runs, hasOpenWork: await workflowRunTreeHasOpenWork(ids) };
+    },
+    { readOnly: true },
+  );
+}
+
+/**
+ * Cancel the pending, running and waiting steps of the given runs. The
+ * migration-140 trigger closes each cancelled step's pending approval.
+ */
+export async function cancelOpenWorkflowTreeSteps(
+  runIds: string[],
+  reason: string,
+  finishedAt: string,
+): Promise<void> {
+  await forEachChunk(runIds, async (chunk, placeholders) => {
+    await getDbClient().run(
+      `UPDATE workflow_run_steps
+          SET status = 'cancelled', error = ?, finishedAt = ?
+        WHERE runId IN (${placeholders}) AND status IN ('pending', 'running', 'waiting')`,
+      [scrubSecrets(reason), finishedAt, ...chunk],
+    );
+  });
+}
+
+/**
+ * Drop the pending retries of the failed steps of the given runs. The step
+ * keeps its status, error, output and retryCount; only the queued next
+ * attempt goes.
+ */
+export async function disarmWorkflowTreeRetries(
+  runIds: string[],
+  finishedAt: string,
+): Promise<void> {
+  await forEachChunk(runIds, async (chunk, placeholders) => {
+    await getDbClient().run(
+      `UPDATE workflow_run_steps
+          SET nextRetryAt = NULL, finishedAt = COALESCE(finishedAt, ?)
+        WHERE runId IN (${placeholders}) AND status = 'failed' AND nextRetryAt IS NOT NULL`,
+      [finishedAt, ...chunk],
+    );
+  });
+}
+
+/**
+ * Mark the given runs that are still running or waiting `cancelled`, without
+ * the per-run `workflow.child.finished` wake-up: it is for runs whose parent
+ * step the same cancel closes. Each run it cancels still emits
+ * `workflow.run.finished`. A terminal run keeps its status and reason.
+ */
+export async function cancelLiveWorkflowTreeRuns(
+  runIds: string[],
+  reason: string,
+  finishedAt: string,
+): Promise<void> {
+  await forEachChunk(runIds, async (chunk, placeholders) => {
+    const cancelled = await getDbClient().query<{ id: string; workflowId: string }>(
+      `UPDATE workflow_runs
+          SET status = 'cancelled', error = ?, finishedAt = ?, lastUpdatedAt = ?
+        WHERE id IN (${placeholders}) AND status IN ('running', 'waiting')
+        RETURNING id, workflowId`,
+      [scrubSecrets(reason), finishedAt, finishedAt, ...chunk],
+    );
+    for (const run of cancelled) emitRunFinished(run.id, run.workflowId, "cancelled");
+  });
+}
+
+/** The id of the child run a `sub-workflow` step started on `attempt`, if any. */
+export async function getChildWorkflowRunId(
+  parentStepId: string,
+  attempt: number,
+): Promise<string | null> {
   const row = await getDbClient().get<{ id: string }>(
-    "SELECT id FROM workflow_runs WHERE parentStepId = ?",
-    [parentStepId],
+    "SELECT id FROM workflow_runs WHERE parentStepId = ? AND parentStepAttempt = ?",
+    [parentStepId, attempt],
   );
   return row?.id ?? null;
+}
+
+/**
+ * True while `attempt` of the step is executing in a live run: the step is
+ * `running` with that `retryCount` and no ancestor run is cancelled. A child
+ * run is created only then, so a cancelled run or tree, a step another attempt
+ * moved on, or a step already parked never gets a new child.
+ */
+export async function isParentStepAttemptCurrent(
+  parentStepId: string,
+  attempt: number,
+): Promise<boolean> {
+  const row = await getDbClient().get<{ runId: string }>(
+    `SELECT r.id AS runId
+       FROM workflow_run_steps s
+       JOIN workflow_runs r ON r.id = s.runId
+      WHERE s.id = ? AND s.status = 'running' AND s.retryCount = ?
+        AND r.status IN ('running', 'waiting')`,
+    [parentStepId, attempt],
+  );
+  return row != null && (await getRunLineageBlock(row.runId)) == null;
+}
+
+/**
+ * Why `stepId` may not start new work (a task, an approval, a child run), or
+ * null when it may: the step is `running` in a live run whose lineage is not
+ * blocked. Call it inside the transaction that inserts the work.
+ */
+export async function getStepExecutionBlock(stepId: string): Promise<string | null> {
+  const row = await getDbClient().get<{
+    stepStatus: string;
+    runId: string;
+    runStatus: WorkflowRunStatus;
+  }>(
+    `SELECT s.status AS stepStatus, r.id AS runId, r.status AS runStatus
+       FROM workflow_run_steps s
+       JOIN workflow_runs r ON r.id = s.runId
+      WHERE s.id = ?`,
+    [stepId],
+  );
+  if (!row) return "the step or its run is missing";
+  if (row.runStatus !== "running" && row.runStatus !== "waiting") {
+    return `its run is ${row.runStatus}`;
+  }
+  if (row.stepStatus !== "running") return `the step is ${row.stepStatus}`;
+  return getRunLineageBlock(row.runId);
+}
+
+/**
+ * `sub-workflow` steps left `running` in a live run: each is its node's latest
+ * row, so a row a newer one superseded is not listed. The caller skips the
+ * ones this process is still executing.
+ */
+export async function getRunningSubWorkflowSteps(): Promise<
+  Array<{ stepId: string; runId: string; nodeId: string }>
+> {
+  return getDbClient().query<{ stepId: string; runId: string; nodeId: string }>(
+    `SELECT s.id AS stepId, s.runId AS runId, s.nodeId AS nodeId
+       FROM workflow_run_steps s
+       JOIN workflow_runs r ON r.id = s.runId
+      WHERE s.status = 'running' AND s.nodeType = 'sub-workflow'
+        AND r.status IN ('running', 'waiting')
+        AND s.rowid = (
+          SELECT MAX(rowid) FROM workflow_run_steps
+           WHERE runId = s.runId AND nodeId = s.nodeId
+        )`,
+  );
 }
 
 /** Where a child run came from: the `sub-workflow` step that started it and that step's run. */
@@ -65,12 +620,13 @@ export async function getWorkflowRunLineage(runId: string, maxDepth: number): Pr
   return rows.map((row) => row.workflowId);
 }
 
-/** Waiting `sub-workflow` steps whose child run is terminal or deleted. */
+/** Waiting `sub-workflow` steps whose current attempt's child run is terminal or deleted. */
 export async function getSettledChildRunParentSteps(): Promise<string[]> {
   const rows = await getDbClient().query<{ id: string }>(
     `SELECT s.id
        FROM workflow_run_steps s
-       LEFT JOIN workflow_runs c ON c.parentStepId = s.id
+       LEFT JOIN workflow_runs c
+         ON c.parentStepId = s.id AND c.parentStepAttempt = s.retryCount
       WHERE s.status = 'waiting' AND s.nodeType = 'sub-workflow'
         AND (c.id IS NULL OR c.status IN ('completed', 'failed', 'cancelled', 'skipped'))`,
   );
@@ -103,14 +659,42 @@ export function emitChildRunFinished(
 }
 
 function emitAfterCommit(childRunId: string, parentStepId: string): void {
+  emitBusEventAfterCommit("workflow.child.finished", { childRunId, parentStepId });
+}
+
+/** Bus event every run emits once when it turns terminal. */
+export const WORKFLOW_RUN_FINISHED_EVENT = "workflow.run.finished";
+
+export function isTerminalWorkflowRunStatus(status: WorkflowRunStatus): boolean {
+  return TERMINAL_STATUSES.has(status);
+}
+
+/**
+ * Announce after commit that a run turned terminal, top-level and child runs
+ * alike, so an event-mode `wait` can resume when any run ends. Callers emit
+ * only when a live run (running or waiting) turns terminal, never on a later
+ * update of a run that is already terminal. The id is `runId`, never `workflowRunId` or
+ * `_runId`: those would put the finished run in the waiting run's own `run`
+ * scope, so waiters use scope `global` and filter on `runId`.
+ */
+export function emitRunFinished(
+  runId: string,
+  workflowId: string,
+  status: WorkflowRunStatus,
+): void {
+  if (!TERMINAL_STATUSES.has(status)) return;
+  emitBusEventAfterCommit(WORKFLOW_RUN_FINISHED_EVENT, { runId, workflowId, status });
+}
+
+function emitBusEventAfterCommit(event: string, payload: Record<string, unknown>): void {
   getDbClient().afterCommit(() => {
     import("../../workflows/event-bus")
       .then(({ workflowEventBus }) => {
-        workflowEventBus.emit("workflow.child.finished", { childRunId, parentStepId });
+        workflowEventBus.emit(event, payload);
       })
       .catch((err) =>
         console.error(
-          "[db] workflow.child.finished event not emitted:",
+          `[db] ${event} event not emitted:`,
           scrubSecrets(err instanceof Error ? err.message : String(err)),
         ),
       );

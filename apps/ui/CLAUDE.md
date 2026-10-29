@@ -238,6 +238,7 @@ Pages and composed components are built from primitives. Raw `<div>` layouts tha
 | `DetailPageBody`, `DetailPageRail`, `DetailPageSection`, `QuickStats`, `QuickStat`, `Relationships`, `Relationship`, `DangerZone` | canonical detail-page body layout (1fr / 280px rail) per brand-kit `preview/detail-page-template.html`. Compose pages with `<PageHeader />` above + `<DetailPageBody main={...} rail={<DetailPageRail>…</DetailPageRail>} />`. Pages dominated by editors / split-views / Monaco (templates, workflow-runs, workflows) are exempt. | `<DetailPageBody main={<Form />} rail={<DetailPageRail><QuickStats><QuickStat label="Created" value="…" /></QuickStats><Relationships><Relationship label="Owner" to="/agents/abc" /></Relationships><DangerZone><Button variant="destructive-outline" className="w-full">Delete</Button></DangerZone></DetailPageRail>} />` |
 | `Dialog`, `DialogTrigger`, `DialogContent`, `DialogHeader`, `DialogTitle`, `DialogFooter` | modal dialog | `<Dialog open={open}><DialogContent>...</DialogContent></Dialog>` |
 | `DropdownMenu`, `DropdownMenuTrigger`, `DropdownMenuContent`, `DropdownMenuItem` | dropdown actions menu | `<DropdownMenu><DropdownMenuTrigger>...</DropdownMenuTrigger><DropdownMenuContent>...` |
+| `ContextMenu`, `ContextMenuTrigger`, `ContextMenuContent`, `ContextMenuItem`, `ContextMenuSeparator` | right-click (long press) actions menu, same look as `DropdownMenu` | `<ContextMenu><ContextMenuTrigger asChild>{row}</ContextMenuTrigger><ContextMenuContent>...` |
 | `InfoRow`, `DefinitionList` | uppercase-label + value pair, used in detail pages | `<DefinitionList><InfoRow label="Role">Engineer</InfoRow></DefinitionList>` |
 | `Input` | text input | `<Input id="name" value={v} onChange={...} />` |
 | `Label` | form-control label (use inside `SettingsRow`) | `<Label htmlFor="name">Name</Label>` |
@@ -265,7 +266,7 @@ Pages and composed components are built from primitives. Raw `<div>` layouts tha
 | `AgentLink` | linked agent name with avatar | `<AgentLink agentId={id} agentName={name} />` |
 | `CollapsibleDescription` | truncated text with show-more toggle | `<CollapsibleDescription text={long} />` |
 | `CollapsibleSection` | folding section header | `<CollapsibleSection title="Details">...</CollapsibleSection>` |
-| `CommandMenu` | global ⌘K palette | mounted at root |
+| `CommandMenu` | global ⌘K palette. A new route needs a `handle` in `app/routes.tsx`: `nav({...})` lists it in "Go to", `unlisted(reason)` opts out; an entity list (`/x` + `/x/:id`) also names `search` providers (`components/command-palette/providers.tsx`) or a `searchOptOut`. `app/routes.test.tsx` fails otherwise. Page-specific commands: `useCommandMenuGroup` | mounted at root |
 | `DataGrid` | AG Grid wrapper — REQUIRED for all data lists | `<DataGrid rowData={rows} columnDefs={cols} />` |
 | `EmptyState` | icon + title + description + optional action. First-run page empties add `entity` (renders an "Ask the swarm" CTA that seeds a new session) + `fullPage` (vertical centering) | `<EmptyState icon={Inbox} title="No tasks yet" description="..." entity="task" fullPage />` |
 | `ErrorBoundary` | top-level error fallback | wrap routes |

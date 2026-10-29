@@ -1,22 +1,16 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect } from "react";
 import { SetupCard } from "@/components/shared/setup-card";
-import { StatusIcon } from "@/components/shared/status-icon";
+import { StatusIcon, StatusLine } from "@/components/shared/status-icon";
 import { HARNESS_LABEL } from "@/lib/agent-runtime-models";
 import { HarnessSwitch } from "./harness-switch";
-import { type AiCardId, type AiCardProps, CARD_HARNESSES } from "./model";
+import { type AiCardId, type AiCardProps, CARD_HARNESSES, harnessNames } from "./model";
 import { WaitingPanel } from "./waiting";
-
-/** "Codex" for one harness, "Pi-Mono, Opencode, or DeepSeek (dsh)" for several. */
-function harnessPhrase(card: AiCardId): string {
-  const names = CARD_HARNESSES[card].map((h) => HARNESS_LABEL[h] ?? h);
-  if (names.length === 1) return names[0];
-  return `${names.slice(0, -1).join(", ")}, or ${names[names.length - 1]}`;
-}
 
 /**
  * Accordion card shared by the four providers: status icon, the card's form,
- * then the waiting line once a key is saved, then the R2 harness switch
- * whenever no worker runs the card's harness.
+ * then the waiting line once a key is saved, then the R2 harness switch once
+ * a key is saved and no worker runs the card's harness. While the step
+ * switches every agent itself (first credential), a busy line replaces it.
  */
 export function ProviderCard({
   card,
@@ -29,8 +23,13 @@ export function ProviderCard({
   rollup,
   agents,
   dialContext,
+  reportSaved,
+  autoSwitching,
   children,
-}: Pick<AiCardProps, "open" | "onOpenChange" | "rollup" | "agents" | "dialContext"> & {
+}: Pick<
+  AiCardProps,
+  "open" | "onOpenChange" | "rollup" | "agents" | "dialContext" | "reportSaved" | "autoSwitching"
+> & {
   card: AiCardId;
   icon: ReactNode;
   title: string;
@@ -39,6 +38,7 @@ export function ProviderCard({
   children: ReactNode;
 }) {
   const harnesses = CARD_HARNESSES[card];
+  useEffect(() => reportSaved(card, saved), [reportSaved, card, saved]);
   const runsHarness =
     rollup.workers > 0 ||
     agents.some((a) => a.harnessProvider != null && harnesses.includes(a.harnessProvider));
@@ -61,11 +61,13 @@ export function ProviderCard({
       focusable={false}
       label={`Verified by ${rollup.verifiedWorkers} of ${rollup.workers} agents`}
     />
+  ) : rollup.error ? (
+    <StatusIcon tone="error" focusable={false} label="Key rejected. Fix it and save it again." />
   ) : saved && noWorker ? (
     <StatusIcon
       tone="warning"
       focusable={false}
-      label={`Saved. No worker runs ${harnessPhrase(card)} yet.`}
+      label={`Saved. No worker runs ${harnessNames(card)} yet.`}
     />
   ) : saved ? (
     <StatusIcon
@@ -88,13 +90,20 @@ export function ProviderCard({
       bodyClassName="space-y-3 sm:pl-[60px]"
     >
       {children}
-      {saved || rollup.verified ? (
-        <WaitingPanel rollup={rollup} harnessLabel={waitingLabel} />
+      {saved || rollup.verified || rollup.error ? (
+        <WaitingPanel rollup={rollup} harnessLabel={waitingLabel} noWorker={noWorker} />
       ) : null}
-      {/* A key only verifies on a worker that runs this harness. */}
-      {noWorker ? (
+      {/* A key only verifies on a worker that runs this harness. Before a key
+          is saved, the agent list would only push the form down. */}
+      {saved && noWorker && autoSwitching ? (
+        <output className="block">
+          <StatusLine tone="busy">
+            Switching all agents to {HARNESS_LABEL[autoSwitching] ?? autoSwitching}…
+          </StatusLine>
+        </output>
+      ) : saved && noWorker ? (
         <HarnessSwitch
-          harnessPhrase={harnessPhrase(card)}
+          harnessPhrase={harnessNames(card)}
           targets={harnesses}
           agents={agents}
           dialContext={dialContext}

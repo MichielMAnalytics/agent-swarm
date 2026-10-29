@@ -9,16 +9,16 @@ declare module "swarm-extension" {
       | "schedule"
       | "slack"
       | "agentmail"
-      | "mcp"
-      | "api"
-      | "ui"
       | "github"
       | "gitlab"
       | "azure-devops"
       | "bitbucket"
-      | "system"
       | "linear"
       | "jira"
+      | "mcp"
+      | "api"
+      | "ui"
+      | "system"
       | "comb"
       | "chat"
       | undefined;
@@ -127,16 +127,16 @@ declare module "swarm-extension" {
       | "schedule"
       | "slack"
       | "agentmail"
-      | "mcp"
-      | "api"
-      | "ui"
       | "github"
       | "gitlab"
       | "azure-devops"
       | "bitbucket"
-      | "system"
       | "linear"
       | "jira"
+      | "mcp"
+      | "api"
+      | "ui"
+      | "system"
       | "comb"
       | "chat";
     tags: string[];
@@ -401,6 +401,45 @@ declare module "swarm-extension" {
     description: string;
     origin: TaskCreateOrigin;
     requestInfo?: RequestInfo;
+    /** Slack ingress metadata; not persisted or writable through modify. */
+    slack?: {
+      trigger: "mention" | "thread-buffer";
+      messages: {
+        ts: string;
+        userId: string;
+        text: string;
+      }[];
+    };
+  }
+  /** A pre.task.create hook blocked a task before it was created. */
+  export interface TaskBlockedEvent {
+    /** The extension that blocked, or whose model/agent rewrite was rejected. */
+    extension: {
+      id: string;
+      name: string;
+    };
+    /** The scrubbed block reason. */
+    reason: string;
+    origin: TaskCreateOrigin;
+    source?: AgentTask["source"];
+    requester: {
+      userId?: string;
+      agentId?: string;
+      slackUserId?: string;
+    };
+    context?: {
+      contextKey?: string;
+      scheduleId?: string;
+      workflowRunId?: string;
+      workflowRunStepId?: string;
+      parentTaskId?: string;
+      vcsRepo?: string;
+      vcsNumber?: number;
+      slackChannelId?: string;
+      slackThreadTs?: string;
+    };
+    /** The original task description, scrubbed and cut to 500 characters. */
+    description: string;
   }
   export type TaskCreateModify = Partial<
     Pick<
@@ -701,6 +740,11 @@ declare module "swarm-extension" {
     };
     "post.task.created": {
       event: TaskEvent;
+      modify: never;
+      result: void;
+    };
+    "post.task.blocked": {
+      event: TaskBlockedEvent;
       modify: never;
       result: void;
     };

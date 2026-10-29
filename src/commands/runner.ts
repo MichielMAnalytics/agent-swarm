@@ -1,5 +1,6 @@
 import { existsSync, statSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { deriveDefaultRoute } from "@desplega/model-routing";
 import type { TemplateResponse } from "../../templates/schema.ts";
 import {
   type Attributes,
@@ -118,7 +119,13 @@ import {
   prependContextPreamble,
 } from "./context-preamble.ts";
 import { reportCredentialOutcomeThenFinish } from "./credential-outcome-report.ts";
-import { type CredentialRefreshState, refreshCredentialStatus } from "./credential-refresh.ts";
+import {
+  type CredentialRefreshState,
+  credentialFingerprint,
+  recheckableFailures,
+  refreshCredentialStatus,
+  reportKeyValidation,
+} from "./credential-refresh.ts";
 import {
   awaitCredentials,
   BootMaxWaitExceededError,
@@ -831,6 +838,8 @@ export async function exitAfterTasksIfFinished(
  */
 export interface ResolvedEnvResult {
   env: Record<string, string | undefined>;
+  /** Full credential pools for live validation. Keep this environment in process only. */
+  credentialEnv: Record<string, string | undefined>;
   credentialSelections: CredentialSelection[];
   /** Raw config-row value, kept separate from the merged environment so an
    * actual worker environment variable retains precedence. */
@@ -1049,6 +1058,7 @@ export async function fetchResolvedEnv(
   });
   const effectiveModel = modelSelection.model || (env.MODEL_OVERRIDE as string | undefined) || "";
 
+  const credentialEnv = { ...env };
   const credentialSelections = await resolveCredentialPools(env, {
     apiUrl,
     apiKey,
@@ -1065,7 +1075,7 @@ export async function fetchResolvedEnv(
     enforceModelCapacity: sessionContext?.enforceModelCapacity,
   });
 
-  return { env, credentialSelections, resolvedProvider, scriptsOnlyConfigValue };
+  return { env, credentialEnv, credentialSelections, resolvedProvider, scriptsOnlyConfigValue };
 }
 
 /**
@@ -1212,6 +1222,7 @@ export async function provisionAgentFsAfterRegistration(opts: {
  * - TEMPLATE_REGISTRY_URL — read per registry fetch.
  * - SLACK_DISABLE — read by the prompt builder to gate the Slack tool section.
  * - SWARM_ORG_NAME — read per telemetry event for org identity.
+ * - AGENT_FS_LINK_TARGET — read by the prompt builder for the file-link base.
  *
  * CLAUDE_TRANSPORT stays in the per-session environment. Caching a scoped
  * value here would prevent deletion from restoring the configured default.
@@ -1231,6 +1242,7 @@ export const RELOADABLE_ENV_KEYS: ReadonlySet<string> = new Set([
   "TEMPLATE_REGISTRY_URL",
   "SLACK_DISABLE",
   "SWARM_ORG_NAME",
+  "AGENT_FS_LINK_TARGET",
   // Gate the public-ranking `ranking.usage` emit, so clearing the website or
   // turning the setting off stops it on running workers.
   "SWARM_ORG_WEBSITE",
@@ -2704,6 +2716,8 @@ export interface RunningTask {
   assistantText?: { value?: string };
   /** Last progress value, retained until the final API writes settle. */
   finalProgress?: { value?: string };
+  /** Latest cost snapshot captured from `result` events before completion settles. */
+  lastCost?: { value?: CostData };
   /** Last time `reconcileActiveTasks` read this task's server-side status. */
   lastReconcileAt?: number;
   /** When the runner asked the session to abort (cancel or reconcile). */
@@ -3352,6 +3366,8 @@ export interface PollOptions {
   pollTimeout: number;
   /** Push scheduling fetches once, then returns control to the runner. */
   singlePoll?: boolean;
+  /** Stop an open poll window before its next claim request. */
+  shouldStop?: () => boolean;
   /** Distinguishes a failed fetch from an empty successful response. */
   onPollFailure?: () => void;
   since?: string; // Optional: for filtering finished tasks
@@ -3669,6 +3685,7 @@ async function pollForTriggerOnce(opts: PollOptions): Promise<Trigger | null> {
   }
 
   while (Date.now() - startTime < opts.pollTimeout) {
+    if (opts.shouldStop?.()) return null;
     try {
       // Build URL with optional since parameter
       let url = `${opts.apiUrl}/api/poll`;
@@ -4316,7 +4333,9 @@ async function spawnProviderProcess(
   // config-store slot — gates whether `codexSlot` is set below (see
   // `CodexOAuthCredentialInfo`).
   let oauthIsPoolBacked = false;
-  if (adapter.name === "codex") {
+  // A gateway route uses no OAuth: no pool slot is picked, so no auth.json is
+  // materialised for a session whose traffic goes to the gateway.
+  if (adapter.name === "codex" && !deriveDefaultRoute("codex", freshEnv)) {
     const oauthInfo = await resolveCodexOAuthCredentialInfo(opts.apiUrl, opts.apiKey);
     oauthSelection = oauthInfo?.selection;
     oauthIsPoolBacked = oauthInfo?.isPoolBacked ?? false;
@@ -4538,6 +4557,7 @@ async function spawnProviderProcess(
   // session promise resolves (see `trackAssistantText`).
   const assistantTextHolder: { value?: string } = {};
   const finalProgressHolder: { value?: string } = {};
+  const lastCostHolder: { value?: CostData } = {};
 
   // Context usage throttle: max 1 snapshot per 30 seconds
   let lastContextPostTime = 0;
@@ -4746,6 +4766,11 @@ async function spawnProviderProcess(
           break;
         }
         case "result":
+          lastCostHolder.value = {
+            ...event.cost,
+            taskId: realTaskId,
+            sessionId: opts.runnerSessionId,
+          };
           {
             // Mid-session snapshot — fires on each streamed "result" event,
             // necessarily before `ProviderResult.appliedReasoningEffort` exists
@@ -4953,6 +4978,7 @@ async function spawnProviderProcess(
         }
 
         // Retain cost data for the concurrent final API writes.
+        result.cost ??= lastCostHolder.value;
         if (result.cost) {
           result.cost = { ...result.cost, taskId: realTaskId, sessionId: opts.runnerSessionId };
           sessionSpan.setAttributes({
@@ -5115,6 +5141,7 @@ async function spawnProviderProcess(
     model: model || undefined,
     assistantText: assistantTextHolder,
     finalProgress: finalProgressHolder,
+    lastCost: lastCostHolder,
   };
   runningTaskForSessionInit = runningTask;
   if (pendingHarnessVariant !== undefined) {
@@ -5131,7 +5158,7 @@ async function spawnProviderProcess(
       runningTask.result ??= r;
     })
     .catch(() => {
-      runningTask.result ??= { exitCode: 1, isError: true };
+      runningTask.result ??= { exitCode: 1, isError: true, cost: lastCostHolder.value };
     });
 
   return runningTask;
@@ -5301,6 +5328,7 @@ export async function reconcileActiveTasks(
         exitCode: 1,
         isError: true,
         sessionId: task.session.sessionId,
+        cost: task.lastCost?.value,
         failureReason: "runner exited without result: provider session did not settle after abort",
       };
     }
@@ -5653,6 +5681,38 @@ export async function checkCompletedProcesses(
 }
 
 const TEMPLATE_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+async function saveGeneratedProfile({
+  apiUrl,
+  apiKey,
+  agentId,
+  role,
+  profileUpdate,
+}: {
+  apiUrl: string;
+  apiKey: string;
+  agentId: string;
+  role: string;
+  profileUpdate: Record<string, string>;
+}): Promise<void> {
+  try {
+    const response = await fetch(`${apiUrl}/api/agents/${agentId}/profile`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "X-Agent-ID": agentId,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(profileUpdate),
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    }
+    console.log(`[${role}] Generated and saved default identity templates`);
+  } catch (err) {
+    console.warn(scrubSecrets(`[${role}] Could not save generated templates to server: ${err}`));
+  }
+}
 
 async function fetchTemplate(
   templateId: string,
@@ -6016,7 +6076,10 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     ready: null,
     lastRefreshAt: 0,
     inFlight: false,
+    fingerprint: null,
+    rejectedKeys: 0,
   };
+  let latestCredentialEnv: Record<string, string | undefined> | undefined;
 
   // Throttle for live HARNESS_PROVIDER reconciliation. Each reconciliation
   // calls `fetchResolvedEnv` which also re-resolves credential pools — we
@@ -6410,6 +6473,10 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       credentialRefreshState.harnessProvider = state.harnessProvider;
       credentialRefreshState.ready = bootCredSnapshot?.ready ?? true;
       credentialRefreshState.lastRefreshAt = Date.now();
+      credentialRefreshState.fingerprint = credentialFingerprint(process.env);
+      credentialRefreshState.rejectedKeys = recheckableFailures(bootCredSnapshot?.liveTest);
+      const keys = bootCredSnapshot?.liveTest?.keys;
+      if (keys?.length) await reportKeyValidation(apiConfig, keys);
     } catch (error) {
       console.error(`[${role}] Failed to report credential readiness after recovery: ${error}`);
       process.exit(1);
@@ -6499,30 +6566,15 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
         if (!agentClaudeMd) agentClaudeMd = generateDefaultClaudeMd(agentInfo);
 
         // Push generated templates to server
-        try {
-          const profileUpdate: Record<string, string> = {};
-          if (!profile.soulMd) profileUpdate.soulMd = agentSoulMd;
-          if (!profile.identityMd) profileUpdate.identityMd = agentIdentityMd;
-          if (!profile.toolsMd) profileUpdate.toolsMd = agentToolsMd;
-          if (!profile.claudeMd && agentClaudeMd) profileUpdate.claudeMd = agentClaudeMd;
-          if (!profile.setupScript && agentSetupScript)
-            profileUpdate.setupScript = agentSetupScript;
-          if (!profile.heartbeatMd && agentHeartbeatMd)
-            profileUpdate.heartbeatMd = agentHeartbeatMd;
+        const profileUpdate: Record<string, string> = {};
+        if (!profile.soulMd) profileUpdate.soulMd = agentSoulMd;
+        if (!profile.identityMd) profileUpdate.identityMd = agentIdentityMd;
+        if (!profile.toolsMd) profileUpdate.toolsMd = agentToolsMd;
+        if (!profile.claudeMd && agentClaudeMd) profileUpdate.claudeMd = agentClaudeMd;
+        if (!profile.setupScript && agentSetupScript) profileUpdate.setupScript = agentSetupScript;
+        if (!profile.heartbeatMd && agentHeartbeatMd) profileUpdate.heartbeatMd = agentHeartbeatMd;
 
-          await fetch(`${apiUrl}/api/agents/${agentId}/profile`, {
-            method: "PUT",
-            headers: {
-              Authorization: `Bearer ${apiKey}`,
-              "X-Agent-ID": agentId,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(profileUpdate),
-          });
-          console.log(`[${role}] Generated and saved default identity templates`);
-        } catch {
-          console.warn(`[${role}] Could not save generated templates to server`);
-        }
+        await saveGeneratedProfile({ apiUrl, apiKey, agentId, role, profileUpdate });
       }
 
       // Fetch installed MCP servers for system prompt
@@ -7012,9 +7064,11 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       try {
         const {
           env: freshEnv,
+          credentialEnv,
           resolvedProvider,
           scriptsOnlyConfigValue,
         } = await fetchResolvedEnv(apiUrl, apiKey, agentId);
+        latestCredentialEnv = credentialEnv;
         const nextScriptsOnly = resolveScriptsOnlyMode({
           env: process.env.SCRIPTS_ONLY_MCP,
           configValue: scriptsOnlyConfigValue,
@@ -7046,7 +7100,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       apiConfig,
       credentialRefreshState,
       state.harnessProvider,
-      process.env,
+      latestCredentialEnv ?? process.env,
     ).catch((err) =>
       console.warn(`[${role}] cred_status post_task refresh failed (non-fatal): ${err}`),
     );
@@ -7099,7 +7153,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       }
     }
 
-    // Only poll if we have capacity and the API is not draining
+    // Only poll if we have capacity and neither the API nor worker is draining
     const schedule = pushDelivery.schedule({
       mode: state.deliveryMode ?? "poll",
       push: deliveryChecks.push,
@@ -7108,7 +7162,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
         exitAfterTasks === null
           ? state.maxConcurrent
           : Math.min(state.maxConcurrent, Math.max(0, exitAfterTasks - state.tasksProcessed)),
-      draining: state.apiDraining,
+      draining: state.apiDraining || shuttingDown,
       lastPushPingAt,
       pollInterval: PollIntervalMs,
     });
@@ -7146,6 +7200,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           runtimeInstanceId,
           pollTimeout: effectiveTimeout,
           singlePoll: schedule.singlePoll,
+          shouldStop: () => shuttingDown,
           onPollFailure,
           harnessProvider: state.harnessProvider,
           onApiDrainSignal: (draining) => applyApiDrainSignal(state, role, draining),

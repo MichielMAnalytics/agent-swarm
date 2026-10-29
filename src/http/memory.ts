@@ -44,7 +44,7 @@ import { can, type RbacPrincipal } from "../rbac";
 import { AgentMemorySchema, AgentMemoryScopeSchema, AgentMemorySourceSchema } from "../types";
 import { getRequestAuth } from "../utils/request-auth-context";
 import { scrubSecrets } from "../utils/secret-scrubber";
-import { rejectGuest } from "./request-principal";
+import { agentFirstPrincipal, rejectGuest } from "./request-principal";
 import { bodyTask, route } from "./route-def";
 import { jsonError, parseQueryParams } from "./utils";
 
@@ -791,16 +791,7 @@ async function ingestPrincipal(
   req: IncomingMessage,
   agentIdHeader: string | undefined,
 ): Promise<RbacPrincipal> {
-  const auth = getRequestAuth(req);
-  if (auth?.kind === "user") return { kind: "user", userId: auth.userId };
-  if (auth?.kind === "guest") return { kind: "guest" };
-  const agentId = auth?.kind === "agent" ? auth.agentId : agentIdHeader;
-  if (agentId) {
-    const agent = await getAgentById(agentId);
-    return { kind: "agent", agentId, isLead: agent?.isLead ?? false };
-  }
-  if (auth?.kind === "operator") return { kind: "operator" };
-  return { kind: "agent", agentId: "", isLead: false };
+  return agentFirstPrincipal(req, agentIdHeader, { unauthenticatedFallback: "anonymous-agent" });
 }
 
 /** Whose rows a memory list may show. `seesAll` lifts the own-or-swarm filter. */
@@ -914,7 +905,7 @@ export async function handleMemory(
     try {
       const provider = getEmbeddingProvider();
       const store = getMemoryStore();
-      const queryEmbedding = await provider.embed(query);
+      const queryEmbedding = await provider.embed(query, { kind: "query" });
 
       const candidateLimit = Math.min(limit, 20) * CANDIDATE_SET_MULTIPLIER;
       const candidates = await searchMemoryCandidates(
@@ -1039,7 +1030,7 @@ export async function handleMemory(
     try {
       if (query && query.trim().length > 0) {
         const provider = getEmbeddingProvider();
-        const queryEmbedding = await provider.embed(query.trim());
+        const queryEmbedding = await provider.embed(query.trim(), { kind: "query" });
 
         const candidateLimit = Math.min(
           4096,
@@ -1289,7 +1280,7 @@ export async function handleMemory(
       });
       if (result.changed) {
         const provider = getEmbeddingProvider();
-        const embedding = await provider.embed(result.memory.content);
+        const embedding = await provider.embed(result.memory.content, { kind: "document" });
         if (embedding) await store.updateEmbedding(result.memory.id, embedding, provider.name);
         try {
           // Edit path: prune links derived from removed content (sequel links survive).
@@ -1378,7 +1369,10 @@ export async function handleMemory(
       for (let i = 0; i < memories.length; i += batchSize) {
         const batch = memories.slice(i, i + batchSize);
         try {
-          const embeddings = await provider.embedBatch(batch.map((m) => m.content));
+          const embeddings = await provider.embedBatch(
+            batch.map((m) => m.content),
+            { kind: "document" },
+          );
           for (let j = 0; j < embeddings.length; j++) {
             if (embeddings[j]) {
               await store.updateEmbedding(batch[j]!.id, embeddings[j]!, provider.name);

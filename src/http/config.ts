@@ -2,7 +2,6 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import {
   deleteSwarmConfig,
-  getAgentById,
   getResolvedConfig,
   getSwarmConfigById,
   getSwarmConfigLookupById,
@@ -21,17 +20,16 @@ import {
   internalConfigKeyError,
   isApiOnlyConfigKey,
   isInternalConfigKey,
-  isReservedConfigKey,
-  reservedKeyError,
-  validateConfigValue,
-  validateExportToEnv,
+  validateConfigEntry,
 } from "../be/swarm-config-guard";
+import { isScriptRunToken } from "../be/users";
 import { can, isRbacEnabled, type PermissionVerb } from "../rbac";
-import { SwarmConfigSchema } from "../types";
+import { type SwarmConfig, SwarmConfigSchema } from "../types";
 import { getRequestAuth, type HttpRequestAuth } from "../utils/request-auth-context";
 import { registerVolatileSecret } from "../utils/secret-scrubber";
 import { reloadGlobalConfigsAndIntegrations, scheduleIntegrationsReload } from "./core";
 import { syncRankingAfterConfigChange } from "./ranking";
+import { requestPrincipal } from "./request-principal";
 import { route } from "./route-def";
 import { duplicateGuardedQueryKey, jsonError } from "./utils";
 
@@ -69,34 +67,37 @@ export function readsRepoSecrets(
   }).allow;
 }
 
-async function requestSecretReadScope(
+export async function requestSecretReadScope(
   req: IncomingMessage,
   resolvedScope?: { agentId?: string; repoId?: string },
 ): Promise<"all" | "self" | "none"> {
-  const auth = getRequestAuth(req);
-  if (auth?.kind === "operator") return "all";
-  if (auth?.kind === "agent") {
-    const agent = await getAgentById(auth.agentId);
+  const principal = await requestPrincipal(req, undefined);
+  // Preserve legacy reads without a user or session-token principal.
+  if (!principal || principal.kind === "operator") return "all";
+  if (principal.kind === "guest") return "none";
+  if (principal.kind === "agent") {
     if (
       can({
-        principal: { kind: "agent", agentId: auth.agentId, isLead: agent?.isLead ?? false },
+        principal,
         verb: "config.read.secrets",
         resource: { kind: "none" },
         source: "http",
       }).allow
     )
       return "all";
+    const auth = getRequestAuth(req);
     // Runtime and agent tokens stand in for a worker and read their own agent's
     // scope. Task tokens are ACP harness credentials and read no secrets.
-    if (auth.tokenKind === "task" || resolvedScope?.agentId !== auth.agentId) return "none";
+    if (
+      (auth?.kind === "agent" && auth.tokenKind === "task") ||
+      resolvedScope?.agentId !== principal.agentId
+    )
+      return "none";
     return "self";
   }
-  if (auth?.kind === "guest") return "none";
-  // Preserve legacy reads without a user or session-token principal.
-  if (auth?.kind !== "user") return "all";
   if (!isRbacEnabled()) return "all";
 
-  const grant = await getUserGrant(auth.userId);
+  const grant = await getUserGrant(principal.userId);
   return grant.grantsAll || grant.verbs.has("config.read.secrets") ? "all" : "none";
 }
 
@@ -112,6 +113,49 @@ async function resolveSecretsRead(
     includeRepoSecrets: !(auth?.kind === "agent" && auth.tokenKind !== "task" && scope !== "all"),
     secretsNote: includeSecrets && scope === "none" ? SECRETS_FORCE_MASK_NOTE : "",
   };
+}
+
+/**
+ * Ids of the rows a script run's token reads unmasked on its own
+ * `/api/config/resolved` (its agent over global, no repo secrets). The run
+ * already holds these values in `ctx.swarm.config`. `undefined` for any other
+ * caller.
+ */
+async function scriptRunHeldConfigIds(req: IncomingMessage): Promise<Set<string> | undefined> {
+  const auth = getRequestAuth(req);
+  if (auth?.kind !== "agent" || auth.tokenKind !== "agent") return undefined;
+  if (!(await isScriptRunToken(auth.tokenId))) return undefined;
+  const held = stripApiOnlyKeys(
+    await getResolvedConfig(auth.agentId, undefined, { includeRepoSecrets: false }),
+  );
+  return new Set(held.map((config) => config.id));
+}
+
+/**
+ * Mask a raw list or by-id read for this caller. A script run's token gets
+ * the rows it holds (see {@link scriptRunHeldConfigIds}) unmasked, so
+ * `config_list` and `ctx.swarm.config` agree; every other secret row stays
+ * masked. Unmasked secret values are registered with the scrubber.
+ */
+async function maskConfigRead(
+  req: IncomingMessage,
+  configs: SwarmConfig[],
+  includeSecrets: boolean,
+): Promise<{ result: SwarmConfig[]; secretsNote: string }> {
+  const { effectiveIncludeSecrets, secretsNote } = await resolveSecretsRead(req, includeSecrets);
+  const held =
+    includeSecrets && !effectiveIncludeSecrets ? await scriptRunHeldConfigIds(req) : undefined;
+  const reveal = (config: SwarmConfig) => effectiveIncludeSecrets || !!held?.has(config.id);
+  const result = configs.map((config) =>
+    config.isSecret && !reveal(config) ? maskSecrets([config])[0]! : config,
+  );
+  for (const config of result) {
+    if (config.isSecret && config.value && reveal(config)) {
+      registerVolatileSecret(config.value, `config:${config.key}`);
+    }
+  }
+  const anyMasked = result.some((config) => config.isSecret && !reveal(config));
+  return { result, secretsNote: held && !anyMasked ? "" : secretsNote };
 }
 
 /**
@@ -146,6 +190,25 @@ export async function ensureConfigAdmin(
 }
 
 /**
+ * What a committed config write triggers beyond the row itself. Shared by
+ * `PUT /api/config` and HITL `config` answers.
+ */
+export async function runConfigWriteSideEffects(
+  scope: "global" | "agent" | "repo",
+  key: string,
+  value: string,
+): Promise<void> {
+  if (scope !== "global") return;
+  if (key === "SWARM_ORG_WEBSITE") await fillOrgLogoFromWebsite(value);
+  await syncRankingAfterConfigChange(key, value);
+  // Auto-reload integrations when a global-scoped config changes so callers
+  // (CLI, automation, dashboard) don't have to remember to hit /reload.
+  // Debounced to coalesce sequential single-key upserts from the dashboard
+  // batch save (no bulk endpoint exists).
+  scheduleIntegrationsReload();
+}
+
+/**
  * The general form of `ensureConfigAdmin`: operators and users pass, guests
  * get a plain 403, and an agent principal (session identity first, then the
  * legacy X-Agent-ID header) must hold `verb`. On denial it writes a 403 with
@@ -156,17 +219,18 @@ export async function ensureHttpPermission(
   res: ServerResponse,
   verb: PermissionVerb,
   forbiddenMessage: string,
+  callerAgentId?: string,
 ): Promise<boolean> {
-  const auth = getRequestAuth(req);
-  if (auth?.kind === "operator" || auth?.kind === "user") return true;
-  if (auth?.kind === "guest") {
+  const principal = await requestPrincipal(req, callerAgentId ?? singleHeader(req, "x-agent-id"), {
+    unauthenticatedFallback: "anonymous-agent",
+  });
+  if (principal.kind === "operator" || principal.kind === "user") return true;
+  if (principal.kind === "guest") {
     jsonError(res, "Forbidden", 403);
     return false;
   }
-  const agentId = auth?.kind === "agent" ? auth.agentId : singleHeader(req, "x-agent-id");
-  const agent = agentId ? await getAgentById(agentId) : undefined;
   const decision = can({
-    principal: { kind: "agent", agentId: agentId ?? "", isLead: agent?.isLead ?? false },
+    principal,
     verb,
     resource: { kind: "none" },
     source: "http",
@@ -439,13 +503,9 @@ export async function handleConfig(
       jsonError(res, "Config not found", 404);
       return true;
     }
-    const { effectiveIncludeSecrets, secretsNote } = await resolveSecretsRead(req, includeSecrets);
-    const singleResult = effectiveIncludeSecrets ? config : maskSecrets([config])[0]!;
-    if (effectiveIncludeSecrets && singleResult.isSecret && singleResult.value) {
-      registerVolatileSecret(singleResult.value, `config:${singleResult.key}`);
-    }
+    const { result, secretsNote } = await maskConfigRead(req, [config], includeSecrets);
     getConfigById.respond(res, 200, {
-      ...singleResult,
+      ...result[0]!,
       ...(secretsNote ? { message: `Found 1 config(s).${secretsNote}` } : {}),
     });
     return true;
@@ -455,7 +515,6 @@ export async function handleConfig(
     const parsed = await listConfig.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
     const includeSecrets = parsed.query.includeSecrets === "true";
-    const { effectiveIncludeSecrets, secretsNote } = await resolveSecretsRead(req, includeSecrets);
     const configs = stripApiOnlyKeys(
       await getSwarmConfigs({
         scope: parsed.query.scope || undefined,
@@ -463,14 +522,7 @@ export async function handleConfig(
         key: parsed.query.key,
       }),
     );
-    const listResult = effectiveIncludeSecrets ? configs : maskSecrets(configs);
-    if (effectiveIncludeSecrets) {
-      for (const c of listResult) {
-        if (c.isSecret && c.value) {
-          registerVolatileSecret(c.value, `config:${c.key}`);
-        }
-      }
-    }
+    const { result: listResult, secretsNote } = await maskConfigRead(req, configs, includeSecrets);
     listConfig.respond(res, 200, {
       configs: listResult,
       ...(secretsNote ? { message: `Found ${listResult.length} config(s).${secretsNote}` } : {}),
@@ -484,28 +536,7 @@ export async function handleConfig(
     if (!(await ensureConfigAdmin(req, res, "config.write.any"))) return true;
     const { scope, scopeId, key, value, isSecret, envPath, description, exportToEnv } = parsed.body;
 
-    if (scope === "global" && scopeId) {
-      jsonError(res, "Global scope must not have scopeId", 400);
-      return true;
-    }
-
-    if ((scope === "agent" || scope === "repo") && !scopeId) {
-      jsonError(res, "Agent/repo scope requires scopeId", 400);
-      return true;
-    }
-
-    if (isReservedConfigKey(key)) {
-      jsonError(res, reservedKeyError(key).message, 400);
-      return true;
-    }
-
-    if (isInternalConfigKey(key)) {
-      jsonError(res, internalConfigKeyError(key).message, 400);
-      return true;
-    }
-
-    const validationError =
-      validateConfigValue(key, value) ?? validateExportToEnv(key, exportToEnv);
+    const validationError = validateConfigEntry({ scope, scopeId, key, value, exportToEnv });
     if (validationError) {
       jsonError(res, validationError, 400);
       return true;
@@ -523,17 +554,7 @@ export async function handleConfig(
         description: description || null,
         exportToEnv,
       });
-      // Auto-reload integrations when a global-scoped config changes so callers
-      // (CLI, automation, dashboard) don't have to remember to hit /reload.
-      // Debounced to coalesce sequential single-key upserts from the dashboard
-      // batch save (no bulk endpoint exists).
-      if (scope === "global" && key === "SWARM_ORG_WEBSITE") {
-        await fillOrgLogoFromWebsite(String(value));
-      }
-      if (scope === "global") await syncRankingAfterConfigChange(key, String(value));
-      if (scope === "global") {
-        scheduleIntegrationsReload();
-      }
+      await runConfigWriteSideEffects(scope, key, String(value));
       const result = includeSecrets || !config.isSecret ? config : maskSecrets([config])[0]!;
       upsertConfig.respond(res, 200, result);
     } catch (error) {

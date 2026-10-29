@@ -17,7 +17,7 @@ export function routeAuthHeaders(ctx: {
   return { [auth.header]: secret };
 }
 
-async function readBody(res: Response): Promise<string> {
+export async function readBody(res: Response): Promise<string> {
   try {
     return await res.text();
   } catch {
@@ -25,7 +25,7 @@ async function readBody(res: Response): Promise<string> {
   }
 }
 
-function modelIds(body: string): string[] | undefined {
+export function modelIds(body: string): string[] | undefined {
   try {
     const parsed = JSON.parse(body) as { data?: Array<{ id?: unknown }> };
     if (!Array.isArray(parsed.data)) return undefined;
@@ -61,5 +61,9 @@ export async function checkAnthropicModels(
       reason: `HTTP ${res.status}: the endpoint does not list models, so the key was not checked`,
     };
   }
-  return { status: "failed", reason: `HTTP ${res.status}: ${body.slice(0, 200)}` };
+  return {
+    status: "failed",
+    reason: `HTTP ${res.status}: ${body.slice(0, 200)}`,
+    httpStatus: res.status,
+  };
 }

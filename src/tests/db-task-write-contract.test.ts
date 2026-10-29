@@ -552,6 +552,7 @@ value:recordKeyAuthFailure
 value:recordKeyRateLimitWindows
 value:recordKeySeatMismatch
 value:recordKeyUsage
+value:recordKeyValidation
 value:recordSlackMessage
 value:recordTaskProviderIfUnset
 value:recordTaskPullRequestAttachments
@@ -684,7 +685,6 @@ STEERING_MESSAGE_SELECT
 UNATTRIBUTED_USER_ID
 VERSIONABLE_FIELDS
 WEEK_SECONDS
-WORKFLOW_RUN_SUMMARY_COLUMNS
 abandonSlackOutcomeDelivery
 acceptTask
 assertSkillFileLimits
@@ -1097,8 +1097,6 @@ rowToUser
 rowToUserFavorite
 rowToWaitState
 rowToWorkflow
-rowToWorkflowRun
-rowToWorkflowRunStep
 rowToWorkflowSummary
 rowToWorkflowVersion
 scriptRunUpdateSets

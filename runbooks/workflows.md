@@ -298,22 +298,88 @@ A `sub-workflow` node runs another workflow as a child run and waits for it.
   parent run stay `waiting` until the child run is terminal, so the parent never completes while its
   child is running, waiting on a human, or awaiting a retry.
 - A child that fails, is cancelled, or is skipped (cooldown) fails the node and the parent run,
-  whatever `onNodeFailure` says. Node `retry` reconnects to the same failed child, so it does not
-  rerun it.
-- The child run stores the parent step in `workflow_runs.parentStepId` (unique). A re-executed step
-  reconnects to that child instead of starting a second one. The child's terminal status emits
-  `workflow.child.finished` after commit. The engine rechecks the child once the step parks, and the
-  recovery sweep resumes any waiting step whose child already finished, so a lost event or a
-  restart does not strand the parent.
+  whatever `onNodeFailure` says. Node `retry` is a new attempt: it starts a new child run, and the
+  previous attempt's child can no longer settle the step.
+- The child run stores the parent step and that step's attempt (`retryCount`) in
+  `workflow_runs.parentStepId` / `parentStepAttempt` (unique together). One attempt has at most one
+  child: a re-executed or recovered step reconnects to it, and concurrent executions get the same
+  child. The child is created in one transaction with its initial context, and only while the
+  parent step's attempt is still `running` in a live run. A step a crash left `running` is
+  re-claimed by recovery under the same step id, so it reconnects instead of starting a second
+  child. The child's terminal status emits `workflow.child.finished` after commit. The engine and
+  the retry poller recheck the child once the step parks, and the recovery sweep resumes any
+  waiting step whose child already finished, so a lost event or a restart does not strand the
+  parent. Only the call that claims the waiting step routes its successors.
 - Deleting a workflow fails every waiting step that started one of its runs as a child. Recovery
   also fails a waiting step whose child row is missing.
 - Recursion is rejected: a workflow cannot invoke itself or any workflow already running in its
   ancestor runs, and nesting stops at 16 levels below the root run (`MAX_SUB_WORKFLOW_DEPTH`). The
   checks run when the node executes, not when the definition is saved.
+- Cancelling a run cancels its child runs too (see [Cancelling a run](#cancelling-a-run)).
 - Not yet supported (tracked in the sub-workflow issue): pinning the child's definition version
-  (the child runs its live definition), cancelling the child when the parent is cancelled, and a
-  per-node timeout. As a `foreach` body, a run retry gives the failed item a new child run (see
+  (the child runs its live definition) and a per-node timeout. As a `foreach` body, a run retry gives the failed item a new child run (see
   [Retry with preserved siblings](#retry-with-preserved-siblings)).
+
+## Cancelling a run
+
+`cancelWorkflowRun` (`src/workflows/resume.ts`) backs the HTTP route
+(`POST /api/workflow-runs/{id}/cancel`), the `cancel-workflow-run` MCP tool and the dashboard. An
+approval cancel and the approval auto-cancel sweep cancel their run through the same
+`cancelWorkflowRunRows`.
+
+- The cancel covers the run and every run below it: children of every attempt of every
+  `sub-workflow` step, through runs that already ended. The tree comes only from stored links
+  (`child.parentStepId` → step → run). Run outputs, names and trigger data are never used.
+- One `BEGIN IMMEDIATE` transaction reads the tree and, for each run, cancels its open tasks
+  (found by the indexed `agent_tasks.workflowRunId`; a retry detaches only the step link, so tasks
+  of earlier attempts are included), its non-terminal steps, its pending approvals and its queued
+  step retries (`nextRetryAt` is cleared). Every non-terminal run becomes `cancelled` with the
+  reason. A completed, failed or skipped descendant keeps its status, error and output; only its
+  leftover open work is cancelled.
+- Steps, retries and descendant runs are written with one `UPDATE` per 500 runs, and dependents of
+  the cancelled tasks are looked up in one scan over open tasks, only when the tree has open tasks. Only the root goes through `updateWorkflowRun`, so
+  a root that is itself a child still wakes its parent step. Measured on a laptop: 2017 runs in
+  about 0.3 s, 10k runs in about 1.4 s, about 140 µs per run (mostly the per-task `cancelTask`).
+- A root that is completed, failed or skipped is refused, as before. A `cancelled` root is walked
+  again, so a repeat cancel finishes descendants an earlier cancel (or an older release) left open.
+  Reasons already written are kept.
+- A repeat cancel of a tree with nothing left open (no live run, open step, queued retry, open
+  task or pending approval) is answered in a read-only transaction: no write lock, no dependents
+  scan, no cancel writes. The guards below keep a cancelled tree from gaining work, so that answer
+  holds. It still returns the tree's run ids, so Slack posts an earlier cancel could not deliver
+  (an outage releases the claim) are retried; a delivered post is never sent again.
+  Concurrent `cancelWorkflowRun` calls for one run in the API process share one cancel.
+- There is no size limit: the engine admits any number of children per run, and every tree it
+  admitted stays cancellable. The walk goes level by level and stops at the first run it reaches
+  twice. A cycle in the links or a chain deeper than `WORKFLOW_RUN_TREE_MAX_DEPTH` (32, twice the
+  engine's `MAX_SUB_WORKFLOW_DEPTH`) throws, and nothing commits. Any other error rolls back the
+  whole tree too.
+- After commit: worker nudges and task lifecycle events (queued with `afterCommit`), then the Slack
+  update of every cancelled approval in the tree whose post is not delivered yet
+  (`listUndeliveredCancelledApprovalRequestIds` in `src/be/db/approvals.ts`, one query per 500 runs). A failed Slack post
+  is logged; it does not undo the cancel, and the next cancel of the tree retries it.
+
+After the commit, nothing in the tree starts new engine work. The guard is
+`getRunLineageBlock(runId)` (`src/be/db/workflow-runs.ts`): it blocks a run that is cancelled, has a
+cancelled ancestor, or has a broken parent link, a cycle or too deep a chain. Completed and failed
+ancestors do not block. Each write that starts work checks it inside its own transaction, so a
+cancel either commits first and is seen there, or sees the new row and cancels it:
+
+| Path | Guard |
+|---|---|
+| Child run insert | `isParentStepAttemptCurrent`: step attempt `running`, run live, lineage clear |
+| Workflow task insert (`createTaskExtended` with `workflowRunStepId`) | `getStepExecutionBlock`; throws `WorkflowStepNotExecutableError` |
+| Approval request linked to an existing run (HITL executor, `POST /api/approval-requests`), with or without a step | created `cancelled` |
+| Step claim (`executeStep`), foreach item claim | no step is claimed |
+| Checkpoint fences, `checkpointStepWaiting` | nothing is written |
+| Task / approval / wait / child-run callbacks, `scheduleTaskStepRetry` | the step is not claimed and nothing routes |
+| Retry poller claim | the retry is dropped (`nextRetryAt` cleared); a failed run is never revived |
+| Manual `retryFailedRun` | refused, run stays `failed` |
+| Run finalizers (walk, `finalizeOrWait`, recovery, retry poller) | the run is not completed or parked |
+
+The cancel is a database guarantee. It does not stop a process that is already running (a script,
+an LLM call, an agent session until the worker sees its task cancelled) and does not undo external
+side effects that already happened.
 
 ## Agent-task steps cut by a deploy
 
@@ -326,10 +392,17 @@ A deploy drain or heartbeat remediation fails an in-flight workflow-step task wi
 - An explicit node `retry` always wins. `retry: { maxRetries: 0 }` is the opt-out for a node with
   external side effects that must not run twice.
 - A second cut exhausts the implicit retry and follows `onNodeFailure`.
-- Foreach children (`<foreachId>#<key>`) are not covered: the retry poller resolves the node by
-  exact id (`src/workflows/retry-poller.ts`) and cannot re-dispatch a child step. Automatic per-item
-  retry is a follow-up to #2029; until then, a cut item follows its fan-out's failure policy, and a
-  fail-fast run is resumed with `retry-workflow-run`, which reruns only the failed items.
+- A foreach child (`<foreachId>#<key>`) with an `agent-task` body gets the same retry. The parent
+  foreach node's `retry` applies to its items (the body carries none), else
+  `SUPERSEDE_RETRY_POLICY` on a cut, so `retry: { maxRetries: 0 }` on the foreach opts every item
+  out. A queued item is not settled: the join stays open and the item keeps its `concurrency` slot.
+  When the retry is due, the retry poller (`src/workflows/retry-poller.ts`) flips the item back to
+  `pending` and drives the fan-out, which starts it with a fresh task; its result settles into the
+  join like any other item. A fail-fast failure of a sibling cancels a queued item with the rest of
+  the queue. A queued item never revives a failed run: a cut whose run already failed is recorded as
+  the item's failure, and when another branch fails the run the poller retires the queued retry
+  instead of running it. `retry-workflow-run` then gives the item one new attempt. Exhausted
+  retries and every other failure follow the fan-out's failure policy as before.
 
 ## Script node types
 
@@ -357,11 +430,21 @@ Inline executable source may interpolate only `input`, `workflow`, `swarm`, and 
 - `pinHash`: optional script content hash. When set, execution uses the matching `script_versions` row instead of the latest live source.
 - `args`: optional JSON object passed to the script as its first argument. Values support normal workflow interpolation.
 - `fsMode`: optional, defaults to `none`. `workspace-rw` is reserved for v2 worker-side execution and fails in v1 with a clear workflow-node error.
-- `timeoutMs`: optional wall-clock timeout in milliseconds. Defaults to `30000` (30s), accepts integers from `1000` through `300000` (5m), and applies both to the workflow step timeout and the scripts-runtime `wallClockMs` resource budget.
+- `timeoutMs`: optional wall-clock timeout in milliseconds. Defaults to `30000` (30s), accepts integers from `1000` through `300000` (5m), and applies both to the workflow step timeout and the scripts-runtime `wallClockMs` resource budget. When the step watchdog fires first (for example because the API was slow to reach the spawn), it aborts the executor and the script process is killed, so a step reported as timed out does not go on to perform the script's side effects.
 
 Catalog script source is never workflow-interpolated. If it contains a token rooted at a built-in workflow value or a declared input alias, the node fails with guidance to pass that value through `config.args`; unrelated mustache text remains literal script data.
 
-Agent-scoped lookup uses the workflow's `createdByAgentId`. If a workflow has no creator, `trigger.agentId` is accepted as a fallback; otherwise only global scripts can be resolved.
+The node runs as the workflow's `createdByAgentId`. A workflow with no creator (seeded, or created without `X-Agent-ID`) runs as the agent the server stamped on the run (`workflow_runs.triggeredByAgentId`), never as `trigger.agentId`, which the caller controls:
+
+| Run started by | Principal |
+| --- | --- |
+| `trigger-workflow` MCP tool | the calling agent |
+| `POST /api/workflows/:id/trigger` | the request's `X-Agent-ID` |
+| A schedule with `targetType: workflow` | the schedule's `createdByAgentId` (not `targetAgentId`, which the creator picks) |
+| A `sub-workflow` node | the parent's principal (its creator, else its stamped agent); `agentId` in `inputs` is plain data |
+| Webhook or event trigger | none: the `workflow` sentinel with no agent token, global scripts only |
+
+Retries and resumes reuse the run row, so they keep its principal. `trigger.agentId` remains ordinary trigger data for interpolation. Agent-scoped lookup uses the same principal; with none, only global scripts resolve. A seeded workflow should pin `scope: "global"` on every node so the starting agent cannot swap a script for its own copy.
 
 `timeoutMs` controls elapsed wall-clock time, not CPU time. The scripts runtime deliberately keeps a separate 60s CPU-time ulimit, so an I/O-bound or waiting script can use the full 5-minute wall-clock window while a hot loop is still terminated after roughly 60 CPU seconds. Workflow create, update, bulk-patch, and single-node patch operations validate executor config and reject values outside the allowed range before saving.
 
@@ -719,6 +802,57 @@ Each workflow run persists the trusted human requester in `workflow_runs.created
 
 Retry, resume, and recovery reconstruct requester context from the workflow run. Agent-task nodes created after a restart therefore keep the original `requestedByUserId` instead of losing attribution at the checkpoint boundary. Historical runs with `created_by = NULL` are not backfilled because no trustworthy requester can be recovered.
 
+## Waiting on a trigger
+
+A top-level trigger (MCP `trigger-workflow`, `POST /api/workflows/{id}/trigger`, webhooks) resolves only after the new run walks its instant steps, up to the end of the run or its first async step (`agent-task`, `foreach`, `wait`, ...). A caller that needs only the `runId` waits for all of that. MCP `trigger-workflow` and `ctx.swarm.workflow_trigger` in a script take `wait: false` (the REST route takes `?wait=false`) to return once the run is committed and walk it in the background, as a `sub-workflow` child does. A script step that fires another workflow should pass it, or the step's timeout covers the other workflow's steps too.
+
+## Idempotent create and trigger
+
+`POST /api/workflows` and `POST /api/workflows/{id}/trigger` take an optional `Idempotency-Key` header (1-255 visible ASCII characters). Without it, nothing changes. With it, the server accepts one operation per key and answers every retry with that operation's original status and body, plus `Idempotent-Replayed: true`.
+
+MCP `trigger-workflow` and `ctx.swarm.workflow_trigger` take the same key as `idempotencyKey`, with the same record, scope (`agent:<calling agent>`) and rules. The tool reports a replay as `replayed: true` and a different body as an error with `idempotencyConflict: true`; the script SDK sends the header to the REST route and returns its status and body.
+
+Guarantee boundary: the server accepts the request once. Node side effects inside the run are not made exactly-once by this.
+
+A script step that triggers another workflow at most once per business key (a PR head, an order id) should pass that key as `idempotencyKey` instead of claiming the key in KV first. A step timeout kills the script, and a kill between a KV claim and the trigger leaves the claim held with no run, so a retry skips the work. With the key, a kill before the run commits leaves nothing behind, and a retry after it commits gets the same run back. Give the node a `retry` policy so a timed-out attempt runs again.
+
+| Request | Result |
+|---|---|
+| No key | Same as before; nothing recorded |
+| New key | Normal handling; the key is recorded if the operation is accepted |
+| Same key, equivalent body | Original status and body; nothing created, started or resumed |
+| Same key, different body | `409`, nothing runs |
+| Same key, its workflow was deleted | `410`; the key stays taken and nothing is re-created |
+| Concurrent identical requests | One workflow or run; the others get its result |
+
+### Scope and fingerprint
+
+The scope is `(principal, operation, targetId, sha256(key))`, unique in `workflow_idempotency_keys`:
+
+- `principal`: `user:<id>` for user tokens, `agent:<id>` for agent session tokens, `controller:<id>`, and for the swarm API key `agent:<X-Agent-ID>` or `operator`. It never contains a bearer value, so rotating a token keeps the scope. Under the shared swarm key, X-Agent-ID only keeps workers' keys apart; it is not an access boundary. Guest page sessions get `400`.
+- `operation`: `workflow.create` or `workflow.trigger`. `targetId` is the workflow id for trigger, empty for create.
+- The fingerprint is a SHA-256 of the canonical body: object keys sorted (code-unit order), array order kept, nothing redacted first. For create it is the zod-parsed body, so unknown fields are ignored as the route schema ignores them. Workflow state (definition, status) is not part of it.
+
+### Transaction boundaries
+
+- Create: one transaction checks the scope, inserts the workflow, and inserts the record with the response snapshot (workflow plus `warnings`, computed before the transaction).
+- Trigger: the record is inserted by the `accept` hook of `startWorkflowExecution` (`src/workflows/engine.ts`), inside the transaction that commits the run and its initial state (`createRunWithInitialState`), or inside the transaction around the day's setup-failure run. Cooldown skips, readiness and input failures, and setup failures are all accepted runs.
+- A concurrent request blocks on `BEGIN IMMEDIATE`, then finds the winner's record in its own transaction, throws `IdempotencyKeyTakenError`, rolls back and replays. The unique index backs this across processes. The loser never walks the graph, alerts or emits telemetry.
+- Nothing is held open across network calls: readiness warnings, input resolution and the graph walk run outside the transaction.
+- After the commit, a crash before the walk leaves a `running` run with its context; recovery walks it, and a retry replays the stored result. A failure after the commit (walk error, lost response) never deletes the record.
+
+### Order of checks
+
+Authentication runs first on every request; a revoked token gets `401` and no replay. Then the record is looked up, before definition validation (create) and before the existence, enabled, cooldown, readiness and trigger-schema checks (trigger). Errors before acceptance (`400`, `403`, `404`, trigger schema) do not record the key.
+
+### Storage and lifecycle
+
+- `responseBody` is sealed with `sealJson` (registered in `SEALED_REPLAY_COLUMNS`). The key and the request are stored only as hashes.
+- Deleting a workflow (`deleteWorkflowRows`) clears `responseBody` and sets `resourceDeletedAt` on every record naming it. That removes the extra copy of the definition and keeps the key taken.
+- No TTL: records are never reused or pruned automatically.
+
+Code: `src/be/db/workflow-idempotency.ts`, `src/http/idempotency-key.ts`, `src/http/workflows.ts`. Tests: `src/tests/workflow-idempotency.test.ts`.
+
 ## Trigger schema
 
 `triggerSchema` is an optional JSON Schema attached to a workflow that validates the `triggerData` payload for every trigger path — manual `/trigger`, webhooks, schedules, and MCP `trigger-workflow`. When set, mismatched payloads are rejected before the workflow starts (no run is created, no nodes execute). When unset (the default), any payload is accepted.
@@ -871,6 +1005,7 @@ The following events are already emitted on `workflowEventBus` today and are usa
 | `task.created` / `task.progress` / `task.budget_refused` | `src/be/db.ts` | task-id keyed lifecycle payloads |
 | `approval.resolved` | `src/http/approval-requests.ts` (respond route) | `{ requestId, status, responses, workflowRunId?, workflowRunStepId?, sourceTaskId? }`; the run and step id are absent for a standalone request, so a `wait` node with `scope: "global"` and no filter also fires for those |
 | `workflow.child.finished` | `src/be/db.ts` (`updateWorkflowRun`, terminal status of a run with a `parentStepId`) | `{ childRunId, parentStepId }` |
+| `workflow.run.finished` | `src/be/db.ts` (`updateWorkflowRun`), `src/be/db/workflow-runs.ts` (`cancelLiveWorkflowTreeRuns`), `src/be/automation-preflight.ts` (preflight failure run) | `{ runId, workflowId, status }`; once per run turning `completed`, `failed`, `cancelled` or `skipped`, top-level and child runs alike. See "Waiting for another run to end" |
 | `agentmail.message.received` | `src/agentmail/handlers.ts:168` | inbox/message keyed payload |
 | `slack.message` | `src/slack/handlers.ts` | `{ channel, text, user, ts, threadTs }` |
 | `chat.message.received` | `src/integrations/chat-sdk/inbound.ts` | `{ adapter, channelId, threadId, userId, text, messageId }` |
@@ -889,6 +1024,27 @@ The following events are already emitted on `workflowEventBus` today and are usa
 | `bitbucket.pull_request.declined` | `src/http/webhooks.ts` (Bitbucket dispatch, `pullrequest:rejected`) | `{ repo, number, title?, body?, action, user_login }` |
 
 For `task.completed` specifically, the canonical payload shape lives in `src/be/db.ts` next to the emit site. Because it includes `workflowRunId`, you can use a `scope: run` wait with a filter like `{ workflowRunId: "<the run id>" }` to correlate against a specific upstream task — see "Ordering caveat" below.
+
+### Waiting for another run to end
+
+Every run emits `workflow.run.finished` after the commit that makes it terminal: `completed`, `failed`, `cancelled` or `skipped`. It covers top-level runs, detached runs and child runs, including the descendants a cascade cancel closes. A later write to a run that is already terminal does not emit again; a retried run emits again when it ends again.
+
+The payload names the finished run `runId`, never `workflowRunId` or `_runId`, so the event is never in the waiting run's own `run` scope. Wait with `scope: global` and filter on `runId`:
+
+```yaml
+- id: wait-for-review
+  type: wait
+  config:
+    mode: event
+    eventName: workflow.run.finished
+    scope: global
+    filter:
+      runId: "<the run id you started>"
+    timeoutMs: 3600000
+  next: { event: read-result, timeout: give-up }
+```
+
+The ordering caveat below applies: the wait must register before the run ends. If the run may already be terminal, read its status before the wait, or set `timeoutMs` and re-read on `timeout`.
 
 ### What's NOT yet on the bus
 

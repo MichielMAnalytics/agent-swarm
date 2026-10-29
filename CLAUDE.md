@@ -33,7 +33,7 @@ Prefer portable `modelTier` (`smol` / `regular` / `smart` / `ultra`) for cross-h
 
 Architecture: API server owns the `scripts` + `script_versions` tables. Workers + the runtime invoke via HTTP. The runtime evaluates user-supplied TS in a `Bun.spawn` subprocess wrapped in `ulimit -v 524288 -t 60 -u 32 -f 65536 -n 64`, launched as `bun --no-orphans` (the harness dies with the API and SIGKILLs its whole descendant tree on exit; added by `buildSandboxedCommand` in `src/utils/sandboxed-process.ts`), a wall-clock AbortController (30s default; up to 5m where exposed), and a 1 MB stdout cap.
 
-Config injection: agent identity + bearer + mcpBaseUrl flow as a JSON `SwarmConfigPayload` over the subprocess **stdin** — NOT env vars. Bearer is wrapped in `Redacted<string>` inside the script; user code never unwraps. `process.env` carries only Node/Bun defaults. Loader reads the bearer via `getApiKey()` from `src/utils/api-key.ts` (never raw env).
+Config injection: agent identity + bearer + mcpBaseUrl flow as a JSON `SwarmConfigPayload` over the subprocess **stdin** — NOT env vars. Bearer is wrapped in `Redacted<string>` inside the script; user code never unwraps. `process.env` carries only Node/Bun defaults. Api-side callers run scripts through `runScriptWithRunCredential` (`src/be/scripts/run-credential.ts`): it mints a per-run token bound to the executing agent, passes it to `runScript` as `apiKey`, and revokes it when the run ends. Runs with no real agent (sentinel ids) get no token, and the loader falls back to `getApiKey()` from `src/utils/api-key.ts` (never raw env).
 
 FS modes: `'none'` = per-run tmpdir (v1 only); `'workspace-rw'` returns 501 in v1 (worker dispatch is v2).
 
@@ -318,6 +318,8 @@ Hard rules:
 
 <important if="you are preparing a commit, push, or pull request — or CI just failed and you need to know why">
 
+`CHANGELOG.md` is edited only by release PRs (`release: vX.Y.Z`); feature, fix, chore and docs PRs never touch it, not even an `[Unreleased]` entry. On a `CHANGELOG.md` merge conflict in a non-release PR, restore the merge-base version so the PR diff shows no CHANGELOG change.
+
 Mirror what `.github/workflows/merge-gate.yml` runs. Full job-by-job breakdown, drift checks, lockfile rules, and "why CI fails" list: [runbooks/ci.md](./runbooks/ci.md).
 
 Inner loop: `bun run check:local` (`scripts/check.sh`). It runs a frozen install, Biome on changed files, `bun check`, and the tests affected by your change (the pre-push hook's scoping). Run it before every push. Secrets scanning stays with the prek hooks.
@@ -343,6 +345,7 @@ Drift checks — run only if you touched the trigger files, MUST commit any rege
 
 - Edited `plugin/commands/*.md`? → `bun run build:pi-skills`
 - Edited `content.md` or `config.json` under `templates/skills/` in a directory with a `SKILL.md`? → `bun run build:skill-md` and commit the generated file
+- Edited the frontmatter of a page under `docs-site/content/docs/`, or added, moved or removed a page? → `bun run build:docs-index` and commit `templates/skills/swarm-docs/content.md`
 - Added/edited a file under `templates/skills/*/files/`? → `bun run build:seed-skill-files` and commit `src/be/seed-skills/bundled-files.generated.json` (NEVER hand-edit that JSON)
 - Edited `src/be/scripts/typecheck.ts` or `src/scripts-runtime/sdk-allowlist.ts`? → `bun run build:script-types` and commit `src/scripts-runtime/types/*.d.ts` (NEVER edit those `.d.ts` files directly — they're generated from `typecheck.ts`)
 - Edited `apps/ui/src/logs-parser/**` or `src/utils/dsh-usage.ts`? → `bun run build:claude-mod` and commit `claude-mod/vendor/logs-parser.js` (the Claude Code mod's bundle of the parser)
@@ -364,9 +367,9 @@ PR descriptions MUST fill every required section of [.github/pull_request_templa
 
 - **Why**: one sentence, paraphrased. Link only public sources here (Fixes #N, a public PR or issue). Never paste customer names or verbatim quotes from private chat. Do not rewrite the ask to match what you built.
 - **Risk**: how deep to read, set by the author. `high` (migration, auth/RBAC, secrets, billing, data deletion, prompt or routing changes that hit every agent, a public API break) adds the `risk:high` label. Review pings stay driven by Urgency.
-- **Swarm provenance**: links to the swarm task and its tree, the Slack permalink of the ask, any workflow run, and the plan or research (share link plus durable agent-fs path). These auth-gated links are allowed **only** in this section. Bare Slack ids, ts values and private-chat quotes stay blocked everywhere. The **PR Body** check and a PreToolUse hook on `gh pr create|edit` enforce this for bot bodies (`src/utils/pr-body-leaks.ts`).
+- **Swarm provenance**: links to the swarm task and its tree, the Slack permalink of the ask, any workflow run, and the plan or research (agent-fs live app link). These auth-gated links are allowed **only** in this section. Bare Slack ids, ts values and private-chat quotes stay blocked everywhere. The **PR Body** check and a PreToolUse hook on `gh pr create|edit` enforce this for bot bodies (`src/utils/pr-body-leaks.ts`).
 - **Urgency**: copy it from the request. If the request gives none, check "nice to have". Never pick it yourself. After the check passes, "asap" requests a review from tarasyarema and posts a comment. "this week" requests a review from desplega-bot, which starts a swarm review.
-- **Links**: images, GIFs and mp4s as GitHub user attachments (`github-attach` skill); docs as `agent-fs share-create` links. A presigned `signed-url` is an image-only fallback, with `--inline`. Never use one for docs or mp4s: it downloads and expires in 7 days.
+- **Links**: images, GIFs and mp4s as GitHub user attachments (`github-attach` skill); docs as the agent-fs live app link under Swarm provenance. Make an `agent-fs share-create` link only when the requester asks for one or a reader has no agent-fs login. A presigned `signed-url` is an image-only fallback, with `--inline`. Never use one for docs or mp4s: it downloads and expires in 7 days.
 
 `gh pr create --body` skips the template, so write the description to a file, check it, then pass the file:
 

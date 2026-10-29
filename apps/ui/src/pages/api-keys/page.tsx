@@ -26,6 +26,7 @@ import {
 import type { ApiKeyStatus, ApiKeyStatusType } from "@/api/types";
 import { DataGrid, HIDE_WHEN_COMPACT } from "@/components/shared/data-grid";
 import { HarnessIcon } from "@/components/shared/harness-icon";
+import { KeyStatusPill, type KeyStatusTone } from "@/components/shared/key-status-pill";
 import { isSubscriptionKeyType, PlanPicker } from "@/components/shared/plan-picker";
 import { ProviderIcon } from "@/components/shared/provider-icon";
 import { Badge } from "@/components/ui/badge";
@@ -52,31 +53,34 @@ import type { ProviderIconKey } from "@/lib/agent-runtime-models";
 import { formatCost } from "@/lib/cost-format";
 import { cn, formatSmartTime } from "@/lib/utils";
 
-const statusConfig: Record<ApiKeyStatusType, { label: string; dot: string; tone: string }> = {
-  available: {
-    label: "AVAILABLE",
-    dot: "bg-status-success",
-    tone: "border-status-success/30 text-status-success-strong",
-  },
-  rate_limited: {
-    label: "RATE LIMITED",
-    dot: "bg-status-error",
-    tone: "border-status-error/30 text-status-error-strong",
-  },
+const statusConfig: Record<ApiKeyStatusType, { label: string; tone: KeyStatusTone }> = {
+  available: { label: "AVAILABLE", tone: "success" },
+  rate_limited: { label: "RATE LIMITED", tone: "error" },
 };
 
-function KeyStatusBadge({ status }: { status: ApiKeyStatusType }) {
-  const config = statusConfig[status] ?? {
-    label: status,
-    dot: "bg-status-neutral",
-    tone: "border-status-neutral/30 text-status-neutral-strong",
-  };
+/** Workers skip a key the provider rejected with HTTP 401, so it reads as its own state. */
+function isRejected(key: ApiKeyStatus): boolean {
+  return key.lastValidationFailedAt != null;
+}
+
+function RejectedBadge({ keyStatus }: { keyStatus: ApiKeyStatus }) {
+  const reason = keyStatus.lastValidationError ?? "Rejected";
+  const when = keyStatus.lastValidationFailedAt
+    ? `, ${formatSmartTime(keyStatus.lastValidationFailedAt)}`
+    : "";
   return (
-    <Badge variant="outline" size="tag" className={cn("gap-1.5", config.tone)}>
-      <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", config.dot)} />
-      {config.label}
-    </Badge>
+    <KeyStatusPill
+      tone="error"
+      title={`The provider rejected this key in the last check (${reason}${when}). Agents skip it until it passes.`}
+    >
+      REJECTED
+    </KeyStatusPill>
   );
+}
+
+function KeyStatusBadge({ status }: { status: ApiKeyStatusType }) {
+  const config = statusConfig[status] ?? { label: status, tone: "neutral" };
+  return <KeyStatusPill tone={config.tone}>{config.label}</KeyStatusPill>;
 }
 
 type KeyTypeMeta = { label: string; icon: ProviderIconKey | null };
@@ -226,7 +230,7 @@ export default function ApiKeysPage() {
   const providerFilter = readStringParam(searchParams, "provider", "all");
   // Dialog state for renaming a single key. Decoupled from AG Grid edit
   // mode (which has too many gotchas around cell focus / suppressCellFocus
-  // / cellRenderer click forwarding) — clicking the pencil icon opens this
+  // / cellRenderer click forwarding). Clicking the pencil icon opens this
   // dialog directly and the mutation flows through useSetApiKeyName.
   const [editingKey, setEditingKey] = useState<ApiKeyStatus | null>(null);
   const [editingName, setEditingName] = useState("");
@@ -291,6 +295,10 @@ export default function ApiKeysPage() {
     return keys.filter((k) => {
       if (statusFilter === "model_limited") {
         if (!k.modelLimits.some((l) => l.active)) return false;
+      } else if (statusFilter === "rejected") {
+        if (!isRejected(k)) return false;
+      } else if (statusFilter === "available") {
+        if (k.status !== "available" || isRejected(k)) return false;
       } else if (statusFilter !== "all" && k.status !== statusFilter) {
         return false;
       }
@@ -303,12 +311,21 @@ export default function ApiKeysPage() {
   const stats = useMemo(() => {
     const totalCost = costs ? costs.reduce((sum, c) => sum + c.totalCost, 0) : 0;
     if (!keys)
-      return { total: 0, available: 0, rateLimited: 0, modelLimited: 0, totalUsage: 0, totalCost };
+      return {
+        total: 0,
+        available: 0,
+        rateLimited: 0,
+        modelLimited: 0,
+        rejected: 0,
+        totalUsage: 0,
+        totalCost,
+      };
     return {
       total: keys.length,
-      available: keys.filter((k) => k.status === "available").length,
+      available: keys.filter((k) => k.status === "available" && !isRejected(k)).length,
       rateLimited: keys.filter((k) => k.status === "rate_limited").length,
       modelLimited: keys.filter((k) => k.modelLimits.some((l) => l.active)).length,
+      rejected: keys.filter(isRejected).length,
       totalUsage: keys.reduce((sum, k) => sum + k.totalUsageCount, 0),
       totalCost,
     };
@@ -429,7 +446,11 @@ export default function ApiKeysPage() {
         width: 140,
         cellRenderer: (params: { value: ApiKeyStatusType; data: ApiKeyStatus | undefined }) => (
           <div className="flex flex-col gap-1 py-1">
-            <KeyStatusBadge status={params.value} />
+            {params.data && isRejected(params.data) ? (
+              <RejectedBadge keyStatus={params.data} />
+            ) : (
+              <KeyStatusBadge status={params.value} />
+            )}
             {params.data && params.value === "available" && (
               <ModelLimitBadges modelLimits={params.data.modelLimits} />
             )}
@@ -542,10 +563,16 @@ export default function ApiKeysPage() {
 
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-4">
-      <PageHeader title="API Keys" />
+      <PageHeader title="Provider keys" />
 
       {/* Summary cards */}
-      <div className="grid gap-3 grid-cols-2 lg:grid-cols-6">
+      <div
+        className={cn(
+          "grid gap-3 grid-cols-2",
+          // Seven panels truncate their labels in one row below 2xl.
+          stats.rejected > 0 ? "lg:grid-cols-4 2xl:grid-cols-7" : "lg:grid-cols-6",
+        )}
+      >
         <StatPanel icon={Key} label="Total Keys" value={stats.total} />
         <StatPanel
           icon={ShieldCheck}
@@ -561,6 +588,15 @@ export default function ApiKeysPage() {
           tone="error"
           colorValue
         />
+        {stats.rejected > 0 ? (
+          <StatPanel
+            icon={ShieldAlert}
+            label="Rejected"
+            value={stats.rejected}
+            tone="error"
+            colorValue
+          />
+        ) : null}
         <StatPanel
           icon={AlertTriangle}
           label="Model Limited"
@@ -621,6 +657,7 @@ export default function ApiKeysPage() {
             <SelectItem value="available">Available</SelectItem>
             <SelectItem value="rate_limited">Rate Limited</SelectItem>
             <SelectItem value="model_limited">Model Limited</SelectItem>
+            <SelectItem value="rejected">Rejected</SelectItem>
           </SelectContent>
         </Select>
         {keyTypes.length > 1 && (
@@ -654,7 +691,7 @@ export default function ApiKeysPage() {
         columnDefs={columnDefs}
         quickFilterText={search}
         loading={isLoading}
-        emptyMessage="No API keys tracked yet"
+        emptyMessage="No provider keys tracked yet"
         paginationQueryKey="apiKeys"
       />
 

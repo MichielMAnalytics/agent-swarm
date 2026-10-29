@@ -12,7 +12,7 @@ import {
 import { findUserById } from "../be/users";
 import { can, isRbacEnabled, type RbacPrincipal } from "../rbac";
 import type { AgentTask } from "../types";
-import { getRequestAuth } from "../utils/request-auth-context";
+import { authUserId, getRequestAuth, isOperatorAuth } from "../utils/request-auth-context";
 import { dashboardUserIdHeader } from "./favorite-owner";
 import { type RouteDef, routePathParams } from "./route-def";
 import { jsonError } from "./utils";
@@ -38,9 +38,10 @@ export async function resolveSessionActor(
   myAgentId: string | undefined,
 ): Promise<SessionActor> {
   const auth = getRequestAuth(req);
-  if (auth?.kind === "user") return { kind: "user", userId: auth.userId };
+  const userId = authUserId(auth);
+  if (userId) return { kind: "user", userId };
   if (auth?.kind === "guest") return { kind: "user", userId: null };
-  if (auth?.kind === "operator" && !myAgentId && !auth.page) {
+  if (isOperatorAuth(auth) && !myAgentId && !auth.page) {
     const picked = dashboardUserIdHeader(req);
     if (!picked) return BYPASS;
     const user = await findUserById(picked);
@@ -86,6 +87,30 @@ export async function hasSessionWrite(
 ): Promise<boolean> {
   const access = await sessionAccessFor(await resolveSessionActor(req, myAgentId), taskId);
   return hasSessionAccess(access, "write");
+}
+
+export const NOT_YOUR_TASK_DENIED =
+  "You can only change tasks you requested, or sessions shared with you to edit.";
+
+/**
+ * True when a user token without a grant-all role (RBAC on) changes a task it
+ * does not own: neither the task nor its session root names the user as
+ * requester, and the session is not shared with the user for writing. The
+ * session wall reads an ownerless root (Slack, schedules, operator key) as
+ * everyone's; for such a user it is not theirs to change. Operator, agent and
+ * admin callers are never denied here.
+ */
+export async function deniesNonOwnerTaskWrite(
+  req: IncomingMessage,
+  task: { id: string; requestedByUserId?: string | null },
+): Promise<boolean> {
+  const auth = getRequestAuth(req);
+  if (auth?.kind !== "user" || !isRbacEnabled()) return false;
+  if (task.requestedByUserId === auth.userId) return false;
+  if ((await getUserGrant(auth.userId)).grantsAll) return false;
+  const root = await getSessionRoot(task.id);
+  if (!root?.requestedByUserId) return true;
+  return !hasSessionAccess(await sessionAccessForRoot(auth.userId, root), "write");
 }
 
 /**
@@ -219,9 +244,10 @@ export async function userAgentIdentityDenial(
   if (auth?.kind !== "user" && auth?.kind !== "guest") return null;
   if (pathSegments.length === 1 && pathSegments[0] === "mcp") return USER_AGENT_HEADER_DENIED;
   if (req.headers["x-agent-id"] === undefined) return null;
-  if (auth.kind === "user" && def?.auth?.userNamesAgent) {
+  const userId = authUserId(auth);
+  if (userId && def?.auth?.userNamesAgent) {
     if (!isRbacEnabled()) return null;
-    const grant = await getUserGrant(auth.userId);
+    const grant = await getUserGrant(userId);
     if (grant.grantsAll || grant.verbs.has("agent.act.any")) return null;
   }
   return USER_AGENT_HEADER_DENIED;

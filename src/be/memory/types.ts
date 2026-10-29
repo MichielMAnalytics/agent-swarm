@@ -4,13 +4,39 @@ import type { AgentMemory, AgentMemoryScope, AgentMemorySource } from "@/types";
 // EmbeddingProvider — text to vector, swappable
 // ============================================================================
 
+/**
+ * What an input is for. Some models (nomic-embed) need a task prefix on each
+ * input: one for search queries, another for stored documents. No kind means
+ * no prefix.
+ */
+export type EmbeddingInputKind = "query" | "document";
+
+export interface EmbedOptions {
+  kind?: EmbeddingInputKind;
+}
+
+/**
+ * The settings that decide which vector a stored document gets. Two vectors
+ * compare only when both come from the same space. The API key is not part of
+ * it (a rotated key embeds the same way), and neither is the query prefix (it
+ * changes query vectors only, never stored ones).
+ */
+export interface EmbeddingSpace {
+  baseUrl: string;
+  model: string;
+  dimensions: number;
+  documentPrefix: string;
+}
+
 export interface EmbeddingProvider {
   readonly name: string;
   readonly dimensions: number;
-  embed(text: string): Promise<Float32Array | null>;
-  embedBatch(texts: string[]): Promise<(Float32Array | null)[]>;
+  embed(text: string, opts?: EmbedOptions): Promise<Float32Array | null>;
+  embedBatch(texts: string[], opts?: EmbedOptions): Promise<(Float32Array | null)[]>;
   /** True when the provider has a usable API key — no network call. */
   isConfigured(): boolean;
+  /** The space its document vectors live in. Without it, no space change is tracked. */
+  space?(): EmbeddingSpace;
 }
 
 // ============================================================================
@@ -46,6 +72,8 @@ export interface MemoryStore {
   deleteBySourcePath(sourcePath: string, agentId: string): Promise<number>;
   purgeExpired(): Promise<number>;
   updateEmbedding(id: string, embedding: Float32Array, model: string): Promise<void>;
+  /** Drop a row's vector, so vector search skips it until the backfill embeds it again. */
+  clearEmbedding(id: string): Promise<void>;
   /**
    * Redact a row in place (boot retro-sweep). Writes only if the row still
    * holds `before`; keeps FTS in sync and drops the embedding when the

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { getWorkflowRunTriggeredByAgentId } from "../../be/db/workflow-runs";
 import {
   getScriptApiConnectionDescriptors,
   getScriptMcpConnectionDescriptors,
@@ -10,12 +11,12 @@ import {
   restoreScratchScriptLastUsedIfUnchanged,
   touchScratchScriptLastUsed,
 } from "../../be/scripts/db";
+import { runScriptWithRunCredential } from "../../be/scripts/run-credential";
 import {
   DEFAULT_SCRIPT_RESOURCES,
   MAX_SCRIPT_WALL_CLOCK_MS,
   MIN_SCRIPT_WALL_CLOCK_MS,
 } from "../../scripts-runtime/executors/types";
-import { runScript } from "../../scripts-runtime/loader";
 import type { ExecutorMeta } from "../../types";
 import { getMcpBaseUrl } from "../../utils/constants";
 import { findInterpolationTokens } from "../../utils/template";
@@ -78,7 +79,7 @@ export class SwarmScriptExecutor extends BaseExecutor<
 
   protected async execute(
     config: SwarmScriptConfig,
-    context: Readonly<Record<string, unknown>>,
+    _context: Readonly<Record<string, unknown>>,
     meta: ExecutorMeta,
   ): Promise<ExecutorResult<SwarmScriptOutput>> {
     if (config.fsMode === "workspace-rw") {
@@ -89,7 +90,13 @@ export class SwarmScriptExecutor extends BaseExecutor<
     }
 
     const workflow = await this.deps.db.getWorkflow(meta.workflowId);
-    const agentId = workflow?.createdByAgentId ?? agentIdFromContext(context);
+    // Never `trigger.agentId`: trigger data is caller-supplied, so reading the
+    // principal from it let any agent run a creator-less workflow's scripts as
+    // the lead. The run row carries the server-stamped starting agent.
+    const agentId =
+      workflow?.createdByAgentId ??
+      (await getWorkflowRunTriggeredByAgentId(meta.runId)) ??
+      undefined;
     const resolved = await resolveScriptSource(config, agentId);
 
     if (!resolved.ok) {
@@ -119,10 +126,11 @@ export class SwarmScriptExecutor extends BaseExecutor<
     const credentials = await buildScriptCredentialBindingsWithFailures({
       agentId: agentId ?? undefined,
     });
-    const output = await runScript({
+    const output = await runScriptWithRunCredential({
       source: resolved.source,
       args: config.args,
       fsMode: "none",
+      executor: resolved.script.executor,
       agentId: agentId ?? "workflow",
       mcpBaseUrl: getMcpBaseUrl(),
       egressSecrets: credentials.egressSecrets,
@@ -132,6 +140,10 @@ export class SwarmScriptExecutor extends BaseExecutor<
       apiConnections: getScriptApiConnectionDescriptors({ agentId: agentId ?? undefined }),
       mcpConnections: getScriptMcpConnectionDescriptors({ agentId: agentId ?? undefined }),
       timeoutMs: config.timeoutMs,
+      // The step watchdog aborts this when the node budget runs out, which
+      // kills the script process: a step reported as timed out must not go
+      // on to perform the script's side effects.
+      signal: meta.signal,
     });
     if (output.exitCode === 0 && !output.error && !output.runtimeError) {
       await touchScratchScriptLastUsed(resolved.script.id);
@@ -178,15 +190,6 @@ export class SwarmScriptExecutor extends BaseExecutor<
   }
 }
 
-function agentIdFromContext(context: Readonly<Record<string, unknown>>): string | undefined {
-  const trigger = context.trigger;
-  if (trigger && typeof trigger === "object") {
-    const value = (trigger as Record<string, unknown>).agentId;
-    if (typeof value === "string" && value.length > 0) return value;
-  }
-  return undefined;
-}
-
 async function resolveScriptSource(
   config: SwarmScriptConfig,
   agentId: string | undefined,
@@ -204,7 +207,7 @@ async function resolveScriptSource(
     return {
       ok: false,
       error:
-        "swarm-script: agent-scoped scripts require the workflow to have createdByAgentId or trigger.agentId",
+        "swarm-script: agent-scoped scripts require the workflow to have createdByAgentId or the run to be started by an agent",
     };
   }
 

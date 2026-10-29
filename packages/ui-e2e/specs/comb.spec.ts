@@ -34,10 +34,10 @@ test("Comb is off without agent-fs", { tag: "@local" }, async ({ page, api, swar
   expect(send.status).toBe(404);
 
   await page.goto("/file");
-  await expect(page.getByRole("heading", { name: "Comb is off" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Files is off" })).toBeVisible();
   await expect(page.getByRole("link", { name: "Open Configuration" })).toBeVisible();
-  // The sidebar has no Comb item. The header breadcrumb reads "Comb" as plain text.
-  await expect(page.getByRole("link", { name: /^Comb\b/ })).toHaveCount(0);
+  // The sidebar has no Files item. The header breadcrumb reads "Files" as plain text.
+  await expect(page.getByRole("link", { name: /^Files\b/ })).toHaveCount(0);
   await clean.assertClean();
 });
 
@@ -97,7 +97,7 @@ test("Comb connects, comments, replies, and resolves on agent-fs", { tag: "@loca
     expect(written.ok, "the human writes the seed file").toBe(true);
 
     await page.goto("/file");
-    await expect(page.getByRole("link", { name: /^Comb\b/ })).toBeVisible();
+    await expect(page.getByRole("link", { name: /^Files\b/ })).toBeVisible();
     await page.getByRole("tab", { name: "Paste a key" }).click();
     await page.getByRole("textbox", { name: "agent-fs key" }).fill(human.apiKey);
     await page.getByRole("button", { name: "Connect", exact: true }).click();
@@ -109,13 +109,14 @@ test("Comb connects, comments, replies, and resolves on agent-fs", { tag: "@loca
 
     await page.getByRole("button", { name: "Comment on file" }).click();
     await page.getByRole("textbox", { name: "Comment on this file" }).fill("E2E file comment");
-    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await page.getByRole("button", { name: "Add comment", exact: true }).click();
     const thread = page.getByRole("article").filter({ hasText: "E2E file comment" });
     await expect(thread).toBeVisible();
 
     await thread.getByRole("button", { name: "Reply", exact: true }).click();
     await thread.getByRole("textbox", { name: "Reply" }).fill("E2E reply");
-    await thread.getByRole("button", { name: "Send", exact: true }).click();
+    // The opener hides while the reply box is open: this "Reply" saves the reply.
+    await thread.getByRole("button", { name: "Reply", exact: true }).click();
     await expect(thread.getByText("E2E reply")).toBeVisible();
 
     await thread.getByRole("button", { name: "Resolve" }).click();

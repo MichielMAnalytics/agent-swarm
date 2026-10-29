@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { api } from "@/api/client";
 import { useConfigs } from "@/api/hooks/use-config-api";
 import { useFeatureGate } from "@/api/hooks/use-feature-gate";
+import { preloadSessionsPage } from "@/app/sessions-route";
 import { IdentityForm } from "@/components/identity/identity-form";
 import { setupExitHref } from "@/components/onboarding/onboarding-redirect";
 import { ComposerDock } from "@/components/sessions/composer-dock";
@@ -16,9 +17,11 @@ import { StatusLine } from "@/components/shared/status-icon";
 import { SuggestionChips } from "@/components/shared/suggestion-chips";
 import { Button } from "@/components/ui/button";
 import { useCurrentUser } from "@/contexts/current-user-context";
-import { optionValue, SWARM_ORG_USE_CASE, USE_CASES } from "@/lib/company-profile";
+import { optionValue, SWARM_ORG_USE_CASE, storedOrgName, USE_CASES } from "@/lib/company-profile";
 import { cn } from "@/lib/utils";
 import type { StepProps } from "../../step-contract";
+import type { LeadReadiness } from "./agents-card";
+import { InviteTeamCard } from "./invite-team-card";
 import { firstTaskStarters } from "./starters";
 
 type BadgeStatus = ComponentProps<typeof StatusBadge>["status"];
@@ -30,24 +33,42 @@ type BadgeStatus = ComponentProps<typeof StatusBadge>["status"];
  * minimizes setup, and opens the session. Step 7 completes when that task
  * completes.
  */
+/** The composer placeholder while it waits. */
+const WAITING_PLACEHOLDER = "Waiting for the lead to come online…";
+
+function prepareSessionsPage() {
+  return preloadSessionsPage().catch(() => {
+    // The route loader handles chunk failures and shows the reload prompt.
+  });
+}
+
 export function FirstTaskComposer({
   onboarding,
   act,
-  leadReady,
-}: Pick<StepProps, "onboarding" | "act"> & { leadReady: boolean }) {
+  lead,
+}: Pick<StepProps, "onboarding" | "act"> & { lead: LeadReadiness["state"] }) {
+  // An online lead with no verified key can still take the task: Bedrock,
+  // Vertex and CRED_CHECK_DISABLE routes never report "verified". The status
+  // line above warns instead of blocking.
+  const leadReady = lead !== "offline";
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { state: userState, userId, locked } = useCurrentUser();
   // Users and sessions both ship in 1.76.0.
   const { supported: usersSupported } = useFeatureGate("1.76.0");
+  useEffect(() => {
+    if (usersSupported) void prepareSessionsPage();
+  }, [usersSupported]);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Step 2 asks for the use case; its starters replace the general ones.
   const { data: configs } = useConfigs({ scope: "global" });
-  const suggestions = firstTaskStarters(
-    optionValue(USE_CASES, configs?.find((entry) => entry.key === SWARM_ORG_USE_CASE)?.value),
-  );
+  const config = (key: string) => configs?.find((entry) => entry.key === key)?.value || null;
+  const suggestions = firstTaskStarters(optionValue(USE_CASES, config(SWARM_ORG_USE_CASE)), {
+    company: storedOrgName(config("SWARM_ORG_NAME")),
+    website: config("SWARM_ORG_WEBSITE"),
+  });
 
   const taskPath = (id: string) => (usersSupported ? `/sessions/${id}` : `/tasks/${id}`);
   // Step 1 picks the user. This is a fallback for a user that went missing
@@ -67,6 +88,7 @@ export function FirstTaskComposer({
     if (!task || sending || !live) return;
     setSending(true);
     setError(null);
+    const sessionReady = usersSupported ? prepareSessionsPage() : undefined;
     try {
       const created = await api.createTask({
         task,
@@ -84,6 +106,8 @@ export function FirstTaskComposer({
       }
       void queryClient.invalidateQueries({ queryKey: ["sessions"] });
       void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      // A quick send can beat the preload. Keep setup visible until it finishes.
+      await sessionReady;
       void navigate(taskPath(created.id));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to send the task.");
@@ -116,6 +140,7 @@ export function FirstTaskComposer({
           }
         />
         {done ? <StatusLine tone="done">Setup is complete.</StatusLine> : null}
+        <InviteTeamCard />
       </div>
     );
   }
@@ -141,9 +166,7 @@ export function FirstTaskComposer({
         isError={Boolean(error)}
         errorMessage={error ?? undefined}
         pendingLabel="Sending…"
-        placeholder={
-          leadReady ? "Describe a goal for the swarm" : "Waiting for the lead to come online…"
-        }
+        placeholder={leadReady ? "Describe a goal for the swarm" : WAITING_PLACEHOLDER}
         disabled={!live}
         sendLabel="Send first task"
         autoFocus={live && !wentLive}

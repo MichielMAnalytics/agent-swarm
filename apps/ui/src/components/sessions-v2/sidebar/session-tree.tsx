@@ -1,8 +1,8 @@
 /**
  * The sessions v2 sidebar tree (plan Phases 4 and 5, SPEC R4 to R6, R9,
- * R10.3): the search, then Inbox, Later, Done, No group, My groups, and
- * Shared with me, with server counts, paged rows, read state, triage,
- * selection, moves, and group edits.
+ * R10.3): the search, then Inbox, Later, Done, No group, My groups,
+ * Shared with me, and the source sections, with server counts, paged rows,
+ * read state, triage, selection, moves, and group edits.
  *
  * The parts: `useMyGroups` (the groups), `useTreeRows` (the flat row list),
  * `useSearchRows`, `useTreeFolds`, `useTreeCursor` (keys, focus, the
@@ -19,6 +19,7 @@
 import { DndContext, DragOverlay } from "@dnd-kit/core";
 import { CircleAlert } from "lucide-react";
 import {
+  type KeyboardEvent,
   type MouseEvent,
   type PointerEvent,
   type ReactNode,
@@ -33,6 +34,8 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
+import { useSessionLabels } from "@/api/hooks/use-session-tree";
+import { useSessionListTriage } from "@/api/hooks/use-session-triage";
 import { useUsers } from "@/api/hooks/use-users";
 import type { SessionListItem } from "@/api/types";
 import { EmptyState } from "@/components/shared/empty-state";
@@ -41,27 +44,32 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import type { SessionsViewMode } from "@/hooks/use-sessions-view";
 import { useStableHandler } from "@/hooks/use-stable-handler";
-import { SESSIONS_TOAST_POSITION, userName } from "@/lib/sessions-v2";
+import { useSessionsFilter } from "@/lib/sessions-show";
+import { SESSIONS_TOAST_POSITION, type SessionSection, userName } from "@/lib/sessions-v2";
+import { cn } from "@/lib/utils";
 import { MobileBulkBar } from "../mobile/mobile-bulk-bar";
 import { MobileTreeBody } from "../mobile/mobile-tree-body";
 import { useListKeys } from "../use-list-keys";
 import { useMyGroups } from "../use-my-groups";
 import { useSessionTriageActions } from "../use-session-triage-actions";
 import { type SessionsCommandsApi, useSessionsCommands } from "../use-sessions-commands";
-import { BulkBar } from "./bulk-bar";
-import { GroupNode } from "./group-node";
+import { BulkBar, type WholeListOffer } from "./bulk-bar";
+import { FilterMenu } from "./filter-menu";
+import { GroupNode, SECTION_META } from "./group-node";
 import { AddGroupRow, CreateGroupRow, EmptyRow, LoadingRow, PagingRow } from "./list-state-rows";
 import type { RowMenuActions, RowMenuState } from "./row-menu";
-import { segmentsOf, TreeSection } from "./section-header";
+import { SourceHeader, segmentsOf, TreeSection } from "./section-header";
 import { SessionDragPreview, SessionRow } from "./session-row";
 import { SidebarSearch } from "./sidebar-search";
 import { TreeDialogs, useTreeDialogs } from "./tree-dialogs";
 import {
   type ContainerId,
   foldId,
+  isMyGroupRow,
   isNavRow,
   type NavRow,
   type TreeRow as TreeRowModel,
+  wholeListTotal,
 } from "./tree-rows";
 import { useGroupEdits } from "./use-group-edits";
 import { useRowDrag } from "./use-row-drag";
@@ -147,17 +155,27 @@ export function SessionTree({
 }: SessionTreeProps) {
   const { userId } = useCurrentUser();
   const me = userId ?? null;
+  // The tree and list queries below read the filter (Mine / All, hidden sources): re-render on a change.
+  useSessionsFilter();
   const now = useMinuteClock();
   const [expanded, setExpanded] = useState<ReadonlySet<ContainerId>>(() => new Set());
   const { isOpen, setOpen, prune } = useTreeFolds(me);
   const myGroups = useMyGroups(me);
   const { groups, targets, writeBlock } = myGroups;
+  const labels = useSessionLabels();
   /** A new group's name field shows under this parent (`shared/` for the top level). */
   const [creating, setCreating] = useState<string | null>(null);
   /** The group whose name is an input. */
   const [renaming, setRenaming] = useState<string | null>(null);
   const searching = query.trim() !== "";
-  const treeRows = useTreeRows({ me, myGroups, isOpen, expanded, creating, paused: searching });
+  const { rows: treeRows, updating } = useTreeRows({
+    me,
+    myGroups,
+    isOpen,
+    expanded,
+    creating,
+    paused: searching,
+  });
   useEffect(() => {
     if (groups) prune(groups);
   }, [groups, prune]);
@@ -205,6 +223,7 @@ export function SessionTree({
   const moves = useTreeMoves({
     me,
     nameOf,
+    labels,
     emptyGroups: myGroups.emptyGroups,
     serverKeys: myGroups.serverKeys,
     targetKeys,
@@ -213,6 +232,55 @@ export function SessionTree({
     setOpen,
     clearSelection: selection.clear,
   });
+  const listTriage = useSessionListTriage();
+  /** The name of a list: its section, else its group. */
+  const listLabel = (container: ContainerId) =>
+    container in SECTION_META
+      ? SECTION_META[container as SessionSection].label
+      : moves.labelOf(container);
+  /** The list a row belongs to or heads: Cmd+A and the list checkbox select its loaded rows. */
+  const listAt = (row: NavRow | null | undefined): ContainerId | null => {
+    if (row?.type === "session" || row?.type === "more" || row?.type === "all") {
+      return row.container;
+    }
+    if (row?.type === "box") return row.id;
+    if (row?.type === "group") return row.node.key;
+    return null;
+  };
+  // "Select all N": offered while the selection is every loaded row of a
+  // list that has more sessions than it loaded, and kept while it is on.
+  const offerList = selection.wholeList ?? (selection.selectionMode ? selection.fullList() : null);
+  const offerTotal = offerList ? wholeListTotal(rows, offerList) : null;
+  const whole: WholeListOffer | null =
+    offerList && offerTotal !== null
+      ? {
+          label: listLabel(offerList),
+          total: offerTotal,
+          on: selection.wholeList === offerList,
+          onSelect: () => {
+            selection.selectWholeList();
+            if (!phone) focusTree();
+          },
+        }
+      : null;
+  const wholeOn = whole?.on ? offerList : null;
+  /** The list's unread count says Mark read or Mark unread, as `anyUnread` does for rows. */
+  const listUnread = (container: ContainerId) =>
+    rows.some(
+      (row) =>
+        ((row.type === "box" && row.id === container) ||
+          (row.type === "group" && row.node.key === container)) &&
+        row.counts.unread > 0,
+    );
+  /** Done on the whole list, or back to the Inbox from Done (the `e` toggle). */
+  const wholeDone = (container: ContainerId) => {
+    listTriage.run(container, container === "done" ? "inbox" : "done");
+    selection.clear();
+  };
+  const wholeRead = (container: ContainerId) => {
+    listTriage.run(container, listUnread(container) ? "read" : "unread");
+    selection.clear();
+  };
   const drag = useRowDrag({
     dragTargets: selection.menuTargets,
     onDrop: (sessions, key) => void moves.move(sessions, key),
@@ -257,7 +325,7 @@ export function SessionTree({
   /** The group menu of a row, at the pointer (right-click) or under the control or row. */
   const openGroupMenu = (rowKey: string, anchor: { x: number; y: number }) => {
     const row = rowsByKey.get(rowKey);
-    if (row?.type !== "group" || row.sharedWithMe) return;
+    if (!isMyGroupRow(row)) return;
     cursor.place(rowKey);
     const groupKey = row.node.key;
     dialogs.setGroupMenu({
@@ -290,12 +358,11 @@ export function SessionTree({
    * connection cannot start a session in gives No group.
    */
   const startGroupOf = (row: NavRow | null | undefined): string | null => {
-    const key =
-      row?.type === "group" && !row.sharedWithMe
-        ? row.node.key
-        : row?.type === "session" && targetKeys.has(row.container)
-          ? row.container
-          : null;
+    const key = isMyGroupRow(row)
+      ? row.node.key
+      : row?.type === "session" && targetKeys.has(row.container)
+        ? row.container
+        : null;
     return key && !writeBlock(key) ? key : null;
   };
   const goNextUnread = () => {
@@ -360,7 +427,10 @@ export function SessionTree({
       goNextUnread();
     },
     newSession: () => newSession(startGroupOf(cursorRow)),
-    move: () => openMove(keyTargets()),
+    move: () => {
+      // The whole list moves nowhere: moves check each session (at most 200).
+      if (!wholeOn) openMove(keyTargets());
+    },
     select: () => {
       if (cursorSession && cursorRow) selection.toggle(cursorSession.root.id, cursorRow.key);
     },
@@ -374,15 +444,16 @@ export function SessionTree({
     },
     ...(canTriage
       ? {
-          done: () => triage.doneOrBack(keyTargets()),
+          done: () => (wholeOn ? wholeDone(wholeOn) : triage.doneOrBack(keyTargets())),
           later: () => {
             const targets = keyTargets();
-            if (!cursorRow) return;
+            if (!cursorRow || wholeOn) return;
             triage.laterOrBack(targets, () =>
               menuAtRow(cursorRow.key, "later", cursorSession ?? targets[0], targets),
             );
           },
           read: () => {
+            if (wholeOn) return wholeRead(wholeOn);
             const targets = keyTargets();
             if (targets.length > 0) actions.toggleRead(targets);
           },
@@ -392,6 +463,24 @@ export function SessionTree({
     // Then Escape clears the selection, then the search.
     clear: selection.selectionMode ? selection.clear : searching ? () => setQuery("") : undefined,
   });
+
+  /** Cmd+A (Ctrl+A): the loaded rows of the cursor's list. Other keys go to the list keys. */
+  const onTreeKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const selectAll =
+      (event.metaKey || event.ctrlKey) &&
+      !event.altKey &&
+      !event.shiftKey &&
+      event.key.toLowerCase() === "a" &&
+      !(event.target as Element).closest("input");
+    const list = selectAll ? listAt(cursorRow) : null;
+    if (!list) {
+      onKeyDown(event);
+      return;
+    }
+    event.preventDefault();
+    cursor.enterKeyMode();
+    selection.selectList(list);
+  };
 
   // ── Pointer handlers: stable, so the memoized rows render only on change.
   /**
@@ -462,6 +551,14 @@ export function SessionTree({
     newSession(startGroupOf(rowsByKey.get(key))),
   );
   const onRenameDone = useStableHandler(edits.onRenameDone);
+  /** A list's checkbox, on its section or group row. */
+  const onToggleList = useStableHandler((key: string) => {
+    const list = listAt(rowsByKey.get(key));
+    if (!list) return;
+    cursor.place(key);
+    focusTree();
+    selection.toggleList(list);
+  });
   const onPeekClose = useStableHandler(cursor.closePeek);
 
   const commandsApi: SessionsCommandsApi = {
@@ -497,7 +594,8 @@ export function SessionTree({
       case "box":
       case "group":
       case "owner": {
-        const mine = row.type === "group" && !row.sharedWithMe;
+        // Shared with me and source groups are read-only: no menu, no "+", no drops.
+        const mine = isMyGroupRow(row);
         // A personal group on the operator key takes no new sessions and no drops.
         const writable = mine && !writeBlock(row.node.key);
         const noGroupBox = row.type === "box" && row.id === "nogroup";
@@ -517,9 +615,22 @@ export function SessionTree({
             dropKey={writable ? row.node.key : noGroupBox ? null : undefined}
             renaming={mine && !row.searchMatch && renaming === row.node.key}
             onRenameDone={onRenameDone}
+            listSelect={row.type === "owner" ? null : selection.listState(listAt(row) ?? "")}
+            selecting={selection.selectionMode}
+            onToggleList={onToggleList}
           />
         );
       }
+      case "source":
+        return (
+          <SourceHeader
+            key={row.key}
+            row={row}
+            domId={domId(row.key)}
+            cursor={row.key === cursorRow?.key}
+            onRowClick={onRowClick}
+          />
+        );
       case "session": {
         const id = row.session.root.id;
         const isCursor = row.key === cursorRow?.key;
@@ -541,6 +652,7 @@ export function SessionTree({
             peek={cursor.peekKey === row.key}
             keyboard={keyboard}
             nameOf={nameOf}
+            labels={labels}
             onRowClick={onRowClick}
             onRowAuxClick={onRowAuxClick}
             onRowContextMenu={onRowContextMenu}
@@ -628,6 +740,7 @@ export function SessionTree({
         me={me}
         now={now}
         nameOf={nameOf}
+        labels={labels}
         selection={selection}
         canTriage={canTriage}
         renaming={renaming}
@@ -657,14 +770,19 @@ export function SessionTree({
           aria-label={searching ? "Search results" : "Sessions"}
           aria-multiselectable
           aria-activedescendant={cursorRow ? domId(cursorRow.key) : undefined}
-          aria-busy={rows.some((row) => row.type === "loading") || undefined}
+          aria-busy={
+            (!search.active && updating) || rows.some((row) => row.type === "loading") || undefined
+          }
           tabIndex={0}
           data-kb={keyboard ? "true" : undefined}
-          onKeyDown={onKeyDown}
+          onKeyDown={onTreeKeyDown}
           onFocus={cursor.onFocus}
           onBlur={cursor.onBlur}
           onPointerDown={onTreePointerDown}
-          className="group/tree min-h-0 flex-1 overflow-y-auto overscroll-contain pt-1.5 pb-4 outline-none"
+          className={cn(
+            "group/tree min-h-0 flex-1 overflow-y-auto overscroll-contain pt-1.5 pb-4 outline-none transition-opacity",
+            !search.active && updating && "opacity-60",
+          )}
         >
           {segmentsOf(rows).map(({ section, rows: segmentRows }) =>
             section ? (
@@ -691,6 +809,11 @@ export function SessionTree({
   }
 
   const selected = selection.selectionMode ? selection.sessions() : [];
+  /** The phone's "Select all": the selection's list, while some of its loaded rows are not selected. */
+  const selectionList = selection.fullList() ? null : selection.list;
+  const anyUnread = wholeOn
+    ? listUnread(wholeOn)
+    : selected.some((session) => session.readState === "unread");
   // The bar goes with the selection: the focus goes back to the list.
   const andFocus = (run: () => void) => () => {
     run();
@@ -703,19 +826,21 @@ export function SessionTree({
           open={selected.length > 0}
           count={selected.length}
           canTriage={canTriage}
-          anyUnread={selected.some((session) => session.readState === "unread")}
-          onDone={() => actions.done(selected)}
+          anyUnread={anyUnread}
+          onDone={() => (wholeOn ? wholeDone(wholeOn) : actions.done(selected))}
           onLater={() => laterMenu(selected[0], selected)}
-          onToggleRead={() => actions.toggleRead(selected)}
+          onToggleRead={() => (wholeOn ? wholeRead(wholeOn) : actions.toggleRead(selected))}
           onMove={() => openMove(selected)}
           onClear={selection.clear}
+          onSelectList={selectionList ? () => selection.selectList(selectionList) : undefined}
+          whole={whole}
         />
       ) : selected.length > 0 ? (
         <BulkBar
           count={selected.length}
           canTriage={canTriage}
-          anyUnread={selected.some((session) => session.readState === "unread")}
-          onDone={andFocus(() => actions.done(selected))}
+          anyUnread={anyUnread}
+          onDone={andFocus(() => (wholeOn ? wholeDone(wholeOn) : actions.done(selected)))}
           onLater={({ left, bottom }) =>
             dialogs.setMenu({
               x: left,
@@ -725,9 +850,12 @@ export function SessionTree({
               targets: selected,
             })
           }
-          onToggleRead={andFocus(() => actions.toggleRead(selected))}
+          onToggleRead={andFocus(() =>
+            wholeOn ? wholeRead(wholeOn) : actions.toggleRead(selected),
+          )}
           onMove={() => openMove(selected)}
           onClear={andFocus(selection.clear)}
+          whole={whole}
         />
       ) : null}
       <SidebarSearch
@@ -741,6 +869,13 @@ export function SessionTree({
           focusTree();
           if (searching) cursor.moveTo(0);
         }}
+        action={
+          <FilterMenu
+            sources={myGroups.treeQuery.data?.sources ?? []}
+            canShow={me !== null}
+            phone={phone}
+          />
+        }
       />
       {body}
       <TreeDialogs

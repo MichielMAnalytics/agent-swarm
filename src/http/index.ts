@@ -15,8 +15,10 @@ import {
   getSwarmConfigs,
   upsertSwarmConfig,
 } from "../be/db";
+import { startTaskSearchBackfill, stopTaskSearchBackfill } from "../be/db/tasks/search-index";
 import { startDbRetention, stopDbRetention } from "../be/db-retention";
 import { startHumanFreeDrain, stopHumanFreeDrain } from "../be/human-free-drain";
+import { startMcpOverflowSweep, stopMcpOverflowSweep } from "../be/mcp-overflow-sweep";
 import {
   enqueueAuditRow,
   flushAuditBuffer,
@@ -70,18 +72,20 @@ import { isEnvFlagEnabled } from "../utils/env-flag";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { initWorkflows } from "../workflows";
 import { handleActiveSessions } from "./active-sessions";
+import { handleAgentFsProxy } from "./agentfs-proxy";
 import { handleAgentRegister, handleAgentsRest } from "./agents";
 import { handleApiKeys } from "./api-keys";
 import { handleApprovalRequests } from "./approval-requests";
 import { handleApps } from "./apps";
 import { handleAssets } from "./assets";
 import { handleBudgets } from "./budgets";
+import { handleCodexOAuthAccounts } from "./codex-oauth-accounts";
 import { handleCodexOAuthDevice } from "./codex-oauth-device";
 import { handleCodexOAuthKeepWarm } from "./codex-oauth-keep-warm";
 import { handleComb } from "./comb";
 import { handleConfig } from "./config";
 import { handleContext } from "./context";
-import { handleCore, loadGlobalConfigsIntoEnv } from "./core";
+import { getDeploymentEnvValue, handleCore, loadGlobalConfigsIntoEnv } from "./core";
 import { handleDbQuery } from "./db-query";
 import { handleEvents } from "./events";
 import { handleExtensions } from "./extensions";
@@ -115,6 +119,7 @@ import { handlePageProxy } from "./page-proxy";
 import { handlePages } from "./pages";
 import { handlePagesPublic } from "./pages-public";
 import { handlePoll } from "./poll";
+import { handlePoolKeys } from "./pool-keys";
 import { handlePricing } from "./pricing";
 import { handlePromptTemplates } from "./prompt-templates";
 import { handleRanking } from "./ranking";
@@ -139,11 +144,13 @@ import { handleTasks } from "./tasks";
 import { handleTelemetryUi } from "./telemetry-ui";
 import { handleTrackers } from "./trackers";
 import { handleUsedBy } from "./used-by";
+import { handleUserRoles } from "./user-roles";
 import { handleUsers } from "./users";
 import {
   getPathSegments,
   httpServerSemconvAttributes,
   parseQueryParams,
+  redactShareTokenInPath,
   safeRequestUrlForLog,
   setCorsHeaders,
   warnIfCorsAllowsAnyOrigin,
@@ -316,7 +323,7 @@ const httpServer = createHttpServer(async (req, res) => {
           spanName,
           {
             "http.request.method": req.method ?? "",
-            "url.path": reqPath,
+            "url.path": redactShareTokenInPath(reqPath),
             "url.scheme": semconv["url.scheme"],
             "http.route": httpRoute,
             "server.address": semconv["server.address"],
@@ -359,6 +366,7 @@ const httpServer = createHttpServer(async (req, res) => {
         () => handleStatus(req, res, pathSegments, queryParams),
         () => handleOnboarding(req, res, pathSegments, queryParams),
         () => handleCodexOAuthDevice(req, res, pathSegments, queryParams),
+        () => handleCodexOAuthAccounts(req, res, pathSegments, queryParams),
         () => handleActiveSessions(req, res, pathSegments, queryParams, myAgentId),
         () => handlePricing(req, res, pathSegments, queryParams, myAgentId),
         () => handleSchedules(req, res, pathSegments, queryParams, myAgentId),
@@ -366,8 +374,10 @@ const httpServer = createHttpServer(async (req, res) => {
         () => handleWorkflowEvents(req, res, pathSegments, queryParams),
         () => handleApprovalRequests(req, res, pathSegments, queryParams),
         () => handleApps(req, res, pathSegments, queryParams, myAgentId),
+        () => handlePoolKeys(req, res, pathSegments, queryParams),
         () => handleConfig(req, res, pathSegments, queryParams),
         () => handleFs(req, res, pathSegments, queryParams, myAgentId),
+        () => handleAgentFsProxy(req, res),
         () => handleComb(req, res, pathSegments, queryParams, myAgentId),
         () => handleKv(req, res, pathSegments, queryParams),
         () => handleRooms(req, res, pathSegments, queryParams),
@@ -404,6 +414,7 @@ const httpServer = createHttpServer(async (req, res) => {
         () => handleRuntimePools(req, res, pathSegments, queryParams, myAgentId),
         () => handleExtensions(req, res, pathSegments, queryParams, myAgentId),
         () => handleFavorites(req, res, pathSegments, queryParams, myAgentId),
+        () => handleUserRoles(req, res, pathSegments, queryParams),
         () => handleUsers(req, res, pathSegments, queryParams),
         () => handleSessions(req, res, pathSegments, queryParams, myAgentId),
         () => handleInboxState(req, res, pathSegments, queryParams),
@@ -511,13 +522,16 @@ async function shutdown() {
   await stopChatSdk();
 
   // Stop OAuth keepalive
-  if (process.env.OAUTH_KEEPALIVE_DISABLE !== "true") {
+  if (!isEnvFlagEnabled("OAUTH_KEEPALIVE_DISABLE", false)) {
     const { stopOAuthKeepalive } = await import("../oauth/keepalive");
     await stopOAuthKeepalive();
   }
 
   // Stop the unified OAuth pending-session garbage collector (all flows)
   stopOAuthPendingGc();
+
+  // Stop the expired MCP overflow sweep
+  stopMcpOverflowSweep();
 
   // Stop memory expired-row garbage collector
   stopMemoryGc();
@@ -527,6 +541,9 @@ async function shutdown() {
 
   // Stop the human-free reclassification drain before closing SQLite.
   stopHumanFreeDrain();
+
+  // Stop the task search index backfill after its current batch.
+  await stopTaskSearchBackfill();
 
   // Stop scratch-script retention garbage collector
   stopScratchScriptGc();
@@ -841,7 +858,7 @@ httpServer
     startRuntimeSupervisor();
 
     // Start OAuth token keepalive (proactive refresh to prevent expiry)
-    if (process.env.OAUTH_KEEPALIVE_DISABLE !== "true") {
+    if (!isEnvFlagEnabled("OAUTH_KEEPALIVE_DISABLE", false)) {
       const { startOAuthKeepalive } = await import("../oauth/keepalive");
       startOAuthKeepalive();
     }
@@ -849,13 +866,16 @@ httpServer
     // Start generic OAuth token refresh sweep (all oauth_apps providers,
     // 15-min tick, first run ~1 min after boot). Complements the tracker-only
     // keepalive above — see src/be/oauth-refresh-sweep.ts.
-    if (process.env.OAUTH_REFRESH_SWEEP_DISABLE !== "true") {
+    if (!isEnvFlagEnabled("OAUTH_REFRESH_SWEEP_DISABLE", false)) {
       const { startOAuthRefreshSweep } = await import("../be/oauth-refresh-sweep");
       startOAuthRefreshSweep();
     }
 
     // Start the unified OAuth pending-session garbage collector (5-min tick, all flows)
     startOAuthPendingGc();
+
+    // Delete expired MCP overflow values (10-min tick, off the spill path)
+    startMcpOverflowSweep();
 
     // Start expired-memory garbage collector (1-hour tick, immediate first run)
     await startMemoryGc();
@@ -868,24 +888,23 @@ httpServer
     // task tree, or a restart mid-drain). Wakes on demand; see human-free-drain.ts.
     startHumanFreeDrain();
 
+    // Index the task rows migration 256 left out, in batches. Task search
+    // stays on LIKE until it finishes. See src/be/db/tasks/search-index.ts.
+    void startTaskSearchBackfill();
+
     // (RBAC audit sink is wired pre-listen — see above httpServer.listen.)
 
-    // Background backfill: re-embed any agent_memory rows with wrong-dimension
-    // embeddings (e.g. 1536d instead of 512d). Non-blocking, idempotent, no-op
-    // when the DB is clean. See src/be/memory/boot-reembed.ts.
-    import("../be/memory/boot-reembed")
-      .then(({ runBootReembed }) => runBootReembed())
+    // Background embedding maintenance: re-embed every memory and script
+    // vector when the embedding space (endpoint, model, dimensions, document
+    // prefix) changed, then embed rows with a missing or wrong-length vector.
+    // Non-blocking, idempotent, resumable. See src/be/memory/embedding-space.ts.
+    import("../be/memory/embedding-space")
+      .then(({ runEmbeddingMaintenance, setDeploymentEnvReader }) => {
+        setDeploymentEnvReader(getDeploymentEnvValue);
+        return runEmbeddingMaintenance({ backfill: true });
+      })
       .catch((err) => {
-        console.error("[boot-reembed] startup backfill failed (non-fatal):", err);
-      });
-
-    // Background backfill: embed any scripts that were seeded without embeddings
-    // (scriptEmbeddingMode: "skip" during boot). Non-blocking, idempotent, no-op
-    // when every non-scratch script already has an embedding.
-    import("../be/scripts/boot-reembed")
-      .then(({ runBootReembedScripts }) => runBootReembedScripts())
-      .catch((err) => {
-        console.error("[boot-reembed-scripts] startup backfill failed (non-fatal):", err);
+        console.error("[embedding-space] startup maintenance failed (non-fatal):", err);
       });
 
     // Versioned retro-sweep: once per SCRUBBER_RULES_VERSION, redact stored
@@ -895,6 +914,13 @@ httpServer
       .then(({ runBootScrubSweep }) => runBootScrubSweep())
       .catch((err) => {
         console.error("[boot-scrub-sweep] startup scrub failed (non-fatal):", err);
+      });
+
+    // Source key backfill is idempotent, resumable, and non-fatal.
+    import("../be/session-source-backfill")
+      .then(({ runSessionSourceBackfill }) => runSessionSourceBackfill())
+      .catch((err) => {
+        console.error("[session-source-backfill] startup run failed (non-fatal):", err);
       });
   })
   .on("error", (err) => {

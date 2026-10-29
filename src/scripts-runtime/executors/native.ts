@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { mkdir, rm, symlink } from "node:fs/promises";
+import { tmpdir as osTmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   detachedProcessGroup,
@@ -98,12 +101,28 @@ export async function writeBareImportShim(
   targetUrl: URL,
 ): Promise<void> {
   const dir = `${tmpdir}/node_modules/${name}`;
-  await Bun.$`mkdir -p ${dir}`;
-  await Bun.write(`${dir}/package.json`, JSON.stringify({ type: "module", main: "index.ts" }));
-  await Bun.write(`${dir}/index.ts`, `export * from ${JSON.stringify(targetUrl.href)};\n`);
+  await mkdir(dir, { recursive: true });
+  await Promise.all([
+    Bun.write(`${dir}/package.json`, JSON.stringify({ type: "module", main: "index.ts" })),
+    Bun.write(`${dir}/index.ts`, `export * from ${JSON.stringify(targetUrl.href)};\n`),
+  ]);
 }
 
-async function writeBareImportShims(tmpdir: string): Promise<void> {
+let cachedDevTargets: Array<[string, URL]> | undefined;
+
+function getDevBareImportTargets(): Array<[string, URL]> {
+  if (!cachedDevTargets) {
+    cachedDevTargets = [
+      ["stdlib", new URL("../stdlib/index.ts", import.meta.url)],
+      ["swarm-sdk", new URL("../swarm-sdk.ts", import.meta.url)],
+      ["zod", pathToFileURL(Bun.resolveSync("zod", import.meta.dir))],
+      ["zod/mini", pathToFileURL(Bun.resolveSync("zod/mini", import.meta.dir))],
+    ];
+  }
+  return cachedDevTargets;
+}
+
+export async function writeBareImportShims(tmpdir: string): Promise<void> {
   const runtimeDir = process.env.SCRIPT_RUNTIME_DIR;
   if (runtimeDir) {
     // Compiled binary mode: use pre-built bundles on real filesystem.
@@ -114,21 +133,58 @@ async function writeBareImportShims(tmpdir: string): Promise<void> {
       ["zod", `${runtimeDir}/zod.bundle.js`],
       ["zod/mini", `${runtimeDir}/zod-mini.bundle.js`],
     ];
-    for (const [name, bundlePath] of shims) {
-      const dir = `${tmpdir}/node_modules/${name}`;
-      await Bun.$`mkdir -p ${dir}`;
-      await Bun.write(`${dir}/package.json`, JSON.stringify({ type: "module", main: "index.js" }));
-      await Bun.write(
-        `${dir}/index.js`,
-        `export * from ${JSON.stringify(pathToFileURL(bundlePath).href)};\n`,
-      );
-    }
+    await Promise.all(
+      shims.map(async ([name, bundlePath]) => {
+        const dir = `${tmpdir}/node_modules/${name}`;
+        await mkdir(dir, { recursive: true });
+        await Promise.all([
+          Bun.write(`${dir}/package.json`, JSON.stringify({ type: "module", main: "index.js" })),
+          Bun.write(
+            `${dir}/index.js`,
+            `export * from ${JSON.stringify(pathToFileURL(bundlePath).href)};\n`,
+          ),
+        ]);
+      }),
+    );
     return;
   }
-  await writeBareImportShim(tmpdir, "stdlib", new URL("../stdlib/index.ts", import.meta.url));
-  await writeBareImportShim(tmpdir, "swarm-sdk", new URL("../swarm-sdk.ts", import.meta.url));
-  for (const name of ["zod", "zod/mini"]) {
-    await writeBareImportShim(tmpdir, name, pathToFileURL(Bun.resolveSync(name, import.meta.dir)));
+  await Promise.all(
+    getDevBareImportTargets().map(([name, url]) => writeBareImportShim(tmpdir, name, url)),
+  );
+}
+
+const sharedShimDirPromises = new Map<string, Promise<string>>();
+
+async function getSharedNodeModulesDir(baseTmpDir: string): Promise<string> {
+  const runtimeDir = process.env.SCRIPT_RUNTIME_DIR ?? "";
+  const cacheKey = `${baseTmpDir}::${runtimeDir}`;
+  const existing = sharedShimDirPromises.get(cacheKey);
+  if (existing) {
+    const dir = await existing;
+    if (existsSync(`${dir}/zod/package.json`)) return dir;
+    sharedShimDirPromises.delete(cacheKey);
+  }
+  const initPromise = (async () => {
+    const rootHash = Bun.hash(runtimeDir || "dev").toString(36);
+    const sharedRoot = `${baseTmpDir}/swarm-script-shims-${process.pid}-${rootHash}`;
+    await writeBareImportShims(sharedRoot);
+    return `${sharedRoot}/node_modules`;
+  })();
+  sharedShimDirPromises.set(cacheKey, initPromise);
+  try {
+    return await initPromise;
+  } catch (err) {
+    sharedShimDirPromises.delete(cacheKey);
+    throw err;
+  }
+}
+
+async function linkOrWriteBareImportShims(baseTmpDir: string, tmpdir: string): Promise<void> {
+  try {
+    const sharedNodeModules = await getSharedNodeModulesDir(baseTmpDir);
+    await symlink(sharedNodeModules, `${tmpdir}/node_modules`, "junction");
+  } catch {
+    await writeBareImportShims(tmpdir);
   }
 }
 
@@ -155,11 +211,12 @@ export class NativeScriptExecutor implements ScriptExecutor {
     }
 
     const start = Date.now();
-    const tmpdir = `${process.env.TMPDIR ?? "/tmp"}/swarm-script-${crypto.randomUUID()}`;
-    await Bun.$`mkdir -p ${tmpdir}`;
+    const baseTmpDir = process.env.TMPDIR ?? (process.platform === "win32" ? osTmpdir() : "/tmp");
+    const tmpdir = `${baseTmpDir}/swarm-script-${crypto.randomUUID()}`;
+    await mkdir(`${tmpdir}/user-module`, { recursive: true });
 
     const argsFile = `${tmpdir}/args.json`;
-    const sourceFile = `${tmpdir}/source.ts`;
+    const sourceFile = `${tmpdir}/user-module/user-script.ts`;
     const resultFile = `${tmpdir}/result.json`;
     const errorFile = `${tmpdir}/error.json`;
     const startedFile = `${tmpdir}/started.marker`;
@@ -173,23 +230,21 @@ export class NativeScriptExecutor implements ScriptExecutor {
     let removeAbortListener: (() => void) | undefined;
     let proc: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
 
+    const killedOutput = (): ExecutorOutput => ({
+      result: undefined,
+      stdout: "",
+      stderr: "",
+      truncated: { stdout: false, stderr: false },
+      durationMs: Date.now() - start,
+      exitCode: 1,
+      error: "killed",
+    });
+
     try {
-      if (killed) {
-        return {
-          result: undefined,
-          stdout: "",
-          stderr: "",
-          truncated: { stdout: false, stderr: false },
-          durationMs: Date.now() - start,
-          exitCode: 1,
-          error: "killed",
-        };
-      }
+      if (killed) return killedOutput();
 
-      await Bun.write(argsFile, JSON.stringify(input.args ?? null));
-      await Bun.write(sourceFile, input.source);
-      await writeBareImportShims(tmpdir);
-
+      // Listen before the first await: an abort during the file writes below
+      // must stop the spawn, not land between the writes and the listener.
       const onExternalAbort = () => {
         killed = true;
         if (proc) void terminateProcessGroup(proc.pid);
@@ -197,12 +252,21 @@ export class NativeScriptExecutor implements ScriptExecutor {
       input.signal?.addEventListener("abort", onExternalAbort, { once: true });
       removeAbortListener = () => input.signal?.removeEventListener("abort", onExternalAbort);
 
+      await Promise.all([
+        Bun.write(argsFile, JSON.stringify(input.args ?? null)),
+        Bun.write(sourceFile, input.source),
+        linkOrWriteBareImportShims(baseTmpDir, tmpdir),
+      ]);
+
+      // No await between this check and the spawn below.
+      if (killed) return killedOutput();
+
       const timeout = setTimeout(() => {
         timedOut = true;
         if (proc) void terminateProcessGroup(proc.pid);
       }, input.resources.wallClockMs);
 
-      const harnessEnv = {
+      const harnessEnv: Record<string, string> = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: process.env.HOME ?? "/tmp",
         LANG: process.env.LANG ?? "C.UTF-8",
@@ -214,6 +278,7 @@ export class NativeScriptExecutor implements ScriptExecutor {
         SWARM_SCRIPT_RESULT_FILE: resultFile,
         SWARM_SCRIPT_ERROR_FILE: errorFile,
         SWARM_SCRIPT_STARTED_FILE: startedFile,
+        ...(input.hostValidatedArgs ? { SWARM_SCRIPT_HOST_VALIDATED_ARGS: "1" } : {}),
       };
 
       proc = registerProcessGroup(
@@ -269,7 +334,7 @@ export class NativeScriptExecutor implements ScriptExecutor {
     } finally {
       removeAbortListener?.();
       if (proc) await terminateProcessGroup(proc.pid);
-      await Bun.$`rm -rf ${tmpdir}`;
+      await rm(tmpdir, { recursive: true, force: true });
     }
   }
 }

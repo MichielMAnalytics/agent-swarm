@@ -350,7 +350,7 @@ elif [ "$HARNESS_PROVIDER" = "opencode" ]; then
 elif [ "$HARNESS_PROVIDER" = "dsh" ]; then
     DSH_BIN="${DSH_BINARY:-dsh}"
     if ! command -v "$DSH_BIN" >/dev/null 2>&1; then
-        echo "FATAL: dsh CLI not found: '$DSH_BIN'. Use worker-full or install @deepseek-ai/dsh@0.2.1-rc.2 during image provisioning."
+        echo "FATAL: dsh CLI not found: '$DSH_BIN'. Use worker-full or install @deepseek-ai/dsh@0.2.2-alpha.2 during image provisioning."
         exit 1
     fi
     echo "dsh CLI: $(command -v "$DSH_BIN")"
@@ -364,7 +364,7 @@ elif [ "$HARNESS_PROVIDER" = "amp" ]; then
 elif [ "$HARNESS_PROVIDER" = "grok" ]; then
     GROK_BIN="${GROK_BINARY:-grok}"
     if ! command -v "$GROK_BIN" >/dev/null 2>&1; then
-        echo "FATAL: grok CLI not found: '$GROK_BIN'. Use worker-full or install @xai-official/grok@1.0.67 during image provisioning."
+        echo "FATAL: grok CLI not found: '$GROK_BIN'. Use worker-full or install @xai-official/grok@1.0.70 during image provisioning."
         exit 1
     fi
     echo "grok CLI: $(command -v "$GROK_BIN") ($(GROK_DISABLE_AUTOUPDATER=1 "$GROK_BIN" --version 2>/dev/null))"
@@ -487,6 +487,8 @@ mkdir -p /workspace/personal/memory 2>/dev/null || true
 # chown individual dirs (not -R) to avoid EPERM on mount-managed system files
 chown worker:worker /workspace/personal 2>/dev/null || true
 chown worker:worker /workspace/personal/memory 2>/dev/null || true
+# A reused named volume keeps the owner from its first mount, which may be root.
+chown worker:worker /logs 2>/dev/null || true
 
 # ROLE and MCP_URL are resolved earlier (see the API readiness gate above),
 # before any provider-specific block can read the control-plane API.
@@ -695,7 +697,9 @@ elif [ -n "$GITLAB_TOKEN" ]; then
     # over HTTPS to this host would have none. Same env-reading helper as Azure
     # DevOps below: the token never lands in ~/.gitconfig or a credential store.
     # GitLab accepts any non-empty username with a PAT as the password.
-    git config --global "credential.${GITLAB_HOST%/}.helper" \
+    # --replace-all: a restart or a startup hook's reset + helper pair can leave
+    # several values for this origin, and a plain set fails on those under set -e.
+    git config --global --replace-all "credential.${GITLAB_HOST%/}.helper" \
         '!f() { test "$1" = get || exit 0; echo username=oauth2; echo "password=${GITLAB_TOKEN}"; }; f'
 
     # Set git user config for GitLab commits (use GitLab-specific env vars or fall back to GitHub ones)
@@ -1053,14 +1057,10 @@ elif [ -n "$AGENT_ID" ] && [ -n "$API_KEY" ] && [ -n "$MCP_BASE_URL" ]; then
         done
 
         # Install legacy complex remote skills via npx. DB-backed complex skills
-        # are synced through /api/skills/sync-filesystem; this remains a safe
-        # fallback for sourceRepo-only skills.
-        echo "$SKILLS_RESPONSE" | jq -r '.skills[] | select(.isComplex == true) | [.id, (.sourceRepo // "")] | @tsv' 2>/dev/null | while IFS=$'\t' read -r skill_id repo; do
-            if [ -n "$repo" ]; then
-                npx skills add "$repo" -a claude-code -a pi -a codex -g -y 2>&1 || echo "[entrypoint] Warning: failed to install complex skill from $repo" >&2
-            else
-                echo "[entrypoint] Warning: complex skill ${skill_id:-unknown} has no sourceRepo; skipping npx install" >&2
-            fi
+        # (no sourceRepo, such as every seeded skill) are synced through
+        # /api/skills/sync-filesystem, so they need nothing here.
+        echo "$SKILLS_RESPONSE" | jq -r '.skills[] | select(.isComplex == true) | (.sourceRepo // "") | select(. != "")' 2>/dev/null | while read -r repo; do
+            npx skills add "$repo" -a claude-code -a pi -a codex -g -y 2>&1 || echo "[entrypoint] Warning: failed to install complex skill from $repo" >&2
         done
 
         echo "[entrypoint] Skill sync complete"

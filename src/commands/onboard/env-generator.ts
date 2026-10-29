@@ -5,7 +5,7 @@ import type { OnboardState } from "./types.ts";
  * Generate a .env file string from onboard wizard state.
  * Uses real values from state (not placeholders).
  */
-export function generateEnv(state: OnboardState): string {
+export function generateEnv(state: OnboardState, env: NodeJS.ProcessEnv = process.env): string {
   const expanded = expandServices(state.services, state.agentIds);
   const lines: string[] = [];
 
@@ -35,6 +35,18 @@ export function generateEnv(state: OnboardState): string {
     lines.push(`INSTALL_PRESET=${state.presetId}`);
   }
 
+  // Knobs from the installer's environment, so the first boot already honours
+  // them: telemetry (`ANONYMIZED_TELEMETRY=false`, `DESPLEGA_TELEMETRY_ENV=<cohort>`)
+  // and the host address for published ports (`AGENT_SWARM_BIND_ADDRESS=127.0.0.1`).
+  for (const key of [
+    "ANONYMIZED_TELEMETRY",
+    "DESPLEGA_TELEMETRY_ENV",
+    "AGENT_SWARM_BIND_ADDRESS",
+  ]) {
+    const value = env[key]?.trim();
+    if (value) lines.push(`${key}=${value}`);
+  }
+
   lines.push("");
   lines.push("# New-deployment memory preset: retrieval, citation ratings, self-rating hints.");
   lines.push("# Set MEMORY_RATERS= to disable all raters; leave SKIP_SESSION_SUMMARY unset.");
@@ -42,6 +54,15 @@ export function generateEnv(state: OnboardState): string {
   lines.push("MEMORY_GRAPH_EXPANSION=1");
   lines.push("MEMORY_RATERS=implicit-citation,explicit-self");
   lines.push("MEMORY_DEMOTION_FLOOR=1.0");
+
+  if (state.bundleAgentFs) {
+    lines.push("");
+    lines.push("# Bundled agent-fs (local disk) and TEI (memory embeddings); settings are in");
+    lines.push(
+      "# docker-compose.yml. Generate without them: agent-swarm onboard --yes --no-agent-fs",
+    );
+    if (state.teiImage) lines.push(`TEI_IMAGE=${state.teiImage}`);
+  }
 
   // ── Authentication ──
   lines.push("");

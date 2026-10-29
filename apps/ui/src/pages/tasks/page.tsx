@@ -46,6 +46,7 @@ import { useCurrentUser } from "@/contexts/current-user-context";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { MODEL_TIER_OPTIONS } from "@/lib/model-tiers";
 import { taskListTitle } from "@/lib/task-title";
+import { useCan } from "@/lib/use-can";
 import { formatRelativeTime } from "@/lib/utils";
 import { TaskEffortField } from "./task-effort-field";
 import { useStalePageCorrection } from "./use-stale-page-correction";
@@ -251,7 +252,8 @@ function CreateTaskDialog({
                           setForm({ ...form, dependsOn: form.dependsOn.filter((d) => d !== depId) })
                         }
                       >
-                        #{depId.slice(0, 8)} {depTask ? `— ${depTask.task.slice(0, 20)}` : ""}
+                        #{depId.slice(0, 8)}{" "}
+                        {depTask ? `— ${taskListTitle(depTask).slice(0, 20)}` : ""}
                         <X className="h-2.5 w-2.5" />
                       </Badge>
                     );
@@ -278,7 +280,7 @@ function CreateTaskDialog({
                         className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         <StatusBadge status={t.status} />
-                        <span className="truncate flex-1">{t.task}</span>
+                        <span className="truncate flex-1">{taskListTitle(t)}</span>
                         <span className="text-[10px] font-mono text-muted-foreground shrink-0">
                           #{t.id.slice(0, 8)}
                         </span>
@@ -311,6 +313,8 @@ const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const;
 const DEFAULT_PAGE_SIZE = 100;
 
 export default function TasksPage() {
+  // A Viewer lists tasks but cannot create one.
+  const mayCreate = useCan("task.create.own");
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -689,10 +693,12 @@ export default function TasksPage() {
             </fieldset>
           )}
           {isMobile || view === "board" ? null : <TasksColumnsMenu state={tasksColumns} />}
-          <Button size="sm" onClick={() => setDialogOpen(true)}>
-            <Plus className="h-4 w-4" />
-            New task
-          </Button>
+          {mayCreate ? (
+            <Button size="sm" onClick={() => setDialogOpen(true)}>
+              <Plus className="h-4 w-4" />
+              New task
+            </Button>
+          ) : null}
         </div>
       </div>
 

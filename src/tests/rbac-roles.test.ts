@@ -16,7 +16,9 @@ import type { PermissionVerb } from "../rbac";
 const TEST_DB_PATH = "./test-rbac-roles.sqlite";
 const REQUESTER_ROLE_ID = "rbac-role-requester";
 const REQUESTER_VERBS = [
+  "comb.presence",
   "favorite.write.own",
+  "fs.join.own",
   "session.presence",
   "session.share",
   "task.action.own",
@@ -24,6 +26,7 @@ const REQUESTER_VERBS = [
   "task.create.own",
   "task.fs.mutate",
   "task.read.own",
+  "task.steer.own",
 ] satisfies PermissionVerb[];
 
 async function removeDbFiles() {
@@ -188,6 +191,21 @@ describe("role attachment helpers", () => {
 });
 
 describe("ensureRbacSeedsSynced", () => {
+  test("seeds viewer with a subset of the requester verbs", async () => {
+    await getDbClient().run("DELETE FROM roles WHERE id = 'rbac-role-viewer'");
+
+    ensureRbacSeedsSynced({ quiet: true });
+
+    const viewerVerbs = await roleVerbs("rbac-role-viewer");
+    expect(viewerVerbs).toEqual([
+      "comb.presence",
+      "favorite.write.own",
+      "fs.join.own",
+      "session.presence",
+    ]);
+    for (const verb of viewerVerbs) expect(REQUESTER_VERBS).toContain(verb);
+  });
+
   test("restores a deleted built-in role and its permissions", async () => {
     await getDbClient().run("DELETE FROM roles WHERE id = ?", [REQUESTER_ROLE_ID]);
 

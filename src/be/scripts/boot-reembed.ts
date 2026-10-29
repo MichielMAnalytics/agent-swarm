@@ -11,7 +11,7 @@ import { getDbClient } from "@/be/db";
 import type { ScriptScope } from "@/types";
 import { embeddingProvider, embedScript } from "./embeddings";
 
-type ScriptRow = {
+export type ScriptRow = {
   id: string;
   name: string;
   scope: ScriptScope;
@@ -26,17 +26,19 @@ type ScriptRow = {
   isScratch: number;
   typeChecked: number;
   fsMode: "none" | "workspace-rw";
+  executor: "native" | "quickjs" | null;
   createdByAgentId: string | null;
   createdAt: string;
   updatedAt: string;
 };
 
-function toScriptRecord(row: ScriptRow) {
+export function toScriptRecord(row: ScriptRow) {
   return {
     ...row,
     scopeId: row.scopeId ?? null,
     isScratch: row.isScratch === 1,
     typeChecked: row.typeChecked === 1,
+    executor: row.executor ?? null,
     createdByAgentId: row.createdByAgentId ?? null,
   };
 }

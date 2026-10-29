@@ -11,6 +11,7 @@ import {
   updateWorkflowRun,
   updateWorkflowRunStep,
 } from "../be/db";
+import { getRunLineageBlock, getWorkflowRunStatus } from "../be/db/workflow-runs";
 import type {
   Workflow,
   WorkflowDefinition,
@@ -41,11 +42,12 @@ import {
   cancelQueuedForeachChildren,
   FOREACH_TERMINAL_STEP_STATUSES,
   type ForeachChildOutcome,
+  isRetryPending,
   latestForeachChildren,
   settleForeachChild,
 } from "./foreach-join";
 import { getSecretInputKeys } from "./input";
-import { resolveNodeTimeoutMs } from "./node-timeout";
+import { resolveNodeTimeoutMs, startStepDeadline } from "./node-timeout";
 import { rebuildNodeExecutionInput } from "./step-input";
 
 export { FOREACH_ITEMS_WAIT_FOR };
@@ -352,8 +354,8 @@ async function parkRunIfRunning(runId: string): Promise<void> {
 
 /**
  * Flip `pending` children to `running`, in item order, while fewer than the
- * fan-out's `concurrency` cap are in flight (`running` or `waiting`, latest
- * attempt rows only), and collect unowned `running` ones. Ownership is registered before commit, so no other
+ * fan-out's `concurrency` cap are in flight (`running`, `waiting` or queued
+ * for a retry, latest attempt rows only), and collect unowned `running` ones. Ownership is registered before commit, so no other
  * drive can see a claimed row without also seeing it owned.
  */
 async function claimChildren(
@@ -367,6 +369,10 @@ async function claimChildren(
     // so concurrent drives (a settlement's drive and the recovery sweep)
     // serialize here and never exceed the cap together.
     await getDbClient().transaction(async () => {
+      // A cancel of the run (or of an ancestor) that committed first wins.
+      const status = await getWorkflowRunStatus(runId);
+      if (status !== "running" && status !== "waiting") return;
+      if (await getRunLineageBlock(runId)) return;
       const children = latestForeachChildren(
         def,
         parentNode.id,
@@ -379,7 +385,8 @@ async function claimChildren(
         }
       }
       const inFlight = children.filter(
-        (child) => child.status === "running" || child.status === "waiting",
+        (child) =>
+          child.status === "running" || child.status === "waiting" || isRetryPending(child),
       ).length;
       let free = foreachConcurrencyCap(parentNode) - inFlight;
       for (const child of children) {
@@ -473,27 +480,21 @@ async function startChild(input: {
   }
 
   const executor = registry.get(bodyType);
-  const timeoutMs = resolveNodeTimeoutMs({ type: bodyType, config });
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = startStepDeadline(resolveNodeTimeoutMs({ type: bodyType, config }));
   let result: Awaited<ReturnType<typeof executor.run>>;
   try {
     result = await Promise.race([
       executor.run({
         config,
         context: { ...ctx, ...bodyCtx },
-        meta: { ...meta, stepId: child.id, nodeId: child.nodeId },
+        meta: { ...meta, stepId: child.id, nodeId: child.nodeId, signal: deadline.signal },
       }),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`Step timed out after ${timeoutMs}ms`)),
-          timeoutMs,
-        );
-      }),
+      deadline.expired,
     ]);
   } catch (err) {
     return { status: "failed", error: err instanceof Error ? err.message : String(err) };
   } finally {
-    if (timer) clearTimeout(timer);
+    deadline.clear();
   }
 
   if (result.status === "failed") {

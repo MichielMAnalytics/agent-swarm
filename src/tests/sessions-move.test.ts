@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { createServer } from "node:http";
+import { sessionSourceKey } from "../assets/source-key";
 import * as audit from "../be/asset-key-audit";
 import {
   closeDb,
@@ -15,12 +16,14 @@ import {
   upsertInboxState,
 } from "../be/db";
 import * as sessionMoves from "../be/db/session-moves";
+import { attachRole, detachRole, ensureRbacSeedsSynced } from "../be/rbac-roles";
 import { setSessionShares } from "../be/session-shares";
 import * as assets from "../http/assets";
 import { handleAssets } from "../http/assets";
-import { SESSION_READ_DENIED } from "../http/session-access";
+import { NOT_YOUR_TASK_DENIED, SESSION_READ_DENIED } from "../http/session-access";
 import { handleSessions } from "../http/sessions";
 import { getPathSegments, parseQueryParams } from "../http/utils";
+import { chatSdkContextKey } from "../tasks/context-key";
 import { setRequestAuth } from "../utils/request-auth-context";
 import { listenOnFreePort } from "./test-net";
 
@@ -99,6 +102,135 @@ async function share(root: { id: string; requestedByUserId?: string }, access: "
     other,
   );
 }
+
+test("bulk source moves allow exits and exact Undo keys, but refuse source groups", async () => {
+  for (const origin of [
+    { slackChannelId: "C1", slackThreadTs: "1.2" },
+    { contextKey: chatSdkContextKey("slack:D1:") },
+    { contextKey: chatSdkContextKey("telegram:-100") },
+    { contextKey: chatSdkContextKey("discord:@me:c1") },
+  ]) {
+    const root = await createTaskExtended("source root", {
+      agentId,
+      requestedByUserId: owner,
+      ...origin,
+    });
+    const child = await createTaskExtended("child", { parentTaskId: root.id, agentId });
+    const ownKey = sessionSourceKey(root)!;
+    for (const groupKey of [
+      "shared/slack/c1/",
+      "shared/telegram/",
+      "shared/discord/c2/task:other/",
+    ]) {
+      expect(await call("session-moves", { rootTaskIds: [root.id], groupKey })).toEqual({
+        status: 200,
+        body: {
+          moved: [],
+          skipped: [{ rootTaskId: root.id, reason: "Source groups are read-only." }],
+        },
+      });
+      expect((await getTaskById(root.id))?.key).toBe(ownKey);
+    }
+    for (const groupKey of ["shared/research/", ownKey, null, ownKey]) {
+      expect(await call("session-moves", { rootTaskIds: [root.id], groupKey })).toEqual({
+        status: 200,
+        body: { moved: [root.id], skipped: [] },
+      });
+      for (const id of [root.id, child.id]) {
+        expect((await getTaskById(id))?.key).toBe(groupKey ?? `shared/task:${root.id}/`);
+      }
+    }
+  }
+  const { root } = await session();
+  const result = await call("session-moves", {
+    rootTaskIds: [root.id],
+    groupKey: "SHARED/SLACK/C1",
+  });
+  expect(result.body.skipped).toEqual([
+    { rootTaskId: root.id, reason: "Source groups are read-only." },
+  ]);
+});
+
+test("prefix refuses source prefixes before audit and root scans, including bypass requests", async () => {
+  const auditSpy = spyOn(audit, "auditAssetKeys");
+  const prefixScan = spyOn(sessionMoves, "listPrefixRoots");
+  const sharedScan = spyOn(sessionMoves, "listSharedPrefixRoots");
+  try {
+    for (const userId of [owner, null]) {
+      for (const body of [
+        { from: "shared/slack/c1/", to: "shared/research/" },
+        { from: "shared/slack/c1/", to: null },
+        { from: "shared/research/", to: "SHARED/SLACK/C1" },
+        { from: "SHARED/TELEGRAM", to: "shared/research/" },
+        { from: "shared/research/", to: "shared/discord/c1/task:root/" },
+      ]) {
+        expect(await call("session-moves/prefix", body, userId)).toEqual({
+          status: 400,
+          body: { error: "Source groups are read-only." },
+        });
+      }
+    }
+    expect(auditSpy).not.toHaveBeenCalled();
+    expect(prefixScan).not.toHaveBeenCalled();
+    expect(sharedScan).not.toHaveBeenCalled();
+  } finally {
+    auditSpy.mockRestore();
+    prefixScan.mockRestore();
+    sharedScan.mockRestore();
+  }
+});
+
+test("PATCH checks the actual root source for root and child moves", async () => {
+  for (const origin of [
+    { slackChannelId: "C1", slackThreadTs: "1.2" },
+    { contextKey: chatSdkContextKey("telegram:-100") },
+    { contextKey: chatSdkContextKey("discord:@me:c1") },
+  ]) {
+    const root = await createTaskExtended("source root", {
+      agentId,
+      requestedByUserId: owner,
+      ...origin,
+    });
+    // Different fields on the child must not determine its allowed Undo key.
+    const child = await createTaskExtended("child", {
+      parentTaskId: root.id,
+      agentId,
+      slackChannelId: "C_OTHER",
+      slackThreadTs: "9.9",
+    });
+    for (const id of [root.id, child.id]) {
+      for (const key of [
+        "SHARED/SLACK/C1",
+        "shared/slack/c_other/thread:9.9/",
+        "shared/telegram/-100/task:other/",
+      ]) {
+        expect(await call(`assets/task/${id}/key`, { key, cascade: true })).toEqual({
+          status: 400,
+          body: { error: "Source groups are read-only." },
+        });
+      }
+      expect((await getTaskById(id))?.key).toBe(root.key);
+      expect((await call(`assets/task/${id}/key`, { key: "shared/research/" })).status).toBe(200);
+      expect((await call(`assets/task/${id}/key`, { key: root.key.toUpperCase() })).status).toBe(
+        200,
+      );
+      expect((await getTaskById(id))?.key).toBe(root.key);
+    }
+  }
+});
+
+test("prefix refuses a source destination produced by suffix replacement", async () => {
+  const { root } = await session("shared/indirect/slack/c1/");
+  expect(await call("session-moves/prefix", { from: "shared/indirect/", to: "shared/" })).toEqual({
+    status: 200,
+    body: {
+      moved: [],
+      remaining: 0,
+      skipped: [{ rootTaskId: root.id, reason: "Source groups are read-only." }],
+    },
+  });
+  expect((await getTaskById(root.id))?.key).toBe(root.key);
+});
 
 test("bulk moves every chain task and attachment mapping with history and preserves read state", async () => {
   const { root, child, grandchild } = await session();
@@ -573,4 +705,41 @@ test("old route denies read-only sharees with and without cascade and admits wri
   expect((await call(`assets/task/${root.id}/key`, { key: "shared/operator/" }, null)).status).toBe(
     200,
   );
+});
+
+// Regression: the session wall reads an ownerless root as everyone's, so with
+// RBAC on a requester could re-key Slack, schedule and operator sessions.
+test("with RBAC on, a requester cannot move an ownerless session; an admin user still can", async () => {
+  const previous = process.env.RBAC_ENABLED;
+  process.env.RBAC_ENABLED = "true";
+  try {
+    await ensureRbacSeedsSynced();
+    const requester = (await createUser({ name: "Move Requester" })).id;
+    await detachRole(requester, "admin");
+    await attachRole(requester, "requester");
+    const ownerless = await createTaskExtended("ownerless root", { key: "shared/slack/", agentId });
+    const own = await session("shared/requester-own/", requester);
+
+    const denied = await call(
+      "session-moves",
+      { rootTaskIds: [ownerless.id, own.root.id], groupKey: "shared/requester-moved/" },
+      requester,
+    );
+    expect(denied.status).toBe(200);
+    expect(denied.body.moved).toEqual([own.root.id]);
+    expect(denied.body.skipped).toEqual([
+      { rootTaskId: ownerless.id, reason: NOT_YOUR_TASK_DENIED },
+    ]);
+    expect((await getTaskById(ownerless.id))?.key).toBe("shared/slack/");
+
+    const admin = await call(
+      "session-moves",
+      { rootTaskIds: [ownerless.id], groupKey: "shared/admin-moved/" },
+      owner,
+    );
+    expect(admin.body.moved).toEqual([ownerless.id]);
+  } finally {
+    if (previous === undefined) delete process.env.RBAC_ENABLED;
+    else process.env.RBAC_ENABLED = previous;
+  }
 });

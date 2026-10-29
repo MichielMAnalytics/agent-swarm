@@ -1,6 +1,7 @@
 import { buildCtx } from "./ctx";
 import { patchFetchWithEgressSubstitution } from "./egress-secrets";
 import type { SwarmConfigPayload } from "./executors/types";
+import { isHostValidationEquivalent } from "./host-validated-args";
 import { ctxSignatureHintFor } from "./script-error-hints";
 import { SwarmConfig } from "./swarm-config";
 
@@ -115,8 +116,11 @@ try {
     agentFs: payload.agentFs,
   });
 
-  const sourceText = await Bun.file(requiredEnv("SWARM_SCRIPT_SOURCE_FILE")).text();
-  await Bun.write(userModulePath, sourceText);
+  const sourceFile = requiredEnv("SWARM_SCRIPT_SOURCE_FILE");
+  if (sourceFile !== userModulePath) {
+    const sourceText = await Bun.file(sourceFile).text();
+    await Bun.write(userModulePath, sourceText);
+  }
 
   if (startedFile) await Bun.write(startedFile, "1");
 
@@ -131,8 +135,14 @@ try {
     );
   }
 
+  const hostValidatedArgs = process.env.SWARM_SCRIPT_HOST_VALIDATED_ARGS === "1";
   let validatedArgs = parsedArgs;
-  if (mod.argsSchema && typeof mod.argsSchema === "object" && "parse" in mod.argsSchema) {
+  if (
+    mod.argsSchema &&
+    typeof mod.argsSchema === "object" &&
+    "parse" in mod.argsSchema &&
+    !(hostValidatedArgs && isHostValidationEquivalent(mod.argsSchema, parsedArgs))
+  ) {
     try {
       // biome-ignore lint/suspicious/noExplicitAny: argsSchema is a Zod schema at runtime
       validatedArgs = (mod.argsSchema as any).parse(parsedArgs);

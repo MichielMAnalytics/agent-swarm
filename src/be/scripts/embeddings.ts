@@ -28,6 +28,7 @@ type ScriptEmbeddingCandidateRow = ScriptEmbeddingRow & {
   isScratch: number;
   typeChecked: number;
   fsMode: "none" | "workspace-rw";
+  executor: "native" | "quickjs" | null;
   createdByAgentId: string | null;
   createdAt: string;
   updatedAt: string;
@@ -70,25 +71,35 @@ function rowToScript(row: ScriptEmbeddingCandidateRow): ScriptRecord {
     isScratch: row.isScratch === 1,
     typeChecked: row.typeChecked === 1,
     fsMode: row.fsMode,
+    executor: row.executor ?? null,
     createdByAgentId: row.createdByAgentId ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
 }
 
-export async function embedScript(script: ScriptRecord): Promise<void> {
+export type ScriptEmbedding = { text: string; embedding: Float32Array; model: string };
+
+/** Embeds a script's text without writing it. Null when no usable vector came back. */
+export async function computeScriptEmbedding(
+  script: ScriptRecord,
+): Promise<ScriptEmbedding | null> {
   const text = scriptEmbeddingText(script);
   const provider = embeddingProvider();
-  const embedding = await provider.embed(text);
-  if (!embedding) return;
+  const embedding = await provider.embed(text, { kind: "document" });
+  if (!embedding) return null;
 
   if (embedding.length !== provider.dimensions) {
     console.error(
       `[script-embed] dimension mismatch for "${script.name}": expected=${provider.dimensions} got=${embedding.length}, skipping`,
     );
-    return;
+    return null;
   }
+  return { text, embedding, model: provider.name };
+}
 
+/** Upserts a computed vector. Joins the caller's transaction when there is one. */
+export async function writeScriptEmbedding(scriptId: string, e: ScriptEmbedding): Promise<void> {
   await getDbClient().run(
     `INSERT INTO script_embeddings (
       scriptId, embedding, embeddingModel, embeddedText, embeddedAt
@@ -99,8 +110,16 @@ export async function embedScript(script: ScriptRecord): Promise<void> {
       embeddingModel = excluded.embeddingModel,
       embeddedText = excluded.embeddedText,
       embeddedAt = excluded.embeddedAt`,
-    [script.id, serializeEmbedding(embedding), provider.name, text, new Date().toISOString()],
+    [scriptId, serializeEmbedding(e.embedding), e.model, e.text, new Date().toISOString()],
   );
+}
+
+/** Returns whether a vector was stored. */
+export async function embedScript(script: ScriptRecord): Promise<boolean> {
+  const result = await computeScriptEmbedding(script);
+  if (!result) return false;
+  await writeScriptEmbedding(script.id, result);
+  return true;
 }
 
 async function candidateRows(
@@ -205,7 +224,7 @@ export async function searchScripts(args: {
   limit?: number;
 }): Promise<ScriptSearchResult[]> {
   const provider = embeddingProvider();
-  const queryEmbedding = await provider.embed(args.query);
+  const queryEmbedding = await provider.embed(args.query, { kind: "query" });
   if (!queryEmbedding) return lexicalFallback(args);
 
   const candidates = await candidateRows(args.scope, args.scopeId);

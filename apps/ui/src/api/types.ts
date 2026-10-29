@@ -135,6 +135,12 @@ export interface AgentAvatarLucide {
 }
 export type AgentAvatar = AgentAvatarLucide;
 
+/** Mirrors `AgentSlackIconSchema` (backend `src/types.ts`): the agent's Slack persona icon. */
+export type AgentSlackIcon =
+  | { type: "emoji"; emoji: string }
+  | { type: "url"; url: string }
+  | { type: "app" };
+
 export interface Agent {
   id: string;
   name: string;
@@ -145,6 +151,8 @@ export interface Agent {
   capabilities?: string[];
   /** Custom avatar. Null/missing = fall back to the deterministic hash-derived icon/color. */
   avatar?: AgentAvatar | null;
+  /** Slack persona icon. Null/missing = :crown: for the lead, a hashed emoji for workers. */
+  slackIcon?: AgentSlackIcon | null;
   claudeMd?: string;
   soulMd?: string;
   identityMd?: string;
@@ -310,11 +318,23 @@ export interface AgentRuntimeInstancesResponse {
   staleThresholdMinutes: number;
 }
 
+export interface AgentCredStatusKeyResult {
+  keyType: string;
+  index: number;
+  suffix: string;
+  ok: boolean;
+  error?: string;
+  httpStatus?: number;
+  latency_ms: number;
+}
+
 export interface AgentCredStatusLiveTest {
   ok: boolean;
   error?: string | null;
   latency_ms: number;
   testedAt: number;
+  warning?: string;
+  keys?: AgentCredStatusKeyResult[];
 }
 
 export interface AgentBedrockStatusModel {
@@ -550,14 +570,6 @@ export interface UserIdentity {
   externalId: string;
 }
 
-/**
- * Coarse user-role union. The backend stores `role` as a free-form string;
- * this union captures the values the UI currently reasons about and gives a
- * declarative type for future RBAC (e.g. `NavItem.minRole`). Loosened to
- * `string` on the `User` row since the wire value is not constrained.
- */
-export type UserRole = "admin" | "member" | "viewer";
-
 export interface User {
   id: string;
   name: string;
@@ -597,6 +609,16 @@ export interface UserResponse {
 export interface WhoamiResponse {
   kind: "operator" | "user";
   user: User | null;
+  /** The caller's RBAC grants. Absent on APIs older than 2.6.1. */
+  grants?: WhoamiGrants;
+}
+
+/** RBAC grants from whoami. `grantsAll` is also true when RBAC is off. */
+export interface WhoamiGrants {
+  grantsAll: boolean;
+  verbs: string[];
+  /** Role names, e.g. `["requester"]`. */
+  roles: string[];
 }
 
 export interface MintTokenResponse {
@@ -609,6 +631,48 @@ export interface ConnectorCodeResponse {
   code: string;
   expiresAt: string;
   connectUrl: string;
+}
+
+/** The roles `POST /api/invites` accepts. */
+export type InviteRole = "requester" | "viewer" | "admin";
+
+/** `POST /api/invites` body. */
+export interface CreateInviteInput {
+  email: string;
+  name?: string;
+  role: InviteRole;
+}
+
+/** `POST /api/invites` 201. `inviteUrl` carries the one-time code: never log it. */
+export interface CreateInviteResponse {
+  user: User | null;
+  inviteUrl: string;
+  /** Absent on older APIs. */
+  appUrl?: string;
+  expiresAt: string;
+  /** `local` when teammates' browsers likely cannot reach the API URL. */
+  apiReachable: "public" | "local";
+}
+
+/** `POST /api/invites/exchange` 200. */
+export interface InviteExchangeResponse {
+  token: string;
+  userId: string;
+}
+
+/** One role of `GET /api/rbac/roles`. */
+export interface RbacRole {
+  id: string;
+  name: string;
+  description: string | null;
+  isBuiltin: boolean;
+  grantsAll: boolean;
+  primary: boolean;
+  verbs: string[];
+}
+
+export interface RbacRolesResponse {
+  roles: RbacRole[];
 }
 
 export interface McpUserConfigResponse {
@@ -850,11 +914,14 @@ export interface SessionTreeGroup extends SessionSectionCounts {
 
 /** `GET /api/session-tree`: every visible group plus the section counts. */
 export interface SessionTreeResponse {
+  labels?: Record<string, string>;
   groups: SessionTreeGroup[];
   inbox: SessionSectionCounts;
   later: SessionSectionCounts;
   done: SessionSectionCounts;
   noGroup: SessionSectionCounts;
+  /** Each root source in this view with its session count, hidden sources included. */
+  sources?: { source: string; total: number }[];
 }
 
 /** A pending approval request in a session chain (`GET /api/sessions/:rootTaskId`). */
@@ -1029,6 +1096,11 @@ export interface SessionDetailResponse {
   access?: SessionAccess;
   /** The root's requester. Null for Slack/schedule sessions; omitted by older servers. */
   owner?: SessionOwner | null;
+  /**
+   * The root's group with the list's rule: a source thread with two or more
+   * roots is its own group. Omitted by older servers (use `detailGroupKey`).
+   */
+  groupKey?: string;
   /** Pending approval requests in the chain. Missing means none. */
   approvals?: SessionApproval[];
   /** The viewer's read state (the list's rule). Omitted with no picked user. */
@@ -1738,6 +1810,15 @@ export interface WorkflowsResponse {
 
 /** List row of a run: no `context`, which `GET /api/workflow-runs/{id}` serves. */
 export type WorkflowRunSummary = Omit<WorkflowRun, "context">;
+
+/** Step of `GET /api/workflow-runs/{id}?fields=slim`: no `input`, the context snapshot. */
+export type WorkflowRunStepSlim = Omit<WorkflowRunStep, "input">;
+
+/** `GET /api/workflow-runs/{id}?fields=slim`: the run without `context`, steps without `input`. */
+export interface WorkflowRunSlimWithSteps extends WorkflowRunSummary {
+  steps: WorkflowRunStepSlim[];
+  parent?: WorkflowRunParent;
+}
 
 /** One page of `GET /api/workflows/{id}/runs`, newest first. */
 export interface WorkflowRunsPage {
@@ -2519,9 +2600,47 @@ export interface RenderResponse {
 
 export type ApprovalRequestStatus = "pending" | "approved" | "rejected" | "timeout" | "cancelled";
 
+/** Settings of a `config` question: one swarm config key a person sets. */
+export interface ApprovalConfigSettings {
+  key: string;
+  scope: "global" | "agent" | "repo";
+  scopeId?: string;
+  /** Resolved at creation; an existing secret row is always secret. */
+  isSecret?: boolean;
+  helpUrl?: string;
+  options?: Array<{ value: string; label: string; description?: string }>;
+  defaultValue?: string;
+}
+
+/** Live state of a config question's key, read when the request is fetched. */
+export interface ApprovalConfigState {
+  exists: boolean;
+  isSecret: boolean;
+  updatedAt: string | null;
+  /** Present only for non-secret keys. */
+  value?: string;
+}
+
+/** What the dashboard sends for a config question. */
+export type ApprovalConfigAnswer =
+  | { action: "set"; value: string }
+  | { action: "keep" }
+  | { action: "skip" };
+
+/** What the server stores for a config question. Never holds a secret value. */
+export interface ApprovalConfigResult {
+  key: string;
+  scope: "global" | "agent" | "repo";
+  scopeId: string | null;
+  isSecret: boolean;
+  status: "set" | "kept" | "skipped";
+  updatedAt: string | null;
+  value?: string;
+}
+
 export interface ApprovalQuestion {
   id: string;
-  type: "approval" | "text" | "single-select" | "multi-select" | "boolean";
+  type: "approval" | "text" | "single-select" | "multi-select" | "boolean" | "config";
   label: string;
   description?: string;
   required?: boolean;
@@ -2531,6 +2650,7 @@ export interface ApprovalQuestion {
   minSelections?: number;
   maxSelections?: number;
   defaultValue?: boolean;
+  config?: ApprovalConfigSettings;
 }
 
 /** One accepted answer. The server takes `responder` from the credential, never from the body. */
@@ -2566,6 +2686,8 @@ export interface ApprovalRequest {
   approvals?: ApprovalVote[] | null;
   /** Quorum progress while pending; null once resolved. */
   approvalProgress?: ApprovalProgress | null;
+  /** Live state per config question id (single-request reads only). */
+  configState?: Record<string, ApprovalConfigState>;
   /** From the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
   resolvedBy: string | null;
   resolvedAt: string | null;
@@ -2929,6 +3051,9 @@ export interface ApiKeyStatus {
   /** Subscription plan id (see `GET /api/keys/plans`), when known. */
   plan: string | null;
   planSource: "manual" | "detected" | "estimated" | null;
+  /** The provider rejected this key in a worker live test (`HTTP 401`), until it passes or leaves the pool. */
+  lastValidationError?: string | null;
+  lastValidationFailedAt?: string | null;
   rateLimitWindows: Record<
     string,
     {
@@ -3314,13 +3439,20 @@ export type TelemetryEnableVia = "banner" | "settings" | "benchmark";
 export interface StatusActivity {
   agents_online: number;
   leads_online: number;
+  /** Leads with status idle or busy (not the heartbeat). Absent on servers that predate it. */
+  leads_ready?: number;
   recent_tasks_count: number;
 }
 
 /** Comb, the agent-fs review space in the dashboard (`/file`). */
 export interface StatusComb {
-  /** `COMB_ENABLED` is on and `AGENT_FS_API_URL` is set. */
+  /**
+   * Files is on: `AGENT_FS_API_URL` is set and `COMB_ENABLED` is not `false`,
+   * and (when `COMB_ENABLED` is unset) a browser can reach agent-fs.
+   */
   enabled: boolean;
+  /** What is missing while Files is off. Null when on. Absent on older APIs. */
+  reason?: string | null;
   /** Browser-facing agent-fs URL (`AGENT_FS_PUBLIC_URL`, else `AGENT_FS_API_URL`). */
   api_url: string | null;
   /** agent-fs live UI host, for "Open in agent-fs" links. */
@@ -3358,6 +3490,8 @@ export interface CombReviewBatchInput {
   commentIds: string[];
   /** The file or folder the batch is sent from ("/docs/a.md", "/docs/"). */
   scopePath: string;
+  /** A note for the lead about the whole batch, at most `COMB_NOTE_MAX` characters. */
+  note?: string;
 }
 
 export interface CombReviewBatchResult {
@@ -3366,6 +3500,11 @@ export interface CombReviewBatchResult {
   sent: string[];
   skipped: CombSkippedComment[];
   repaired: CombRepairedComment[];
+  /**
+   * With a new task only: `online` (a lead got it), `offline` (every lead is
+   * offline), or `none` (no lead, so it waits in the pool). Absent on older servers.
+   */
+  lead?: "online" | "offline" | "none";
 }
 
 export interface StatusAgentFs {
@@ -3869,6 +4008,7 @@ export type OnboardingStepId =
   | "agents"
   | "memory"
   | "integrations"
+  | "files"
   | "first_task";
 
 export type OnboardingStepStatus = "todo" | "done" | "skipped" | "failed";
@@ -3905,6 +4045,18 @@ export type OnboardingMemoryPreset =
   | "custom"
   | "existing";
 
+/**
+ * Where the embeddings endpoint runs: `local` (the server or its private
+ * network), the hosted preset whose host it calls, or `custom`.
+ */
+export type OnboardingMemoryProvider =
+  | "local"
+  | "openai"
+  | "openrouter"
+  | "vercel"
+  | "azure"
+  | "custom";
+
 export type OnboardingIntegrationMethod =
   | "slack"
   | "github"
@@ -3937,11 +4089,29 @@ export interface OnboardingProviderSignal {
   state: "unverified" | "configured" | "verified";
   workers: number;
   verifiedWorkers: number;
+  /** The latest live test failed: its error. */
+  error?: string | null;
+  /** The latest live test passed, but some pool keys failed: names them. */
+  warning?: string | null;
 }
 
 export interface OnboardingSignals {
   providers: OnboardingProviderSignal[];
-  embeddings: { configured: boolean; dimensions: number };
+  embeddings: {
+    configured: boolean;
+    dimensions: number;
+    /** The model memory search uses. Null while off, absent on an older API. */
+    model?: string | null;
+    /** The endpoint runs on the server or its private network. Absent on an older API. */
+    local?: boolean;
+    /** Where the endpoint runs, from its host. Null while off, absent on an older API. */
+    provider?: OnboardingMemoryProvider | null;
+    /**
+     * The local setup of the deployment (its environment), also while a stored
+     * hosted setup replaces it. Null without one, absent on an older API.
+     */
+    localDefault?: { model: string } | null;
+  };
   integrations: {
     slack: boolean;
     github: boolean;
@@ -3952,6 +4122,8 @@ export interface OnboardingSignals {
   };
   agents: { leadsOnline: number; workersOnline: number };
   firstTask: { id: string; status: string } | null;
+  /** The Files step applies (Comb is on). Absent on an API from before the step. */
+  files?: { enabled: boolean };
 }
 
 export interface OnboardingResponse {
@@ -3966,6 +4138,7 @@ export type OnboardingAction =
   | { action: "complete"; step: "ai"; method: OnboardingAiMethod }
   | { action: "complete"; step: "agents"; method: OnboardingAgentsMethod }
   | { action: "complete"; step: "integrations"; method: OnboardingIntegrationMethod }
+  | { action: "complete"; step: "files"; method: "created" | "connected" }
   | { action: "skip"; step: Exclude<OnboardingStepId, "connect"> }
   | { action: "fail"; step: OnboardingStepId; errorClass: OnboardingErrorClass }
   | { action: "first_task"; taskId: string; method: "suggestion" | "free_form" }
@@ -3979,6 +4152,11 @@ export interface OnboardingMemoryTestRequest {
   model?: string;
   apiKey?: string;
   reuseKey?: "OPENAI_API_KEY" | "OPENROUTER_API_KEY";
+  /**
+   * With preset `existing`: test the deployment's own setup, and when it
+   * works, delete the stored embeddings config so it applies again.
+   */
+  restoreDefault?: boolean;
 }
 
 export interface OnboardingMemoryTestResponse {
@@ -4001,6 +4179,70 @@ export interface CodexDevicePollResponse {
   status: "pending" | "complete" | "failed" | "expired";
   slot?: number;
   error?: string;
+}
+
+// ─── Credential pool keys (`/api/config/pool-keys`) ─────────────────────────
+
+/** From the global `api_key_status` row of the key (same `keyType` and `keySuffix`). */
+export type PoolKeyStatus = "ok" | "rejected" | "rate_limited" | "unchecked";
+
+/** One key of a stored credential pool. Only the suffix leaves the server. */
+export interface PoolKey {
+  /** Position in the stored pool, 0-based. */
+  index: number;
+  /** The last 5 characters, the same as `api_key_status.keySuffix`. */
+  suffix: string;
+  status: PoolKeyStatus;
+  /** The last validation error when `rejected`, else null. */
+  error: string | null;
+  checkedAt: string | null;
+  rateLimitedUntil: string | null;
+}
+
+export interface PoolKeysResponse {
+  /** The env var name. */
+  key: string;
+  /** `stored`: a global swarm_config row. `env`: the deployment env only. */
+  source: "stored" | "env" | "none";
+  /** True when `source` is `env`: change the keys in the deployment env. */
+  readOnly: boolean;
+  keys: PoolKey[];
+}
+
+export type PoolKeyCheckResult = "verified" | "rejected" | "not_tested";
+
+/** The instant check of one new key in `POST /api/config/pool-keys`. */
+export interface PoolKeyCheck {
+  suffix: string;
+  result: PoolKeyCheckResult;
+  httpStatus: number | null;
+  /** Short and scrubbed. Never contains the key. */
+  error: string | null;
+}
+
+export interface PoolKeysAddResponse extends PoolKeysResponse {
+  checks: PoolKeyCheck[];
+}
+
+// ─── Codex ChatGPT accounts (`/api/codex-oauth/accounts`) ───────────────────
+
+export type CodexAccountStatus = "ok" | "needs_login" | "unchecked";
+
+export interface CodexAccount {
+  /** 0 for the legacy `codex_oauth` row when no `codex_oauth_0` exists. */
+  slot: number;
+  /** `codex_oauth_<n>` or `codex_oauth`. */
+  configKey: string;
+  legacy: boolean;
+  suffix: string | null;
+  plan: string | null;
+  email: string | null;
+  status: CodexAccountStatus;
+}
+
+export interface CodexAccountsResponse {
+  /** Sorted by slot. */
+  accounts: CodexAccount[];
 }
 
 // ─── Fleet benchmark (`GET /api/fleet-benchmark`) ───────────────────────────

@@ -410,6 +410,8 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
       value,
       "Invalid AGENT_FS_PUBLIC_URL (must be an http(s) URL with no query string or fragment, e.g. https://agent-fs.example.com. Leave blank to use AGENT_FS_API_URL)",
     ),
+  // Where people-facing file links point. Blank keeps the automatic choice.
+  ...enumValidator("AGENT_FS_LINK_TARGET", ["dashboard", "live", ""]),
   HARNESS_PROVIDER: (value) => {
     const parsed = ProviderNameSchema.safeParse(value);
     if (parsed.success) return null;
@@ -520,6 +522,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
     "DB_RETENTION_DRY_RUN",
     "MODEL_AUTO_UPGRADE",
     "COMB_ENABLED",
+    "AGENT_FS_PROXY",
   ]),
   ...enumValidator("SLACK_MODE", ["socket", "http"]),
   ...enumValidator("SLACK_THREAD_STEERING", ["off", "lead", "all"]),
@@ -584,6 +587,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
       "SESSION_LOG_RETENTION_DAYS",
       "AGENT_LOG_RETENTION_DAYS",
       "EVENTS_RETENTION_DAYS",
+      "SCRIPT_RUNS_RETENTION_DAYS",
       // A kept-version count, not days. The floor of 1 is what guarantees the
       // sweep never deletes the newest version of any (agentId, field).
       "CONTEXT_VERSIONS_KEEP_LATEST",
@@ -610,6 +614,8 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   // (~80k chars) it risks the SIGTERM-143 context-saturation failure mode
   // the cap exists to prevent (see context-preamble.ts).
   ...boundedIntegerValidators(["CONTEXT_PREAMBLE_MAX_TOKENS"], 100, 20000),
+  // 0 turns the one-time context-bound note off; no model window reaches 10M.
+  ...boundedIntegerValidators(["CONTEXT_BOUND_NOTE_TOKENS"], 0, 10_000_000),
   MEMORY_MIN_SIMILARITY: (value) =>
     validateFloatRange("MEMORY_MIN_SIMILARITY", value, 0, 1, "between 0 and 1 inclusive"),
   MEMORY_ACCESS_BOOST_MAX: (value) =>
@@ -626,6 +632,29 @@ export function validateConfigValue(key: string, value: unknown): string | null 
   if (isTierConfigKey(key)) return validateTierConfigValue(key.toUpperCase(), value);
   const validator = VALIDATED_KEYS[key.toUpperCase()];
   return validator ? validator(value) : null;
+}
+
+/**
+ * Every check `PUT /api/config` runs before a write: scope and scopeId shape,
+ * reserved and internal keys, the per-key value validator and the env-export
+ * rule. Shared with HITL `config` questions so the two writers cannot drift.
+ */
+export function validateConfigEntry(entry: {
+  scope: "global" | "agent" | "repo";
+  scopeId?: string | null;
+  key: string;
+  value: unknown;
+  exportToEnv?: boolean;
+}): string | null {
+  if (entry.scope === "global" && entry.scopeId) return "Global scope must not have scopeId";
+  if ((entry.scope === "agent" || entry.scope === "repo") && !entry.scopeId) {
+    return "Agent/repo scope requires scopeId";
+  }
+  if (isReservedConfigKey(entry.key)) return reservedKeyError(entry.key).message;
+  if (isInternalConfigKey(entry.key)) return internalConfigKeyError(entry.key).message;
+  return (
+    validateConfigValue(entry.key, entry.value) ?? validateExportToEnv(entry.key, entry.exportToEnv)
+  );
 }
 
 /**

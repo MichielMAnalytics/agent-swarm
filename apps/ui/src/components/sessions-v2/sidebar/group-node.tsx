@@ -5,6 +5,7 @@
  * control), the group menu "⋯" and a "+" on hover or on the keyboard
  * cursor, and the counts. The actions sit next to the counts and never
  * cover them. My groups and No group take dropped rows (plan Phase 5).
+ * Source groups are read-only: no menu, no "+", and no drops.
  */
 
 import {
@@ -16,16 +17,20 @@ import {
   Inbox,
   Lock,
   type LucideIcon,
+  MessagesSquare,
   Plus,
   SquareDashed,
+  User,
 } from "lucide-react";
 import { type KeyboardEvent, type MouseEvent, memo, type ReactNode, useRef, useState } from "react";
 import type { SessionSectionCounts } from "@/api/types";
 import { TaskStatusIcon } from "@/components/shared/task-status-icon";
 import { UserAvatar } from "@/components/shared/user-avatar";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { modKeyLabel } from "@/lib/approval-shortcuts";
 import type { SessionSection } from "@/lib/sessions-v2";
 import { cn } from "@/lib/utils";
 import {
@@ -36,7 +41,7 @@ import {
   TipKey,
   TreeRow,
 } from "./tree-row";
-import type { TreeRow as TreeRowModel } from "./tree-rows";
+import type { ListSelectState, TreeRow as TreeRowModel } from "./tree-rows";
 import { useGroupDroppable } from "./use-row-drag";
 
 export const SECTION_META: Record<SessionSection, { label: string; icon: LucideIcon }> = {
@@ -201,6 +206,12 @@ interface GroupNodeProps {
   renaming?: boolean;
   /** The rename ended: the group key, and the typed name or null to cancel. */
   onRenameDone?: (groupKey: string, name: string | null) => void;
+  /** The list's checkbox state. Missing: no loaded session rows under this row. */
+  listSelect?: ListSelectState | null;
+  /** Some sessions are selected: every list shows its checkbox. */
+  selecting?: boolean;
+  /** The list's checkbox: select its loaded rows, or unselect them. */
+  onToggleList?: (rowKey: string) => void;
 }
 
 /**
@@ -296,7 +307,10 @@ function RowAction({
   );
 }
 
-/** The icon of a container row: the section's, a hash, or the owner's avatar. `touch`: a size larger. */
+/**
+ * The icon of a container row: the section's, a hash, a person for a source
+ * DM, a conversation for a thread, or the owner's avatar. `touch`: a size larger.
+ */
 export function RowIcon({
   row,
   ownerName,
@@ -309,7 +323,10 @@ export function RowIcon({
   if (row.type === "owner") {
     return <UserAvatar id={row.ownerId} name={ownerName ?? row.ownerId} size="xs" />;
   }
-  const Icon = row.type === "box" ? SECTION_META[row.id].icon : Hash;
+  let Icon: LucideIcon = Hash;
+  if (row.type === "box") Icon = SECTION_META[row.id].icon;
+  else if (row.node.thread) Icon = MessagesSquare;
+  else if (row.node.dm) Icon = User;
   return (
     <Icon aria-hidden className={cn("text-muted-foreground", touch ? "size-4" : "size-3.5")} />
   );
@@ -329,6 +346,9 @@ function GroupNodeView({
   dropKey,
   renaming,
   onRenameDone,
+  listSelect,
+  selecting = false,
+  onToggleList,
 }: GroupNodeProps) {
   const { name, searchMatch, hasChildren, plain, onlyYou, label } = containerFacts(row, ownerName);
   const { dropRef, isOver } = useGroupDroppable(row.key, dropKey);
@@ -350,7 +370,39 @@ function GroupNodeView({
       className="h-7 text-data data-[drop-over=true]:bg-primary/10 data-[drop-over=true]:ring-1 data-[drop-over=true]:ring-primary/60 data-[drop-over=true]:ring-inset"
     >
       <span className="grid size-4 shrink-0 place-items-center">
-        <RowIcon row={row} ownerName={ownerName} />
+        {listSelect ? (
+          // The icon turns into the list's checkbox on hover and while sessions are selected.
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Checkbox
+                tabIndex={-1}
+                aria-hidden
+                checked={
+                  listSelect === "all" ? true : listSelect === "some" ? "indeterminate" : false
+                }
+                onCheckedChange={() => onToggleList?.(row.key)}
+                onClick={(event) => event.stopPropagation()}
+                onMouseDown={keepTreeFocus}
+                className={cn(
+                  "col-start-1 row-start-1",
+                  selecting ? "flex" : "hidden group-hover/row:flex",
+                )}
+              />
+            </TooltipTrigger>
+            <TooltipContent className="flex items-center gap-1.5">
+              Select all shown
+              <TipKey>{`${modKeyLabel()}A`}</TipKey>
+            </TooltipContent>
+          </Tooltip>
+        ) : null}
+        <span
+          className={cn(
+            "col-start-1 row-start-1 grid place-items-center",
+            listSelect && (selecting ? "hidden" : "group-hover/row:hidden"),
+          )}
+        >
+          <RowIcon row={row} ownerName={ownerName} />
+        </span>
       </span>
       {renaming && row.type === "group" ? (
         <GroupNameField
@@ -420,6 +472,8 @@ function GroupNodeView({
         className={cn(
           "relative flex min-w-0 grow basis-0 items-center justify-end",
           actionCount === 2 ? "min-w-12.5" : actionCount === 1 && "min-w-6",
+          // A thread's name is a session title: it truncates, and its counts stay whole.
+          row.type === "group" && row.node.thread && "min-w-max",
         )}
       >
         {counts ? (

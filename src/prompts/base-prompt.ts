@@ -22,6 +22,7 @@
 import type { ProviderTraits } from "../providers/types";
 import { getSlackConfiguration } from "../slack/config";
 import type { ProviderName } from "../types";
+import { resolveAgentFsLinkBase } from "../utils/constants";
 import { isSteeringEnabled } from "../utils/steering-enabled";
 import { matchesDefaultClaudeMd, matchesDefaultIdentityMd } from "./defaults";
 import { resolveTemplateAsync } from "./resolver";
@@ -73,6 +74,26 @@ function claudeMdSourcePath(provider: string): string {
 
 /** Providers that get the repo CLAUDE.md inlined until native loading is verified. */
 const REPO_CLAUDE_MD_INLINE_PROVIDERS: ReadonlySet<string> = new Set(["opencode"]);
+
+/**
+ * Template event for the tool-discovery line. Amp, Codex and OpenCode run MCP
+ * tools inside their own code sandbox (`code_exec`, `exec`, `execute`), each
+ * with its own call shape, so the generic lines are wrong for them.
+ */
+function toolDiscoveryEvent(provider: string, hasToolSearch: boolean): string {
+  switch (provider) {
+    case "amp":
+      return "system.agent.tool_discovery.amp";
+    case "codex":
+      return "system.agent.tool_discovery.codex";
+    case "opencode":
+      return "system.agent.tool_discovery.opencode";
+    default:
+      return hasToolSearch
+        ? "system.agent.tool_discovery.search"
+        : "system.agent.tool_discovery.direct";
+  }
+}
 
 export function areSlackPromptToolsEnabled(
   env: NodeJS.ProcessEnv = process.env,
@@ -229,7 +250,8 @@ export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
     const agentFsConfigured = hasLocalEnv && Boolean(process.env.AGENT_FS_API_URL);
     const outputsResult = await resolveTemplateAsync(
       agentFsConfigured ? "system.agent.outputs" : "system.agent.outputs.no_agent_fs",
-      {},
+      // Unset AGENT_FS_LINK_TARGET keeps the literal the agent expands in its shell.
+      { fileLinkBase: resolveAgentFsLinkBase("prompt") ?? `\${AGENT_FS_LIVE_URL}` },
     );
     prompt += outputsResult.text;
   }
@@ -257,26 +279,29 @@ export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
 
   // I. Tools and skills. Skipped without MCP: the discovery tools are MCP tools.
   if (hasMcp) {
-    // Amp's MCP tools sit behind its own `tool_search` + `code_exec` with
-    // underscored names, so the generic "load with your tool search" line is not enough.
-    const discoveryEvent =
-      provider === "amp"
-        ? "system.agent.tool_discovery.amp"
-        : hasToolSearch
-          ? "system.agent.tool_discovery.search"
-          : "system.agent.tool_discovery.direct";
+    const discoveryEvent = toolDiscoveryEvent(provider, hasToolSearch);
     const discoveryResult = await resolveTemplateAsync(discoveryEvent, {});
     const toolsResult = await resolveTemplateAsync(
       "system.agent.tools_skills",
       renderToolsAndSkillsVars({
         skillsSummary: args.skillsSummary,
         mcpServers: args.mcpServers,
+        // pi defers installed MCP servers together with swarm tools.
+        mcpToolsDeferred: provider === "pi" && hasToolSearch,
         nativeSkillDiscovery,
         toolDiscovery: discoveryResult.text,
         hasLocalEnv,
       }),
     );
     prompt += toolsResult.text;
+
+    // Lead docs pointer: only when the lead has the `swarm-docs` skill. The
+    // skill list is unknown on claude-managed (the cloud sandbox owns skill
+    // delivery) and before the first skill load, so render it then.
+    if (role === "lead" && hasSwarmDocsSkill(args.skillsSummary)) {
+      const docsResult = await resolveTemplateAsync("system.agent.lead.docs", {});
+      prompt += docsResult.text;
+    }
   }
 
   // J. Agent notes (CLAUDE.md), only when it differs from the generated
@@ -339,6 +364,11 @@ export const getTaskContextPrompt = async (args: TaskContextPromptArgs): Promise
   return prompt.replace(/\n{3,}/g, "\n\n").trim();
 };
 
+/** True when the skill list includes `swarm-docs`, or when the list is unknown. */
+function hasSwarmDocsSkill(skills: { name: string }[] | undefined): boolean {
+  return skills === undefined || skills.some((skill) => skill.name === "swarm-docs");
+}
+
 /**
  * Dynamic lines for `system.agent.tools_skills`. The static text lives in the
  * template so operators can override or skip the section; only the lists that
@@ -347,6 +377,7 @@ export const getTaskContextPrompt = async (args: TaskContextPromptArgs): Promise
 function renderToolsAndSkillsVars(input: {
   skillsSummary?: { name: string; description: string }[];
   mcpServers?: string[];
+  mcpToolsDeferred?: boolean;
   nativeSkillDiscovery: boolean;
   hasLocalEnv: boolean;
   toolDiscovery: string;
@@ -382,7 +413,11 @@ function renderToolsAndSkillsVars(input: {
   const servers = (input.mcpServers ?? []).filter((name) => name.trim().length > 0);
   const mcpLine =
     servers.length > 0
-      ? `Connected MCP servers: ${servers.join(", ")}. Their tools are in your tool list.\n`
+      ? `Connected MCP servers: ${servers.join(", ")}. ${
+          input.mcpToolsDeferred
+            ? "Load their tools with your harness tool search."
+            : "Their tools are in your tool list."
+        }\n`
       : "";
 
   return {
@@ -428,8 +463,14 @@ function renderRepositoryVars(
   }
 
   if (ctx.hasLocalEnv && repo.autoStashes && repo.autoStashes.length > 0) {
-    const stashes = repo.autoStashes.map((stash) => `- ${stash.ref}: ${stash.message}`).join("\n");
-    vars.auto_stashes = `\nPending auto-stashed work exists in this repo:\n${stashes}\nRestore if relevant with \`git stash apply <ref>\` or \`git stash pop <ref>\`.\n`;
+    const stashes = repo.autoStashes.slice(0, 5).map((stash) => `- ${stash.ref}: ${stash.message}`);
+    const olderCount = repo.autoStashes.length - stashes.length;
+    if (olderCount > 0) {
+      stashes.push(
+        `- ...and ${olderCount} older swarm-autostash entries (run git stash list to see all)`,
+      );
+    }
+    vars.auto_stashes = `\nPending auto-stashed work exists in this repo:\n${stashes.join("\n")}\nRestore if relevant with \`git stash apply <ref>\` or \`git stash pop <ref>\`.\n`;
   }
 
   let section = "";

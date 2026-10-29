@@ -45,6 +45,7 @@ import { startSlackApp, stopSlackApp } from "../slack";
 import type { AgentStatus } from "../types";
 import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
 import {
+  authUserId,
   beginRequestAuthScope,
   runWithoutRequestAuth,
   setRequestAuth,
@@ -94,6 +95,12 @@ import {
  * pre-injection value, not the value a previous reload injected.
  */
 const injectedEnvOriginals = new Map<string, { original: string | undefined; injected: string }>();
+
+/** Read the deployment value without a stored config's temporary env injection. */
+export function getDeploymentEnvValue(key: string): string | undefined {
+  const tracked = injectedEnvOriginals.get(key);
+  return tracked && process.env[key] === tracked.injected ? tracked.original : process.env[key];
+}
 
 export async function loadGlobalConfigsIntoEnv(override = false): Promise<string[]> {
   const globalConfigs = await getInjectableGlobalConfigs();
@@ -216,20 +223,18 @@ async function reloadGlobalConfigsAndIntegrationsInner(): Promise<ReloadConfigRe
     integrations.push("embeddings");
   }
 
-  // Off-to-on transition: existing rows written while no key resolved (or
-  // with a stale dimension) never got embedded. Kick off the same backfill
-  // boot runs, fire-and-forget — it batches, swallows per-batch errors, and
-  // is idempotent, so it's safe to not await here.
-  if (!wasEmbeddingsConfigured && isEmbeddingsConfigured) {
-    import("../be/memory/boot-reembed")
-      .then(({ runBootReembed }) => runBootReembed())
+  // Every reload compares the embedding space with the stored one and
+  // re-embeds on a change (cheap when nothing changed). The off-to-on
+  // transition also backfills rows written while no key resolved (or with a
+  // stale dimension). Fire-and-forget: it batches, resumes and logs its own
+  // errors, so it's safe to not await here.
+  if (isEmbeddingsConfigured) {
+    import("../be/memory/embedding-space")
+      .then(({ runEmbeddingMaintenance }) =>
+        runEmbeddingMaintenance({ backfill: !wasEmbeddingsConfigured }),
+      )
       .catch((err) => {
-        console.error("[config-reload] memory backfill failed (non-fatal):", err);
-      });
-    import("../be/scripts/boot-reembed")
-      .then(({ runBootReembedScripts }) => runBootReembedScripts())
-      .catch((err) => {
-        console.error("[config-reload] script backfill failed (non-fatal):", err);
+        console.error("[config-reload] embedding maintenance failed (non-fatal):", err);
       });
   }
 
@@ -593,8 +598,9 @@ export async function handleCore(
     }
   }
 
-  if (auth?.kind === "user" && isRbacEnabled()) {
-    const grant = await getUserGrant(auth.userId);
+  const userId = authUserId(auth);
+  if (userId && isRbacEnabled()) {
+    const grant = await getUserGrant(userId);
     if (!grant.grantsAll) {
       const def = routeDef;
       const decision = decideAdmission({
@@ -604,7 +610,7 @@ export async function handleCore(
         grant,
       });
       enqueueAdmissionRow({
-        userId: auth.userId,
+        userId,
         decision,
         method: req.method,
         route: def?.path ?? pathSegments.join("/"),

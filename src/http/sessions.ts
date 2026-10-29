@@ -6,6 +6,7 @@ import {
   normalizeAssetKey,
   parseAssetKey,
 } from "../assets/key";
+import { SOURCE_GROUPS_READ_ONLY, sourceMoveError, sourceOfKey } from "../assets/source-key";
 import { AssetKeyAuthorizationError, authorizeAssetKeyWrite } from "../be/asset-key-auth";
 import { resolveHttpAuditUserId } from "../be/audit-user";
 import {
@@ -20,13 +21,19 @@ import {
   getTaskById,
   listRecentSessions,
 } from "../be/db";
+import { getSessionLabels } from "../be/db/session-labels";
 import {
   listPrefixRoots,
   listSharedPrefixRoots,
   moveSessionChains,
   type SessionKeyMove,
 } from "../be/db/session-moves";
-import { getSessionReadState, getSessionTree } from "../be/db/session-tree";
+import {
+  getSessionGroupKey,
+  getSessionReadState,
+  getSessionTree,
+  triageSessionList,
+} from "../be/db/session-tree";
 import { getUserGrant } from "../be/rbac-roles";
 import {
   getSessionRoot,
@@ -53,6 +60,7 @@ import {
 import { can, isRbacEnabled } from "../rbac";
 import { sessionAccessTopic } from "../realtime/auth";
 import { realtimeBus } from "../realtime/bus";
+import { warmSlackChannelLabels } from "../slack/channel-labels";
 import {
   type AgentTask,
   AgentTaskSchema,
@@ -67,9 +75,16 @@ import {
 import { getRequestAuth } from "../utils/request-auth-context";
 import { isRuntimePoolsEnabled } from "../utils/runtime-pools-flag";
 import { canMutateTaskNamespace } from "./assets";
-import { agentFirstPrincipal } from "./request-principal";
+import { createListTotalCache } from "./list-total-cache";
+import { agentFirstPrincipal, authUserId, requireAuthKind } from "./request-principal";
 import { route } from "./route-def";
-import { resolveSessionActor, type SessionActor, sessionAccessFor } from "./session-access";
+import {
+  deniesNonOwnerTaskWrite,
+  NOT_YOUR_TASK_DENIED,
+  resolveSessionActor,
+  type SessionActor,
+  sessionAccessFor,
+} from "./session-access";
 import { jsonError } from "./utils";
 
 // ─── Response Schemas ────────────────────────────────────────────────────────
@@ -152,11 +167,15 @@ const SessionTreeGroupSchema = SessionSectionCountsSchema.extend({
   lastActivityAt: z.string(),
 });
 const SessionTreeResponseSchema = z.object({
+  labels: z.record(z.string(), z.string()).optional(),
   groups: z.array(SessionTreeGroupSchema),
   inbox: SessionSectionCountsSchema,
   later: SessionSectionCountsSchema,
   done: SessionSectionCountsSchema,
   noGroup: SessionSectionCountsSchema,
+  sources: z
+    .array(z.object({ source: z.string(), total: z.number().int() }))
+    .describe("Each root source in this view with its session count, hidden sources included."),
 });
 
 const SessionApprovalSchema = z.object({
@@ -358,11 +377,13 @@ async function ensureAgentTokenManager(
   res: ServerResponse,
   agentId: string,
 ): Promise<boolean> {
-  const auth = getRequestAuth(req);
-  if (auth?.kind !== "operator" && auth?.kind !== "user") {
-    jsonError(res, "Worker tokens require operator or user credentials", 403);
-    return false;
-  }
+  const auth = requireAuthKind(
+    req,
+    res,
+    ["operator", "user"],
+    "Worker tokens require operator or user credentials",
+  );
+  if (!auth) return false;
   const header = req.headers["x-agent-id"];
   const decision = can({
     principal: await agentFirstPrincipal(req, Array.isArray(header) ? header[0] : header),
@@ -378,8 +399,9 @@ async function ensureAgentTokenManager(
   // agent's resolved config, global secrets included. A user without a
   // grant-all role must already hold both, and may not manage the token of an
   // agent that may itself act on any agent (a lead).
-  if (auth.kind === "user" && isRbacEnabled()) {
-    const grant = await getUserGrant(auth.userId);
+  const userId = authUserId(auth);
+  if (userId && isRbacEnabled()) {
+    const grant = await getUserGrant(userId);
     if (!grant.grantsAll) {
       const target = await getAgentById(agentId);
       const targetActsOnAny = can({
@@ -480,6 +502,45 @@ async function handleAgentTokens(
   return true;
 }
 
+const SessionShowSchema = z
+  .enum(["mine", "all"])
+  .optional()
+  .describe(
+    "Sessions v2 view, for a user viewer with tree scope. mine (default): roots the user started from a human channel (not workflow, schedule, or system) plus sessions shared with the user. all: every tree session. Lists only: access is unchanged.",
+  );
+
+const SessionHideSourceSchema = z
+  .string()
+  // The same cap as the `hideSource` body field of `POST /api/session-triage`.
+  .refine((value) => value.split(",").length <= 32, "hideSource takes at most 32 sources.")
+  .optional()
+  .transform((value) =>
+    value
+      ?.split(",")
+      .map((source) => source.trim())
+      .filter(Boolean),
+  )
+  .describe(
+    "Comma-separated root sources to leave out, e.g. `slack,chat`. Older sessions v2 clients send this; `showSource` replaces it.",
+  );
+
+const SessionShowSourceSchema = z
+  .string()
+  // The same cap as the `showSource` body field of `POST /api/session-triage`.
+  .refine((value) => value.split(",").length <= 32, "showSource takes at most 32 sources.")
+  .optional()
+  .transform((value) =>
+    value
+      ?.split(",")
+      .map((source) => source.trim())
+      .filter(Boolean),
+  )
+  .describe(
+    "Comma-separated root sources to keep (the sessions v2 source filter), e.g. `ui,slack`. Present and empty keeps none; omit to keep every source.",
+  );
+
+const sessionTotals = createListTotalCache();
+
 const listSessions = route({
   method: "get",
   path: "/api/sessions",
@@ -539,6 +600,12 @@ const listSessions = route({
       .describe(
         "mine: owned sessions. shared: sessions shared with me. tree: Sessions that GET /api/session-tree counts: mine plus shared with me, no ownerless roots. A bypass actor sees every root with tree scope.",
       ),
+    /** With `scope=tree`: `mine` (default) or `all`. Must match the tree's `show`. */
+    show: SessionShowSchema,
+    /** Root sources to leave out. Must match the tree's `hideSource`. */
+    hideSource: SessionHideSourceSchema,
+    /** Root sources to keep. Must match the tree's `showSource`. */
+    showSource: SessionShowSourceSchema,
   }),
   responses: {
     200: {
@@ -561,11 +628,51 @@ const sessionTree = route({
   pattern: ["api", "session-tree"],
   summary: "Get session groups and triage counts",
   tags: ["Sessions"],
+  query: z.object({
+    show: SessionShowSchema,
+    hideSource: SessionHideSourceSchema,
+    showSource: SessionShowSourceSchema,
+  }),
   responses: {
     200: { description: "Visible groups and section counts", schema: SessionTreeResponseSchema },
     401: { description: "Unauthorized" },
   },
   auth: { apiKey: true },
+});
+
+const triageSessionListRoute = route({
+  method: "post",
+  path: "/api/session-triage",
+  pattern: ["api", "session-triage"],
+  summary: "Triage every session of one sidebar list",
+  description:
+    "The bulk bar's 'Select all N': Done, back to the Inbox, read, or unread for every session that one sessions v2 list shows the caller (the `GET /api/sessions?scope=tree` filters). Needs a picked user.",
+  tags: ["Sessions"],
+  body: z
+    .object({
+      action: z.enum(["done", "inbox", "read", "unread"]),
+      /** The list: one of Inbox, Later, Done, No group, or a group. */
+      triage: z.enum(["inbox", "later", "done"]).optional(),
+      noGroup: z.boolean().optional(),
+      groupKey: SessionKeyFilterSchema.optional(),
+      show: SessionShowSchema,
+      hideSource: z.array(z.string().min(1)).max(32).optional(),
+      /** Root sources to keep; an empty array keeps none. */
+      showSource: z.array(z.string().min(1)).max(32).optional(),
+    })
+    .refine((body) => [body.triage, body.noGroup, body.groupKey].filter(Boolean).length === 1, {
+      message: "Name exactly one list: triage, noGroup, or groupKey",
+    }),
+  responses: {
+    200: {
+      description: "The number of sessions written",
+      schema: z.object({ updated: z.number().int() }),
+    },
+    400: { description: "Validation error, or no picked user" },
+    401: { description: "Unauthorized" },
+  },
+  auth: { apiKey: true },
+  rbac: { permission: "favorite.write.own" },
 });
 
 const SESSION_MOVE_LIMIT = 200;
@@ -576,10 +683,7 @@ const SessionMoveResultSchema = z.object({
   moved: z.array(z.string()),
   skipped: z.array(z.object({ rootTaskId: z.string(), reason: z.string() })),
 });
-const sessionMoveRbac = {
-  ungated:
-    "per-session access, per-task task.fs.mutate, and asset-key write checks in the handler, as PATCH /api/assets/task/{id}/key",
-};
+const sessionMoveRbac = { permission: "task.fs.mutate" } as const;
 const sessionMoveResponses = {
   400: { description: "Invalid namespace or request" },
   403: { description: "Personal destination not authorized" },
@@ -652,7 +756,7 @@ async function checkSessionMove(
   actor: SessionActor,
   req: IncomingMessage,
   myAgentId: string | undefined,
-  options: { ownerOnly?: boolean } = {},
+  options: { ownerOnly?: boolean; destination?: string | null } = {},
 ): Promise<{ reason: string } | { taskIds: string[] }> {
   const root = await getTaskById(rootTaskId);
   if (!root) return { reason: SESSION_MOVE_UNAVAILABLE };
@@ -664,8 +768,11 @@ async function checkSessionMove(
     const access = await sessionAccessFor(actor, root.id);
     if (access === "none") return { reason: SESSION_MOVE_UNAVAILABLE };
     if (!hasSessionAccess(access, "write")) return { reason: "Session write access required" };
+    if (await deniesNonOwnerTaskWrite(req, root)) return { reason: NOT_YOUR_TASK_DENIED };
   }
   if (root.parentTaskId) return { reason: "Task is not a session root" };
+  const sourceError = sourceMoveError(options.destination ?? null, root);
+  if (sourceError) return { reason: sourceError };
   const tasks = await getRootTaskChain(root.id);
   for (const task of tasks) {
     if (!(await canMutateTaskNamespace(task, myAgentId, req))) {
@@ -692,6 +799,8 @@ const getSession = route({
         chain: z.array(TaskWithSteeringSchema),
         access: SessionAccessSchema,
         owner: SessionOwnerSchema.nullable(),
+        /** The group of `root` with the list's rule: a source thread with two or more roots is its own group. */
+        groupKey: z.string(),
         approvals: z.array(SessionApprovalSchema).optional(),
         /** The viewer's read state, with the list's rule. Omitted for callers that act for no user. */
         readState: z.enum(["unread", "read", "later", "done"]).optional(),
@@ -877,6 +986,8 @@ export async function handleSessions(
     }
     const filterOpts = {
       source: sources,
+      hideSource: parsed.query.hideSource,
+      showSource: parsed.query.showSource,
       q: parsed.query.q,
       requestedByUserId: parsed.query.requestedByUserId,
       contextKeyPrefix: parsed.query.contextKeyPrefix,
@@ -888,6 +999,7 @@ export async function handleSessions(
       withUserId: parsed.query.withUserId,
       now: new Date().toISOString(),
       tree: parsed.query.scope === "tree",
+      mine: parsed.query.scope === "tree" && parsed.query.show !== "all",
       ...(actor.kind === "user"
         ? {
             viewer: {
@@ -908,8 +1020,12 @@ export async function handleSessions(
         ? await listRecentSessions(baseOpts)
         : await listRecentSessions({ ...baseOpts, slim: true });
     // Filter-aware total: same WHERE as the list query, so the UI pager
-    // reflects the filtered result set.
-    const total = await countSessions(filterOpts);
+    // reflects the filtered result set. Page 1 counts; later pages reuse it
+    // for 30 s (keyed without the request clock).
+    const { now: _now, ...totalKey } = filterOpts;
+    const total = await sessionTotals.get(totalKey, parsed.query.offset, () =>
+      countSessions(filterOpts),
+    );
     listSessions.respond(res, 200, {
       sessions,
       total,
@@ -922,7 +1038,37 @@ export async function handleSessions(
   if (sessionTree.match(req.method, pathSegments)) {
     const parsed = await sessionTree.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
-    sessionTree.respond(res, 200, await getSessionTree(await resolveSessionActor(req, myAgentId)));
+    const actor = await resolveSessionActor(req, myAgentId);
+    const tree = await getSessionTree(actor, undefined, {
+      mine: parsed.query.show !== "all",
+      hideSource: parsed.query.hideSource,
+      showSource: parsed.query.showSource,
+    });
+    // Labels cover hidden sources too: a pane or tab of a hidden source still names its group.
+    const { sourceGroups, slackChannels, threadLabels, ...counts } = tree;
+    const labels = { ...threadLabels, ...(await getSessionLabels(sourceGroups)) };
+    warmSlackChannelLabels(
+      slackChannels.map((id) => `shared/slack/${id}/`).filter((key) => labels[key] === undefined),
+    );
+    sessionTree.respond(res, 200, { ...counts, labels });
+    return true;
+  }
+
+  if (triageSessionListRoute.match(req.method, pathSegments)) {
+    const parsed = await triageSessionListRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const actor = await resolveSessionActor(req, myAgentId);
+    if (actor.kind !== "user" || !actor.userId) {
+      jsonError(res, "Pick a user to triage sessions", 400);
+      return true;
+    }
+    const { action, show, ...list } = parsed.body;
+    const updated = await triageSessionList(
+      actor.userId,
+      { ...list, mine: show !== "all" },
+      action,
+    );
+    triageSessionListRoute.respond(res, 200, { updated });
     return true;
   }
 
@@ -938,7 +1084,9 @@ export async function handleSessions(
         const skipped: { rootTaskId: string; reason: string }[] = [];
         const moves: SessionKeyMove[] = [];
         for (const rootId of new Set(parsed.body.rootTaskIds)) {
-          const checked = await checkSessionMove(rootId, actor, req, myAgentId);
+          const checked = await checkSessionMove(rootId, actor, req, myAgentId, {
+            destination: key,
+          });
           if ("reason" in checked) {
             skipped.push({ rootTaskId: rootId, reason: checked.reason });
           } else {
@@ -960,6 +1108,10 @@ export async function handleSessions(
     const parsed = await moveSessionPrefix.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
     const from = normalizeAssetKey(parsed.body.from);
+    if (sourceOfKey(from) || (parsed.body.to && sourceOfKey(normalizeAssetKey(parsed.body.to)))) {
+      jsonError(res, SOURCE_GROUPS_READ_ONLY, 400);
+      return true;
+    }
     if (parseAssetKey(from).relativeSegments.length === 0) {
       jsonError(res, "Cannot move a namespace root", 400);
       return true;
@@ -1010,6 +1162,7 @@ export async function handleSessions(
             }
             const checked = await checkSessionMove(root.id, actor, req, myAgentId, {
               ownerOnly: true,
+              destination: nextKey,
             });
             if ("reason" in checked) {
               skipped.push({ rootTaskId: root.id, reason: checked.reason });
@@ -1059,7 +1212,7 @@ export async function handleSessions(
     const chain = await getRootTaskChain(parsed.params.rootTaskId);
     // Load steering, citations and pending approvals for the already loaded chain.
     const tasks = [root, ...chain];
-    const [steering, citations, approvals, read] = await Promise.all([
+    const [steering, citations, approvals, read, groupKey] = await Promise.all([
       getTaskSteeringFieldsForTasks(tasks),
       getTaskCitationsForTasks(tasks.map((task) => task.id)),
       getPendingApprovalsForTasks(tasks.map((task) => task.id)),
@@ -1068,6 +1221,7 @@ export async function handleSessions(
       actor.kind === "user" && actor.userId
         ? getSessionReadState(sessionRoot.id, actor.userId)
         : Promise.resolve(null),
+      getSessionGroupKey(root),
     ]);
     const decorate = (task: AgentTask) => ({
       ...task,
@@ -1079,6 +1233,7 @@ export async function handleSessions(
       chain: chain.map(decorate),
       access,
       owner,
+      groupKey,
       ...(approvals.length ? { approvals } : {}),
       ...(read ?? {}),
     });
@@ -1109,17 +1264,10 @@ export async function handleSessions(
   if (putSessionShares.match(req.method, pathSegments)) {
     const parsed = await putSessionShares.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
-    const auth = getRequestAuth(req);
     const actor = await resolveSessionActor(req, myAgentId);
     // Sharing is a dashboard action: a person, or the operator key itself.
-    const principal =
-      auth?.kind === "user"
-        ? ({ kind: "user", userId: auth.userId } as const)
-        : auth?.kind === "operator" && !myAgentId
-          ? ({ kind: "operator" } as const)
-          : null;
+    const principal = await agentFirstPrincipal(req, myAgentId);
     if (
-      !principal ||
       !can({ principal, verb: "session.share", resource: { kind: "none" }, source: "http" }).allow
     ) {
       jsonError(res, "Only the session owner can share it", 403);

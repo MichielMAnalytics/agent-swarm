@@ -76,13 +76,19 @@ import {
   REBOOT_RETRY_PIN_TAG,
   resolveLeadOnlyRecoveryAssignment,
 } from "../tasks/worker-follow-up";
-import { type AgentTask, SUPERSEDED_WORKFLOW_TASK_REASON, TERMINAL_TASK_STATUSES } from "../types";
+import {
+  type AgentTask,
+  OPEN_TASK_STATUSES,
+  SUPERSEDED_WORKFLOW_TASK_REASON,
+  TERMINAL_TASK_STATUSES,
+} from "../types";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
 import { DEFAULT_OPENROUTER_BASE_URL, getOpenRouterBaseUrl } from "../utils/openrouter-base-url";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { getExecutorRegistry } from "../workflows";
 import { recoverIncompleteRuns } from "../workflows/recovery";
+import { probeScriptRunner } from "./script-runner-probe";
 // Side-effect import: registers heartbeat event templates in the in-memory registry
 import "./templates";
 
@@ -1703,8 +1709,20 @@ export async function defaultChecklistGateRunner(
   scriptName: string,
   leadAgentId: string,
   signal: AbortSignal,
-  deps: Parameters<typeof runSavedScriptAsAgent>[1] = {},
+  deps: Parameters<typeof runSavedScriptAsAgent>[1] & {
+    probe?: typeof probeScriptRunner;
+  } = {},
 ): Promise<unknown> {
+  try {
+    const unhealthy = await (deps.probe ?? probeScriptRunner)(leadAgentId);
+    if (unhealthy) return unhealthy;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      quiet: false,
+      reason: `script-runner-unhealthy: ${scrubSecrets(message)}`.slice(0, 300),
+    };
+  }
   const script = await getScript({ name: scriptName, scope: "global" });
   if (!script) throw new Error(`global script "${scriptName}" not found`);
   const output = await runSavedScriptAsAgent(
@@ -1787,14 +1805,16 @@ export async function checkHeartbeatChecklist(): Promise<void> {
 
   if (isEffectivelyEmpty(heartbeatMd)) return;
 
-  // Dedup: skip if lead already has an active heartbeat-checklist task
+  // Dedup: skip if lead already has an active heartbeat-checklist task.
+  // Unary + keeps agentId/taskType off their indexes, so the seek runs on
+  // status over the few open tasks instead of every past checklist task.
   const existing = await getDbClient().get<{ id: string }>(
     `SELECT id FROM agent_tasks
-       WHERE agentId = ?
-         AND taskType = 'heartbeat-checklist'
-         AND status NOT IN (${TERMINAL_TASK_STATUSES.map(() => "?").join(", ")})
+       WHERE status IN (${OPEN_TASK_STATUSES.map(() => "?").join(", ")})
+         AND +agentId = ?
+         AND +taskType = 'heartbeat-checklist'
        LIMIT 1`,
-    [lead.id, ...TERMINAL_TASK_STATUSES],
+    [...OPEN_TASK_STATUSES, lead.id],
   );
   if (existing) return;
 

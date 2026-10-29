@@ -25,6 +25,7 @@ import {
   createAgent,
   createTaskExtended,
   getDbClient,
+  getKv,
   getLogsByTaskId,
   getSlackTasksInThread,
   getSteeringMessagesForTask,
@@ -34,7 +35,9 @@ import {
   promoteAbandonedDraftTasks,
   startTask,
 } from "../be/db";
+import { installExtension } from "../be/extensions/db";
 import { MAX_TASK_ATTACHMENT_BYTES } from "../be/task-attachment-store";
+import { disableExtension, enableExtension } from "../extensions/lifecycle";
 import { getFileStorageProvider, resetFileStorageProviderForTests } from "../fs/registry";
 import * as slackAppModule from "../slack/app";
 import { createAssistant } from "../slack/assistant";
@@ -49,6 +52,7 @@ import {
   setDraftLeaseRefreshMsForTests,
 } from "../slack/inbound-files";
 import { getBufferMessageCount, instantFlush } from "../slack/thread-buffer";
+import { loadBundleFixture } from "./fixtures/extensions/load";
 
 const TEST_DB_PATH = "./test-slack-inbound-files.sqlite";
 const BOT_TOKEN = "example-slack-inbound-files-token";
@@ -651,7 +655,7 @@ describe("Slack ingress with files", () => {
       "SELECT id FROM agent_tasks WHERE slackTriggerMessageTs = ?",
       [ts],
     );
-    return { client, task: row ? await getTaskById(row.id) : null };
+    return { client, task: row ? await getTaskById(row.id) : null, ts };
   }
 
   test("an image with no text creates a task that carries the image (case 1)", async () => {
@@ -673,6 +677,114 @@ describe("Slack ingress with files", () => {
     expect(task!.task.startsWith("aaa")).toBe(true);
     expect(task!.task).toContain("[File: screenshot.png");
     expect(await getTaskAttachments(task!.id)).toHaveLength(1);
+  });
+
+  test("a shared message keeps the image it carries on attachments[].files", async () => {
+    await createAgent({ name: "lead", isLead: true, status: "idle" });
+
+    const { task } = await sendAssistantDm({
+      subtype: undefined,
+      text: "look at this",
+      files: null,
+      attachments: [{ is_share: true, is_msg_unfurl: true, files: [slackFile()] }],
+    });
+
+    expect(task!.task).toContain("[File: screenshot.png (image/png, 11 B) id=F0SHOT0001]");
+    expect(await readStoredBytes(task!.id)).toEqual([PNG_BYTES]);
+  });
+
+  test("a pasted table reaches the task text after the line that introduces it", async () => {
+    await createAgent({ name: "lead", isLead: true, status: "idle" });
+    const lead = "here are the slugs:";
+
+    const { task } = await sendAssistantDm({
+      subtype: undefined,
+      text: lead,
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [{ type: "rich_text_section", elements: [{ type: "text", text: lead }] }],
+        },
+        {
+          type: "table",
+          rows: [
+            [
+              { type: "raw_text", text: "Acme" },
+              { type: "raw_text", text: "/casos-de-exito/acme" },
+            ],
+            [
+              { type: "raw_text", text: "Globex" },
+              { type: "raw_text", text: "/casos-de-exito/globex" },
+            ],
+          ],
+        },
+      ],
+    });
+
+    expect(task!.task).toContain(
+      `${lead}\n| Acme | /casos-de-exito/acme |\n| --- | --- |\n| Globex | /casos-de-exito/globex |`,
+    );
+  });
+
+  test("a mention with a table keeps a bot mention in a cell", async () => {
+    await createAgent({ name: "lead", isLead: true, status: "idle" });
+    seq += 1;
+    const ts = `1850000000.${String(seq).padStart(6, "0")}`;
+    const text = "<@U_SWARM_BOT> owners:";
+    await channelMessage({
+      event: {
+        type: "message",
+        channel: "C0MENTION1",
+        ts,
+        user: "U_HUMAN",
+        text,
+        blocks: [
+          {
+            type: "rich_text",
+            elements: [
+              {
+                type: "rich_text_section",
+                elements: [
+                  { type: "user", user_id: "U_SWARM_BOT" },
+                  { type: "text", text: " owners:" },
+                ],
+              },
+            ],
+          },
+          {
+            type: "table",
+            rows: [
+              [
+                { type: "raw_text", text: "Owner" },
+                { type: "raw_text", text: "Page" },
+              ],
+              [
+                {
+                  type: "rich_text",
+                  elements: [
+                    {
+                      type: "rich_text_section",
+                      elements: [{ type: "user", user_id: "U_SWARM_BOT" }],
+                    },
+                  ],
+                },
+                { type: "raw_text", text: "/casos-de-exito/acme" },
+              ],
+            ],
+          },
+        ],
+      },
+      body: { event_id: `evt_inbound_files_${seq}` },
+      client: slackClient(),
+      say: mock(async () => ({})),
+    });
+    const row = await getDbClient().get<{ id: string }>(
+      "SELECT id FROM agent_tasks WHERE slackTriggerMessageTs = ?",
+      [ts],
+    );
+    const task = await getTaskById(row!.id);
+    expect(task!.task).toMatch(/^owners:/);
+    expect(task!.task).toMatch(/\| <@U_SWARM_BOT[|>][^\n]* \| \/casos-de-exito\/acme \|/);
   });
 
   test("a file that cannot be downloaded is flagged to the agent and to the user", async () => {
@@ -765,7 +877,7 @@ describe("Slack ingress with files", () => {
 
     afterAll(() => getApp.mockRestore());
 
-    async function sendBuffered(text: string, files: SlackFile[] = []) {
+    async function sendBuffered(text: string, files: SlackFile[] = [], blocks?: unknown[]) {
       seq += 1;
       const ts = `1950000001.${String(seq).padStart(6, "0")}`;
       await channelMessage({
@@ -778,6 +890,7 @@ describe("Slack ingress with files", () => {
           user: "U_HUMAN",
           text,
           files,
+          blocks,
         },
         body: { event_id: `evt_inbound_files_${seq}` },
         client,
@@ -895,6 +1008,114 @@ describe("Slack ingress with files", () => {
       });
     }
 
+    test("!now with only a table buffers the table rows", async () => {
+      process.env.SLACK_THREAD_STEERING = "off";
+      await sendBuffered(
+        "!now",
+        [],
+        [
+          {
+            type: "rich_text",
+            elements: [{ type: "rich_text_section", elements: [{ type: "text", text: "!now" }] }],
+          },
+          {
+            type: "table",
+            rows: [
+              [
+                { type: "raw_text", text: "Acme" },
+                { type: "raw_text", text: "/casos-de-exito/acme" },
+              ],
+              [
+                { type: "raw_text", text: "Globex" },
+                { type: "raw_text", text: "/casos-de-exito/globex" },
+              ],
+            ],
+          },
+        ],
+      );
+      const task = await followUp();
+      expect(task.task).toContain(
+        "| Acme | /casos-de-exito/acme |\n| --- | --- |\n| Globex | /casos-de-exito/globex |",
+      );
+      expect(task.task).not.toContain("!now");
+    });
+
+    test("!now with a table keeps a user mention in a cell", async () => {
+      process.env.SLACK_THREAD_STEERING = "off";
+      await sendBuffered(
+        "!now",
+        [],
+        [
+          {
+            type: "rich_text",
+            elements: [{ type: "rich_text_section", elements: [{ type: "text", text: "!now" }] }],
+          },
+          {
+            type: "table",
+            rows: [
+              [
+                { type: "raw_text", text: "Owner" },
+                { type: "raw_text", text: "Page" },
+              ],
+              [
+                {
+                  type: "rich_text",
+                  elements: [
+                    {
+                      type: "rich_text_section",
+                      elements: [{ type: "user", user_id: "U0CELLUSER1" }],
+                    },
+                  ],
+                },
+                { type: "raw_text", text: "/casos-de-exito/acme" },
+              ],
+            ],
+          },
+        ],
+      );
+      const task = await followUp();
+      expect(task.task).toMatch(/\| <@U0CELLUSER1[|>][^\n]* \| \/casos-de-exito\/acme \|/);
+      expect(task.task).not.toContain("!now");
+    });
+
+    test("!now with a table keeps a bot mention in a cell", async () => {
+      process.env.SLACK_THREAD_STEERING = "off";
+      await sendBuffered(
+        "!now",
+        [],
+        [
+          {
+            type: "rich_text",
+            elements: [{ type: "rich_text_section", elements: [{ type: "text", text: "!now" }] }],
+          },
+          {
+            type: "table",
+            rows: [
+              [
+                { type: "raw_text", text: "Owner" },
+                { type: "raw_text", text: "Page" },
+              ],
+              [
+                {
+                  type: "rich_text",
+                  elements: [
+                    {
+                      type: "rich_text_section",
+                      elements: [{ type: "user", user_id: "U_SWARM_BOT" }],
+                    },
+                  ],
+                },
+                { type: "raw_text", text: "/casos-de-exito/acme" },
+              ],
+            ],
+          },
+        ],
+      );
+      const task = await followUp();
+      expect(task.task).toMatch(/\| <@U_SWARM_BOT[|>][^\n]* \| \/casos-de-exito\/acme \|/);
+      expect(task.task).not.toContain("!now");
+    });
+
     test("text-only follow-ups still steer the running task", async () => {
       await sendBuffered("!now use the safer approach");
       const steering = await getSteeringMessagesForTask(earlier.id);
@@ -953,31 +1174,107 @@ describe("Slack ingress with files", () => {
     });
   });
 
-  test("a channel message that mentions the bot with a file attaches it", async () => {
+  for (const [route, withFiles] of [
+    ["lead", false],
+    ["lead", true],
+    ["no-lead", false],
+    ["no-lead", true],
+    ["follow-up", false],
+    ["follow-up", true],
+  ] as const) {
+    test(`Assistant DM metadata reaches hooks for ${route} with files=${withFiles}`, async () => {
+      const agent =
+        route === "no-lead"
+          ? undefined
+          : await createAgent({
+              name: route === "follow-up" ? "worker" : "lead",
+              isLead: route === "lead",
+              status: route === "follow-up" ? "busy" : "idle",
+            });
+      const channelId = "D0ASSISTMETADATA";
+      const threadTs = "1800000000.000001";
+      const earlier =
+        route === "follow-up"
+          ? await createTaskExtended("earlier work", {
+              agentId: agent!.id,
+              source: "slack",
+              slackChannelId: channelId,
+              slackThreadTs: threadTs,
+            })
+          : undefined;
+      if (earlier) await startTask(earlier.id);
+      const installed = await installExtension(await loadBundleFixture("record-task-create"));
+      const recorder = await enableExtension(installed.extension.id);
+      const text = "<@U_SWARM_BOT> inspect this\n  keep the spacing";
+      try {
+        const { task, ts } = await sendAssistantDm({
+          channel: channelId,
+          thread_ts: threadTs,
+          text,
+          files: withFiles ? [slackFile()] : [],
+        });
+
+        expect(task).not.toBeNull();
+        expect(task!.agentId ?? undefined).toBe(agent?.id);
+        if (earlier) expect(task!.parentTaskId).toBe(earlier.id);
+        expect(await readStoredBytes(task!.id)).toEqual(withFiles ? [PNG_BYTES] : []);
+        const event = (await getKv(`task:agent:${recorder.agentId}`, "ext:record-task-create:last"))
+          ?.value;
+        expect(event).toMatchObject({
+          origin: "slack",
+          slack: {
+            trigger: "mention",
+            messages: [{ ts, userId: "U_HUMAN", text }],
+          },
+        });
+      } finally {
+        await disableExtension(recorder.id);
+      }
+    });
+  }
+
+  test.each([
+    false,
+    true,
+  ])("Slack event metadata accompanies a channel mention with files=%s", async (withFiles) => {
     await createAgent({ name: "lead", isLead: true, status: "idle" });
+    const installed = await installExtension(await loadBundleFixture("record-task-create"));
+    const recorder = await enableExtension(installed.extension.id);
     seq += 1;
     const ts = `1900000000.${String(seq).padStart(6, "0")}`;
+    try {
+      await channelMessage({
+        event: {
+          type: "message",
+          subtype: "file_share",
+          channel: "C0CHANNEL1",
+          ts,
+          user: "U_HUMAN",
+          text: "<@U_SWARM_BOT> what is this?",
+          files: withFiles ? [slackFile()] : [],
+        },
+        body: { event_id: `evt_inbound_files_${seq}` },
+        client: slackClient(),
+        say: mock(async () => ({ ts: "1900000000.999999" })),
+      });
 
-    await channelMessage({
-      event: {
-        type: "message",
-        subtype: "file_share",
-        channel: "C0CHANNEL1",
-        ts,
-        user: "U_HUMAN",
-        text: "<@U_SWARM_BOT> what is this?",
-        files: [slackFile()],
-      },
-      body: { event_id: `evt_inbound_files_${seq}` },
-      client: slackClient(),
-      say: mock(async () => ({ ts: "1900000000.999999" })),
-    });
-
-    const row = await getDbClient().get<{ id: string }>(
-      "SELECT id FROM agent_tasks WHERE slackTriggerMessageTs = ?",
-      [ts],
-    );
-    expect(row).not.toBeNull();
-    expect(await readStoredBytes(row!.id)).toEqual([PNG_BYTES]);
+      const row = await getDbClient().get<{ id: string }>(
+        "SELECT id FROM agent_tasks WHERE slackTriggerMessageTs = ?",
+        [ts],
+      );
+      expect(row).not.toBeNull();
+      expect(await readStoredBytes(row!.id)).toEqual(withFiles ? [PNG_BYTES] : []);
+      const event = (await getKv(`task:agent:${recorder.agentId}`, "ext:record-task-create:last"))
+        ?.value;
+      expect(event).toMatchObject({
+        origin: "slack",
+        slack: {
+          trigger: "mention",
+          messages: [{ ts, userId: "U_HUMAN", text: "<@U_SWARM_BOT> what is this?" }],
+        },
+      });
+    } finally {
+      await disableExtension(recorder.id);
+    }
   });
 });

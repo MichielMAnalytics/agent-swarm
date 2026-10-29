@@ -25,9 +25,13 @@ import {
   PANELS_INLINE_QUERY,
   type PanelTarget,
   RIGHT_OPEN_QUERY,
+  type RightPanelView,
+  type RightTab,
+  readFullWidth,
   readLeftPanel,
   readRightPanel,
-  rightPanelOpen,
+  rightPanelView,
+  writeFullWidth,
   writeLeftPanel,
   writeRightPanel,
 } from "@/lib/comb/panels";
@@ -38,14 +42,25 @@ export interface CombLayoutValue {
   /** From `md` up the panels sit beside the content. Below that they are sheets. */
   inline: boolean;
   left: LeftPanelView;
-  right: { open: boolean };
+  right: RightPanelView;
   /** Open the left panel on a tab (a strip button). */
   showLeft: (tab: LeftTab) => void;
   /** Pick a tab and leave the open state alone (the panel tabs, the phone sheet). */
   selectLeft: (tab: LeftTab) => void;
   collapseLeft: () => void;
-  showRight: () => void;
+  /** Open the right panel, on `tab` when given (a strip button, a `?comment=` link). */
+  showRight: (tab?: RightTab) => void;
+  /** Pick a right tab and leave the open state alone. */
+  selectRight: (tab: RightTab) => void;
   collapseRight: () => void;
+  /**
+   * Full width: a markdown file's text runs as wide as its pane, without the
+   * reading measure. The side panels stay. Stored in this browser.
+   */
+  fullWidth: boolean;
+  setFullWidth: (on: boolean) => void;
+  /** The current file is markdown, so full width changes it. */
+  canWiden: boolean;
   /** The current file's headings (empty for a folder and for a file with no outline). */
   headings: readonly OutlineHeading[];
   /** The current file's viewer scroll pane (the outline scrolls it). */
@@ -65,17 +80,26 @@ const NO_HEADINGS: readonly OutlineHeading[] = [];
 interface OutlineResult {
   /** The location the result is for. */
   key: string;
-  target: PanelTarget;
+  /** The file has an outline (markdown with two or more headings). */
+  outline: boolean;
   headings: readonly OutlineHeading[];
+  markdown: boolean;
 }
 
 function locationKey({ orgId, driveId, path }: DrivePath): string {
   return `${orgId}/${driveId}:${path}`;
 }
 
+/** What a route shows: the drive root is the Comb home. */
+function panelTarget(location: CombLocation): PanelTarget {
+  if (!location.isFolder) return "file";
+  return location.path === "/" ? "home" : "folder";
+}
+
 /**
  * Holds the panel state for one swarm (key it by the API URL). The left panel
- * follows the route: see `leftPanelReducer`.
+ * follows the route: see `leftPanelReducer`. The right panel's Outline tab
+ * follows the open file's headings.
  */
 export function CombLayoutProvider({
   location,
@@ -90,7 +114,10 @@ export function CombLayoutProvider({
   const rightWide = useMediaQuery(RIGHT_OPEN_QUERY);
 
   const [left, setLeft] = useState(() => readLeftPanel(browserStorage(), apiUrl));
-  const [rightStored, setRightStored] = useState(() => readRightPanel(browserStorage(), apiUrl));
+  const [right, setRight] = useState(() => readRightPanel(browserStorage(), apiUrl));
+  const [fullWidthStored, setFullWidthStored] = useState(() =>
+    readFullWidth(browserStorage(), apiUrl),
+  );
   const [viewer, setViewer] = useState<HTMLElement | null>(null);
   const [outline, setOutline] = useState<OutlineResult | null>(null);
 
@@ -108,48 +135,66 @@ export function CombLayoutProvider({
     writeLeftPanel(browserStorage(), apiUrl, { open: left.open, tab: left.tab });
   }, [apiUrl, left.open, left.tab]);
 
-  // What the route shows. A file is pending until its kind (and, for
-  // markdown, its headings) is known. The view keeps the last target
-  // meanwhile, so the tab does not flash while the next file loads.
+  // Once per route: the drive root collapses the left panel for that page.
   const key = locationKey(location);
-  const resolved: PanelTarget | "pending" = location.isFolder
-    ? "folder"
-    : outline?.key === key
-      ? outline.target
-      : "pending";
-  const [target, setTarget] = useState<PanelTarget>(location.isFolder ? "folder" : "plain");
+  const target = panelTarget(location);
   const navigated = useRef<string | null>(null);
   useLayoutEffect(() => {
-    if (resolved === "pending") return;
-    setTarget(resolved);
-    // Once per route: a new version that adds or drops headings does not move the panel.
     if (navigated.current === key) return;
-    apply({ type: "navigate", target: resolved, first: navigated.current === null });
     navigated.current = key;
-  }, [key, resolved, apply]);
+    apply({ type: "navigate", target });
+  }, [key, target, apply]);
 
+  // Store the right panel when the person changes it.
+  const storedRight = useRef(`${right.open}:${right.tab}`);
+  useEffect(() => {
+    const next = `${right.open}:${right.tab}`;
+    if (next === storedRight.current) return;
+    storedRight.current = next;
+    writeRightPanel(browserStorage(), apiUrl, right);
+  }, [apiUrl, right]);
+
+  const setFullWidth = useCallback(
+    (on: boolean) => {
+      setFullWidthStored(on);
+      writeFullWidth(browserStorage(), apiUrl, on);
+    },
+    [apiUrl],
+  );
+
+  const hasOutline = outline?.key === key && outline.outline;
   const value = useMemo<CombLayoutValue>(
     () => ({
       inline,
-      left: leftPanelView(left, target, leftWide),
-      right: { open: rightPanelOpen(rightStored, rightWide) },
-      showLeft: (tab) => apply({ type: "show", tab, target }),
-      selectLeft: (tab) => apply({ type: "select", tab, target }),
+      left: leftPanelView(left, leftWide),
+      right: rightPanelView(right, rightWide, hasOutline),
+      showLeft: (tab) => apply({ type: "show", tab }),
+      selectLeft: (tab) => apply({ type: "select", tab }),
       collapseLeft: () => apply({ type: "collapse" }),
-      showRight: () => {
-        setRightStored(true);
-        writeRightPanel(browserStorage(), apiUrl, true);
-      },
-      collapseRight: () => {
-        setRightStored(false);
-        writeRightPanel(browserStorage(), apiUrl, false);
-      },
-      headings:
-        outline?.key === key && outline.target === "outline" ? outline.headings : NO_HEADINGS,
+      showRight: (tab) => setRight((state) => ({ open: true, tab: tab ?? state.tab })),
+      selectRight: (tab) => setRight((state) => (state.tab === tab ? state : { ...state, tab })),
+      collapseRight: () => setRight((state) => ({ ...state, open: false })),
+      fullWidth: inline && fullWidthStored,
+      setFullWidth,
+      canWiden: outline?.key === key && outline.markdown,
+      headings: hasOutline && outline ? outline.headings : NO_HEADINGS,
       viewer,
       setViewer,
     }),
-    [inline, left, target, leftWide, rightStored, rightWide, apply, apiUrl, outline, key, viewer],
+    [
+      inline,
+      left,
+      leftWide,
+      right,
+      rightWide,
+      hasOutline,
+      apply,
+      fullWidthStored,
+      setFullWidth,
+      outline,
+      key,
+      viewer,
+    ],
   );
 
   return (
@@ -184,7 +229,7 @@ function OutlineProbe({
       : null;
   useEffect(() => {
     if (kind && kind !== "markdown") {
-      onResult({ key: probeKey, target: "plain", headings: NO_HEADINGS });
+      onResult({ key: probeKey, outline: false, headings: NO_HEADINGS, markdown: false });
     }
   }, [kind, probeKey, onResult]);
   return kind === "markdown" ? (
@@ -207,7 +252,12 @@ function MarkdownOutlineProbe({
   const headings = useMemo(() => (text === null ? NO_HEADINGS : extractOutline(text)), [text]);
   useEffect(() => {
     if (!settled) return;
-    onResult({ key: probeKey, target: hasOutline(headings) ? "outline" : "plain", headings });
+    onResult({
+      key: probeKey,
+      outline: hasOutline(headings),
+      headings,
+      markdown: true,
+    });
   }, [settled, headings, probeKey, onResult]);
   return null;
 }
